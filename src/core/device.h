@@ -14,7 +14,7 @@ typedef enum DeviceFound {
         DEVICE_FOUND_UDEV  = 1 << 0, /* The device has shown up in the udev database */
         DEVICE_FOUND_MOUNT = 1 << 1, /* The device has shown up in /proc/self/mountinfo */
         DEVICE_FOUND_SWAP  = 1 << 2, /* The device has shown up in /proc/swaps */
-        DEVICE_FOUND_MASK  = DEVICE_FOUND_UDEV|DEVICE_FOUND_MOUNT|DEVICE_FOUND_SWAP,
+        _DEVICE_FOUND_MASK = DEVICE_FOUND_UDEV|DEVICE_FOUND_MOUNT|DEVICE_FOUND_SWAP,
 } DeviceFound;
 
 struct Device {
@@ -29,7 +29,9 @@ struct Device {
 
         DeviceState state, deserialized_state;
         DeviceFound found, deserialized_found, enumerated_found;
-
+        bool processed; /* Whether udevd has done processing the device, i.e. the device has database and
+                         * ID_PROCESSING=1 udev property is not set. This is used only by enumeration and
+                         * subsequent catchup process. */
         bool bind_mounts;
 
         /* The SYSTEMD_WANTS udev property for this device the last time we saw it */

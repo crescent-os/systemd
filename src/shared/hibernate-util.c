@@ -23,6 +23,7 @@
 #include "log.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "proc-cmdline.h"
 #include "stat-util.h"
 #include "string-util.h"
 #include "strv.h"
@@ -129,6 +130,13 @@ static int read_resume_config(dev_t *ret_devno, uint64_t *ret_offset) {
         assert(ret_devno);
         assert(ret_offset);
 
+        r = proc_cmdline_get_key("noresume", /* flags = */ 0, /* ret_value = */ NULL);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to check if 'noresume' kernel command line option is set: %m");
+        if (r > 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOTRECOVERABLE),
+                                       "'noresume' kernel command line option is set, refusing hibernation device lookup.");
+
         r = read_one_line_file("/sys/power/resume", &devno_str);
         if (r < 0)
                 return log_debug_errno(r, "Failed to read /sys/power/resume: %m");
@@ -138,20 +146,15 @@ static int read_resume_config(dev_t *ret_devno, uint64_t *ret_offset) {
                 return log_debug_errno(r, "Failed to parse /sys/power/resume devno '%s': %m", devno_str);
 
         r = read_one_line_file("/sys/power/resume_offset", &offset_str);
-        if (r == -ENOENT) {
-                log_debug_errno(r, "Kernel does not expose resume_offset, skipping.");
-                offset = UINT64_MAX;
-        } else if (r < 0)
+        if (r < 0)
                 return log_debug_errno(r, "Failed to read /sys/power/resume_offset: %m");
-        else {
-                r = safe_atou64(offset_str, &offset);
-                if (r < 0)
-                        return log_debug_errno(r,
-                                               "Failed to parse /sys/power/resume_offset '%s': %m", offset_str);
-        }
 
-        if (devno == 0 && offset > 0 && offset != UINT64_MAX)
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
+        r = safe_atou64(offset_str, &offset);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to parse /sys/power/resume_offset '%s': %m", offset_str);
+
+        if (devno == 0 && offset > 0)
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOMEDIUM),
                                        "Found populated /sys/power/resume_offset (%" PRIu64 ") but /sys/power/resume is not set, refusing.",
                                        offset);
 
@@ -227,6 +230,8 @@ static int swap_entry_get_resume_config(SwapEntry *swap) {
         r = get_block_device_fd(fd, &swap->devno);
         if (r < 0)
                 return r;
+        if (r == 0)
+                return -EMEDIUMTYPE;
 
         r = fd_is_fs_type(fd, BTRFS_SUPER_MAGIC);
         if (r < 0)
@@ -349,26 +354,25 @@ int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_
         r = read_swap_entries(&entries);
         if (r < 0)
                 return r;
-        if (entries.n_swaps == 0)
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOSPC), "No swap space available for hibernation.");
 
         FOREACH_ARRAY(swap, entries.swaps, entries.n_swaps) {
                 r = swap_entry_get_resume_config(swap);
-                if (r < 0)
-                        return log_debug_errno(r, "Failed to get devno and offset for swap '%s': %m", swap->path);
-                if (swap->devno == 0) {
+                if (r == -EMEDIUMTYPE) {
                         assert(swap->swapfile);
 
-                        log_debug("Swap file '%s' is not backed by block device, ignoring: %m", swap->path);
+                        log_debug_errno(r, "Unable to acquire backing block device for swap file '%s' (maybe on a RAID btrfs?), ignoring.",
+                                        swap->path);
                         continue;
                 }
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to get devno and offset for swap '%s': %m", swap->path);
+                assert(swap->devno > 0);
 
                 if (resume_config_devno > 0) {
                         if (swap->devno == resume_config_devno &&
-                            (!swap->swapfile || resume_config_offset == UINT64_MAX || swap->offset == resume_config_offset)) {
+                            (!swap->swapfile || swap->offset == resume_config_offset)) {
                                 /* /sys/power/resume (resume=) is set, and the calculated swap file offset
-                                 * matches with /sys/power/resume_offset. If /sys/power/resume_offset is not
-                                 * exposed, we can't do proper check anyway, so use the found swap file too. */
+                                 * matches with /sys/power/resume_offset. */
                                 entry = swap;
                                 break;
                         }
@@ -384,9 +388,10 @@ int find_suitable_hibernation_device_full(HibernationDevice *ret_device, uint64_
         }
 
         if (!entry) {
-                /* No need to check n_swaps == 0, since it's rejected early */
-                assert(resume_config_devno > 0);
-                return log_debug_errno(SYNTHETIC_ERRNO(ENOSPC), "Cannot find swap entry corresponding to /sys/power/resume.");
+                if (resume_config_devno > 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ESTALE), "Cannot find swap entry corresponding to /sys/power/resume.");
+
+                return log_debug_errno(SYNTHETIC_ERRNO(ENOSPC), "No swap space available for hibernation.");
         }
 
         if (ret_device) {
@@ -444,11 +449,11 @@ int hibernation_is_safe(void) {
         bypass_space_check = getenv_bool("SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK") > 0;
 
         r = find_suitable_hibernation_device_full(NULL, &size, &used);
-        if (r == -ENOSPC && bypass_space_check)
-                /* If we don't have any available swap space at all, and SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK
-                 * is set, skip all remaining checks since we can't do that properly anyway. It is quite
-                 * possible that the user is using a setup similar to #30083. When we actually perform
-                 * hibernation in sleep.c we'll check everything again. */
+        if (IN_SET(r, -ENOSPC, -ESTALE) && bypass_space_check)
+                /* If we don't have any available swap space at all, or the specified resume device is missing,
+                 * and $SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK is set, skip all remaining checks since
+                 * we can't do that properly anyway. It is quite possible that the user is using a setup
+                 * similar to #30083. When we actually perform hibernation in sleep.c we'll check everything again. */
                 return 0;
         if (r < 0)
                 return r;
@@ -485,28 +490,16 @@ int write_resume_config(dev_t devno, uint64_t offset, const char *device) {
         devno_str = FORMAT_DEVNUM(devno);
         xsprintf(offset_str, "%" PRIu64, offset);
 
-        /* We write the offset first since it's safer. Note that this file is only available in 4.17+, so
-         * fail gracefully if it doesn't exist and we're only overwriting it with 0. */
         r = write_string_file("/sys/power/resume_offset", offset_str, WRITE_STRING_FILE_DISABLE_BUFFER);
-        if (r == -ENOENT) {
-                if (offset != 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
-                                               "Can't configure swap file offset %s, kernel does not support /sys/power/resume_offset. Refusing.",
-                                               offset_str);
-
-                log_warning_errno(r, "/sys/power/resume_offset is unavailable, skipping writing swap file offset.");
-        } else if (r < 0)
-                return log_error_errno(r,
-                                       "Failed to write swap file offset %s to /sys/power/resume_offset for device '%s': %m",
+        if (r < 0)
+                return log_error_errno(r, "Failed to write swap file offset %s to /sys/power/resume_offset for device '%s': %m",
                                        offset_str, device);
-        else
-                log_debug("Wrote resume_offset=%s for device '%s' to /sys/power/resume_offset.",
-                          offset_str, device);
+        log_debug("Wrote resume_offset=%s for device '%s' to /sys/power/resume_offset.",
+                  offset_str, device);
 
         r = write_string_file("/sys/power/resume", devno_str, WRITE_STRING_FILE_DISABLE_BUFFER);
         if (r < 0)
-                return log_error_errno(r,
-                                       "Failed to write device '%s' (%s) to /sys/power/resume: %m",
+                return log_error_errno(r, "Failed to write device '%s' (%s) to /sys/power/resume: %m",
                                        device, devno_str);
         log_debug("Wrote resume=%s for device '%s' to /sys/power/resume.", devno_str, device);
 
@@ -519,7 +512,7 @@ int clear_efi_hibernate_location_and_warn(void) {
         if (!is_efi_boot())
                 return 0;
 
-        r = efi_set_variable(EFI_SYSTEMD_VARIABLE(HibernateLocation), NULL, 0);
+        r = efi_set_variable(EFI_SYSTEMD_VARIABLE_STR("HibernateLocation"), NULL, 0);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)

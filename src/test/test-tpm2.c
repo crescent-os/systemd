@@ -74,16 +74,15 @@ TEST(tpm2_util_pbkdf2_hmac_sha256) {
         };
 
         uint8_t res[SHA256_DIGEST_SIZE];
-        for (size_t i = 0; i < sizeof(test_vectors)/sizeof(test_vectors[0]); i++) {
-
+        FOREACH_ELEMENT(vector, test_vectors) {
                 int rc = tpm2_util_pbkdf2_hmac_sha256(
-                                test_vectors[i].pass,
-                                test_vectors[i].passlen,
-                                test_vectors[i].salt,
-                                test_vectors[i].saltlen,
+                                vector->pass,
+                                vector->passlen,
+                                vector->salt,
+                                vector->saltlen,
                                 res);
                 assert_se(rc == 0);
-                assert_se(memcmp(test_vectors[i].expected, res, SHA256_DIGEST_SIZE) == 0);
+                assert_se(memcmp(vector->expected, res, SHA256_DIGEST_SIZE) == 0);
         }
 }
 
@@ -153,8 +152,8 @@ static void _test_pcr_selection_mask_hash(uint32_t mask, TPMI_ALG_HASH hash) {
         uint32_t test_masks[] = {
                 0x0, 0x1, 0x100, 0x10000, 0xf0f0f0, 0xaaaaaa, 0xffffff,
         };
-        for (unsigned i = 0; i < ELEMENTSOF(test_masks); i++) {
-                uint32_t test_mask = test_masks[i];
+        FOREACH_ELEMENT(i, test_masks) {
+                uint32_t test_mask = *i;
 
                 TPMS_PCR_SELECTION a = POISON_TPMS, b = POISON_TPMS, test_s = POISON_TPMS;
                 tpm2_tpms_pcr_selection_from_mask(test_mask, hash, &test_s);
@@ -182,11 +181,11 @@ static void _test_pcr_selection_mask_hash(uint32_t mask, TPMI_ALG_HASH hash) {
 TEST(tpms_pcr_selection_mask_and_hash) {
         TPMI_ALG_HASH HASH_ALGS[] = { TPM2_ALG_SHA1, TPM2_ALG_SHA256, };
 
-        for (unsigned i = 0; i < ELEMENTSOF(HASH_ALGS); i++)
+        FOREACH_ELEMENT(hash, HASH_ALGS)
                 for (uint32_t m2 = 0; m2 <= 0xffffff; m2 += 0x50000)
                         for (uint32_t m1 = 0; m1 <= 0xffff; m1 += 0x500)
                                 for (uint32_t m0 = 0; m0 <= 0xff; m0 += 0x5)
-                                        _test_pcr_selection_mask_hash(m0 | m1 | m2, HASH_ALGS[i]);
+                                        _test_pcr_selection_mask_hash(m0 | m1 | m2, *hash);
 }
 
 static void _test_tpms_sw(
@@ -199,7 +198,7 @@ static void _test_tpms_sw(
         tpm2_tpms_pcr_selection_from_mask(mask, hash, &s);
 
         _cleanup_free_ char *tpms_str = tpm2_tpms_pcr_selection_to_string(&s);
-        assert_se(streq(tpms_str, expected_str));
+        ASSERT_STREQ(tpms_str, expected_str);
 
         assert_se(tpm2_tpms_pcr_selection_weight(&s) == expected_weight);
         assert_se(tpm2_tpms_pcr_selection_is_empty(&s) == (expected_weight == 0));
@@ -242,7 +241,7 @@ static void _test_tpml_sw(
         assert_se(l.count == expected_count);
 
         _cleanup_free_ char *tpml_str = tpm2_tpml_pcr_selection_to_string(&l);
-        assert_se(streq(tpml_str, expected_str));
+        ASSERT_STREQ(tpml_str, expected_str);
 
         assert_se(tpm2_tpml_pcr_selection_weight(&l) == expected_weight);
         assert_se(tpm2_tpml_pcr_selection_is_empty(&l) == (expected_weight == 0));
@@ -557,8 +556,13 @@ static void check_parse_pcr_argument(
 
                 assert_se(tpm2_pcr_values_to_mask(expected_values, n_expected_values, expected_values[0].hash, &expected_mask) == 0);
 
-                assert_se(tpm2_parse_pcr_argument_to_mask(arg, &mask) == 0);
-                assert_se(mask == expected_mask);
+                _cleanup_free_ Tpm2PCRValue *arg_pcr_values = NULL;
+                size_t n_arg_pcr_values = 0;
+                assert_se(tpm2_parse_pcr_argument(arg, &arg_pcr_values, &n_arg_pcr_values) >= 0);
+                uint32_t mask2 = UINT32_MAX;
+                assert_se(tpm2_pcr_values_to_mask(arg_pcr_values, n_arg_pcr_values, /* algorithm= */ 0, &mask2) >= 0);
+
+                assert_se((mask == UINT32_MAX ? mask2 : (mask|mask2)) == expected_mask);
         }
 
         size_t old_n_values = n_values;
@@ -678,7 +682,7 @@ TEST(parse_pcr_argument) {
         assert_se(tpm2_parse_pcr_argument("1,2=123456abc", &v, &n_v) < 0);
         assert_se(tpm2_parse_pcr_argument("1,2:invalid", &v, &n_v) < 0);
         assert_se(tpm2_parse_pcr_argument("1:sha1=invalid", &v, &n_v) < 0);
-        assert_se(v == NULL);
+        ASSERT_NULL(v);
         assert_se(n_v == 0);
 
         check_parse_pcr_argument_to_mask("", 0x0);
@@ -702,6 +706,10 @@ TEST(parse_pcr_argument) {
         check_parse_pcr_argument_to_mask("sysexts+17+23", 0x822000);
         check_parse_pcr_argument_to_mask("6+boot-loader-code,44", -EINVAL);
         check_parse_pcr_argument_to_mask("debug+24", -EINVAL);
+        check_parse_pcr_argument_to_mask("5:sha1=f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8", -EINVAL);
+        check_parse_pcr_argument_to_mask("0:sha256=f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8", -EINVAL);
+        check_parse_pcr_argument_to_mask("5:sha1=f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8,3", -EINVAL);
+        check_parse_pcr_argument_to_mask("3,0:sha256=f013d66c7f6817d08b7eb2a93e6d0440c1f3e7f8", -EINVAL);
 }
 
 static const TPMT_PUBLIC test_rsa_template = {
@@ -1163,7 +1171,9 @@ static void calculate_seal_and_unseal(
                         /* pcrlock_policy= */ NULL,
                         /* primary_alg= */ 0,
                         &blob,
+                        /* n_blobs= */ 1,
                         /* known_policy_hash= */ NULL,
+                        /* n_known_policy_hash= */ 0,
                         &serialized_parent,
                         &unsealed_secret) >= 0);
 
@@ -1179,7 +1189,7 @@ static int check_calculate_seal(Tpm2Context *c) {
         int r;
 
         if (detect_virtualization() == VIRTUALIZATION_NONE && !slow_tests_enabled()) {
-                log_notice("Skipping slow calculate seal TPM2 tests. Physical system detected, and slow tests disabled.");
+                log_notice("Skipping slow calculate seal TPM2 tests. Physical system detected, and slow tests disabled. (To enable, run again with $SYSTEMD_SLOW_TESTS=1.)");
                 return 0;
         }
 
@@ -1190,11 +1200,9 @@ static int check_calculate_seal(Tpm2Context *c) {
         calculate_seal_and_unseal(c, TPM2_SRK_HANDLE, srk_public);
 
         TPMI_ALG_ASYM test_algs[] = { TPM2_ALG_RSA, TPM2_ALG_ECC, };
-        for (unsigned i = 0; i < ELEMENTSOF(test_algs); i++) {
-                TPMI_ALG_ASYM alg = test_algs[i];
-
+        FOREACH_ELEMENT(alg, test_algs) {
                 TPM2B_PUBLIC template = { .size = sizeof(TPMT_PUBLIC), };
-                assert_se(tpm2_get_srk_template(alg, &template.publicArea) >= 0);
+                assert_se(tpm2_get_srk_template(*alg, &template.publicArea) >= 0);
 
                 _cleanup_free_ TPM2B_PUBLIC *public = NULL;
                 _cleanup_(tpm2_handle_freep) Tpm2Handle *handle = NULL;
@@ -1222,14 +1230,20 @@ static void check_seal_unseal_for_handle(Tpm2Context *c, TPM2_HANDLE handle) {
 
         log_debug("Check seal/unseal for handle 0x%" PRIx32, handle);
 
-        _cleanup_(iovec_done) struct iovec secret = {}, blob = {}, srk = {}, unsealed_secret = {};
+        _cleanup_(iovec_done) struct iovec secret = {}, srk = {}, unsealed_secret = {};
+        struct iovec *blobs = NULL;
+        size_t n_blobs = 0;
+        CLEANUP_ARRAY(blobs, n_blobs, iovec_array_free);
+
         assert_se(tpm2_seal(
                         c,
                         handle,
                         &policy,
+                        1,
                         /* pin= */ NULL,
                         &secret,
-                        &blob,
+                        &blobs,
+                        &n_blobs,
                         /* ret_primary_alg= */ NULL,
                         &srk) >= 0);
 
@@ -1243,8 +1257,10 @@ static void check_seal_unseal_for_handle(Tpm2Context *c, TPM2_HANDLE handle) {
                         /* pin= */ NULL,
                         /* pcrlock_policy= */ NULL,
                         /* primary_alg= */ 0,
-                        &blob,
+                        blobs,
+                        n_blobs,
                         /* policy_hash= */ NULL,
+                        /* n_policy_hash= */ 0,
                         &srk,
                         &unsealed_secret) >= 0);
 
@@ -1257,7 +1273,7 @@ static void check_seal_unseal(Tpm2Context *c) {
         assert(c);
 
         if (detect_virtualization() == VIRTUALIZATION_NONE && !slow_tests_enabled()) {
-                log_notice("Skipping slow seal/unseal TPM2 tests. Physical system detected, and slow tests disabled.");
+                log_notice("Skipping slow seal/unseal TPM2 tests. Physical system detected, and slow tests disabled. (To enable, run again with $SYSTEMD_SLOW_TESTS=1.)");
                 return;
         }
 
@@ -1266,7 +1282,7 @@ static void check_seal_unseal(Tpm2Context *c) {
         check_seal_unseal_for_handle(c, 0);
         check_seal_unseal_for_handle(c, TPM2_SRK_HANDLE);
 
-        FOREACH_ARRAY(template, test_templates, ELEMENTSOF(test_templates)) {
+        FOREACH_ELEMENT(template, test_templates) {
                 TPM2B_PUBLIC public = {
                         .publicArea = **template,
                         .size = sizeof(**template),

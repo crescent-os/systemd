@@ -11,7 +11,7 @@
 Description=User Manager for UID %i
 Documentation=man:user@.service(5)
 BindsTo=user-runtime-dir@%i.service
-After=user-runtime-dir@%i.service dbus.service systemd-oomd.service
+After=systemd-logind.service user-runtime-dir@%i.service dbus.service systemd-oomd.service
 IgnoreOnIsolate=yes
 
 [Service]
@@ -20,6 +20,10 @@ PAMName=systemd-user
 Type=notify-reload
 ExecStart={{LIBEXECDIR}}/systemd --user
 Slice=user-%i.slice
+# Reexecute the manager on service reload, instead of reloading.
+# This provides a synchronous method for restarting all user manager
+# instances after upgrade.
+ReloadSignal=RTMIN+25
 KillMode=mixed
 Delegate=pids memory cpu
 DelegateSubgroup=init.scope

@@ -477,7 +477,7 @@ static int cd_profiles(Context *c) {
 
                 switch (feature) {
                 case 0x00:
-                        log_debug("GET CONFIGURATION: feature 'profiles', with %u entries", features[i + 3] / 4);
+                        log_debug("GET CONFIGURATION: feature 'profiles', with %u entries", features[i + 3] / 4U);
                         feature_profiles(c, features + i + 4, MIN(features[i + 3], len - i - 4));
                         break;
                 default:
@@ -959,10 +959,8 @@ static int run(int argc, char *argv[]) {
         _cleanup_(context_clear) Context c = CONTEXT_EMPTY;
         int r;
 
-        log_set_target(LOG_TARGET_AUTO);
-        udev_parse_config();
-        log_parse_environment();
-        log_open();
+        (void) udev_parse_config();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)

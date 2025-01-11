@@ -20,12 +20,14 @@ TEST(path_is_os_tree) {
 }
 
 TEST(parse_os_release) {
-        /* Let's assume that we're running in a valid system, so os-release is available */
         _cleanup_free_ char *id = NULL, *id2 = NULL, *name = NULL, *foobar = NULL;
-        ASSERT_EQ(parse_os_release(NULL, "ID", &id), 0);
-        log_info("ID: %s", id);
 
-        ASSERT_EQ(setenv("SYSTEMD_OS_RELEASE", "/dev/null", 1), 0);
+        if (access("/etc/os-release", F_OK) >= 0 || access("/usr/lib/os-release", F_OK) >= 0) {
+                ASSERT_EQ(parse_os_release(NULL, "ID", &id), 0);
+                log_info("ID: %s", id);
+        }
+
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_OS_RELEASE", "/dev/null", 1));
         ASSERT_EQ(parse_os_release(NULL, "ID", &id2), 0);
         log_info("ID: %s", strnull(id2));
 
@@ -34,11 +36,11 @@ TEST(parse_os_release) {
                                 "ID=the-id  \n"
                                 "NAME=the-name"), 0);
 
-        ASSERT_EQ(setenv("SYSTEMD_OS_RELEASE", tmpfile, 1), 0);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_OS_RELEASE", tmpfile, 1));
         ASSERT_EQ(parse_os_release(NULL, "ID", &id, "NAME", &name), 0);
         log_info("ID: %s NAME: %s", id, name);
-        assert_se(streq(id, "the-id"));
-        assert_se(streq(name, "the-name"));
+        ASSERT_STREQ(id, "the-id");
+        ASSERT_STREQ(name, "the-name");
 
         _cleanup_(unlink_tempfilep) char tmpfile2[] = "/tmp/test-os-util.XXXXXX";
         ASSERT_EQ(write_tmpfile(tmpfile2,
@@ -46,17 +48,17 @@ TEST(parse_os_release) {
                                 "ID=\"the-id\"  \n"
                                 "NAME='the-name'"), 0);
 
-        ASSERT_EQ(setenv("SYSTEMD_OS_RELEASE", tmpfile2, 1), 0);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_OS_RELEASE", tmpfile2, 1));
         ASSERT_EQ(parse_os_release(NULL, "ID", &id, "NAME", &name), 0);
         log_info("ID: %s NAME: %s", id, name);
-        assert_se(streq(id, "the-id"));
-        assert_se(streq(name, "the-name"));
+        ASSERT_STREQ(id, "the-id");
+        ASSERT_STREQ(name, "the-name");
 
         ASSERT_EQ(parse_os_release(NULL, "FOOBAR", &foobar), 0);
         log_info("FOOBAR: %s", strnull(foobar));
         ASSERT_NULL(foobar);
 
-        assert_se(unsetenv("SYSTEMD_OS_RELEASE") == 0);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD_OS_RELEASE"));
 }
 
 TEST(parse_extension_release) {
@@ -78,8 +80,8 @@ TEST(parse_extension_release) {
 
         assert_se(parse_extension_release(tempdir, IMAGE_SYSEXT, "test", false, "ID", &id, "VERSION_ID", &version_id) == 0);
         log_info("ID: %s VERSION_ID: %s", id, version_id);
-        assert_se(streq(id, "the-id"));
-        assert_se(streq(version_id, "the-version-id"));
+        ASSERT_STREQ(id, "the-id");
+        ASSERT_STREQ(version_id, "the-version-id");
 
         assert_se(b = path_join(tempdir, "/etc/extension-release.d/extension-release.tester"));
         assert_se(mkdir_parents(b, 0777) >= 0);
@@ -90,8 +92,8 @@ TEST(parse_extension_release) {
 
         ASSERT_EQ(parse_extension_release(tempdir, IMAGE_CONFEXT, "tester", false, "ID", &id, "VERSION_ID", &version_id), 0);
         log_info("ID: %s VERSION_ID: %s", id, version_id);
-        assert_se(streq(id, "the-id"));
-        assert_se(streq(version_id, "the-version-id"));
+        ASSERT_STREQ(id, "the-id");
+        ASSERT_STREQ(version_id, "the-version-id");
 
         assert_se(parse_extension_release(tempdir, IMAGE_CONFEXT, "tester", false, "FOOBAR", &foobar) == 0);
         log_info("FOOBAR: %s", strnull(foobar));
@@ -109,14 +111,14 @@ TEST(load_os_release_pairs) {
                                 "ID=\"the-id\"  \n"
                                 "NAME='the-name'"), 0);
 
-        ASSERT_EQ(setenv("SYSTEMD_OS_RELEASE", tmpfile, 1), 0);
+        ASSERT_OK_ERRNO(setenv("SYSTEMD_OS_RELEASE", tmpfile, 1));
 
         _cleanup_strv_free_ char **pairs = NULL;
         ASSERT_EQ(load_os_release_pairs(NULL, &pairs), 0);
         assert_se(strv_equal(pairs, STRV_MAKE("ID", "the-id",
                                               "NAME", "the-name")));
 
-        ASSERT_EQ(unsetenv("SYSTEMD_OS_RELEASE"), 0);
+        ASSERT_OK_ERRNO(unsetenv("SYSTEMD_OS_RELEASE"));
 }
 
 TEST(os_release_support_ended) {

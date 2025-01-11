@@ -104,7 +104,7 @@
       see above and below.</para></listitem>
 
       <listitem><para>The key may be acquired via a PKCS#11 compatible hardware security token or
-      smartcard. In this case a saved key used in unlock process is stored on disk/removable media, acquired via
+      smartcard. In this case, a saved key used in unlock process is stored on disk/removable media, acquired via
       <constant>AF_UNIX</constant>, or stored in the LUKS2 JSON token metadata header. For RSA, the saved key
       is an encrypted volume key. The encrypted volume key is then decrypted by the PKCS#11 token with an RSA
       private key stored on it, and used to unlock the encrypted volume. For elliptic-curve (EC) cryptography,
@@ -114,14 +114,14 @@
       </para></listitem>
 
       <listitem><para>Similarly, the key may be acquired via a FIDO2 compatible hardware security token
-      (which must implement the "hmac-secret" extension). In this case a key generated randomly during
+      (which must implement the "hmac-secret" extension). In this case, a key generated randomly during
       enrollment is stored on disk/removable media, acquired via <constant>AF_UNIX</constant>, or stored in
       the LUKS2 JSON token metadata header. The random key is hashed via a keyed hash function (HMAC) on the
       FIDO2 token, using a secret key stored on the token that never leaves it. The resulting hash value is
       then used as key to unlock the encrypted volume. Use the <option>fido2-device=</option> option
       described below to use this mechanism.</para></listitem>
 
-      <listitem><para>Similarly, the key may be acquired via a TPM2 security chip. In this case a (during
+      <listitem><para>Similarly, the key may be acquired via a TPM2 security chip. In this case, a (during
       enrollment) randomly generated key — encrypted by an asymmetric key derived from the TPM2 chip's seed
       key — is stored on disk/removable media, acquired via <constant>AF_UNIX</constant>, or stored in the
       LUKS2 JSON token metadata header. Use the <option>tpm2-device=</option> option described below to use
@@ -215,8 +215,11 @@
         from the key file. See
         <citerefentry project='die-net'><refentrytitle>cryptsetup</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         for possible values and the default value of this option. This
-        option is ignored in plain encryption mode, as the key file
-        size is then given by the key size.</para>
+        option is ignored in plain encryption mode, where the key file
+        size is determined by the key size. It is also ignored when
+        the key file is used as a salt file for a FIDO2 token, as the
+        salt size in that case is defined by the FIDO2 specification
+        to be exactly 32 bytes.</para>
 
         <xi:include href="version-info.xml" xpointer="v188"/></listitem>
       </varlistentry>
@@ -671,6 +674,26 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>password-cache=yes|no|read-only</option></term>
+
+        <listitem><para>Controls whether to use cache for passwords or security token PINs.
+        Takes a boolean or the special string <literal>read-only</literal>. Defaults to
+        <literal>yes</literal>.</para>
+
+        <para>If set to <literal>read-only</literal>, the kernel keyring is checked for a
+        password/PIN before requesting one interactively. If set to <literal>yes</literal>,
+        in addition to checking the keyring, any password/PIN entered interactively is cached
+        in the keyring with a 2.5-minute timeout before being purged.</para>
+
+        <para>Note that this option is not permitted for PKCS#11 security tokens. The reasoning
+        behind this is that PKCS#11 security tokens are usually configured to lock after being
+        supplied an invalid PIN multiple times, so using the cache might inadvertently lock the
+        token.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>pkcs11-uri=</option></term>
 
         <listitem><para>Takes either the special value <literal>auto</literal> or an <ulink
@@ -690,7 +713,7 @@
 
         <para>The specified URI can refer directly to a private key stored on a token or alternatively
         just to a slot or token, in which case a search for a suitable private key will be performed.  In
-        this case if multiple suitable objects are found the token is refused. The keyfile configured
+        this case, if multiple suitable objects are found, the token is refused. The keyfile configured
         in the third column of the line is used as is (i.e. in binary form, unprocessed). The resulting
         decrypted key (for RSA) or derived shared secret (for ECC) is then Base64 encoded before it is used
         to unlock the LUKS volume.</para>
@@ -724,8 +747,7 @@
         (configured in the line's third column) to operate. If not configured and the volume is of type
         LUKS2, the CID and the key are read from LUKS2 JSON token metadata instead. Use
         <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>
-        as simple tool for enrolling FIDO2 security tokens, compatible with this automatic mode, which is
-        only available for LUKS2 volumes.</para>
+        as simple tool for enrolling FIDO2 security tokens for LUKS2 volumes.</para>
 
         <para>Use <command>systemd-cryptenroll --fido2-device=list</command> to list all suitable FIDO2
         security tokens currently plugged in, along with their device nodes.</para>
@@ -761,11 +783,46 @@
         <term><option>fido2-rp=</option></term>
 
         <listitem><para>Takes a string, configuring the FIDO2 Relying Party (rp) for the FIDO2 unlock
-        operation. If not specified <literal>io.systemd.cryptsetup</literal> is used, except if the LUKS2
+        operation. If not specified, <literal>io.systemd.cryptsetup</literal> is used, except if the LUKS2
         JSON token header contains a different value. It should normally not be necessary to override
         this.</para>
 
         <xi:include href="version-info.xml" xpointer="v248"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>fido2-pin=</option></term>
+
+        <listitem><para>Controls whether to require the user to enter a PIN when unlocking the volume (the
+        FIDO2 <literal>clientPin</literal> feature). This option only applies when in manual mode, i.e.
+        when <option>fido2-cid=</option> option is set. Defaults to neither true or false, but rather to
+        <constant>v248</constant> behavior, that is: try with no PIN first, but if token reports that PIN
+        is required, try again asking for PIN.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>fido2-up=</option></term>
+
+        <listitem><para>Controls whether to require the user to verify presence (tap the token, the FIDO2
+        <literal>up</literal> feature) when unlocking the volume. This option only applies when in manual
+        mode, i.e. when <option>fido2-cid=</option> option is set. Defaults to neither true or false,
+        but rather to <constant>v248</constant> behavior, that is: try with no UP first, but if token reports
+        that UP is required, try again with UP enabled.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>fido2-uv=</option></term>
+
+        <listitem><para>Controls whether to require user verification (the FIDO2 <literal>uv</literal> feature)
+        when unlocking the volume. This option only applies when in manual mode, i.e. when
+        <option>fido2-cid=</option> option is set. Defaults to neither true or false, but rather to
+        <constant>v248</constant> behavior, that is: omit configuring UV whatsoever.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -834,7 +891,7 @@
         public key specified at key enrollment time can be provided. See
         <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         for details on enrolling TPM2 PCR public keys. If this option is not specified but it is attempted to
-        unlock a LUKS2 volume with a signed TPM2 PCR enrollment a suitable signature file
+        unlock a LUKS2 volume with a signed TPM2 PCR enrollment, a suitable signature file
         <filename>tpm2-pcr-signature.json</filename> is searched for in <filename>/etc/systemd/</filename>,
         <filename>/run/systemd/</filename>, <filename>/usr/lib/systemd/</filename> (in this
         order).</para>
@@ -846,12 +903,12 @@
         <term><option>tpm2-pcrlock=</option></term>
 
         <listitem><para>Takes an absolute path to a TPM2 pcrlock policy file, as produced by the
-        <citerefentry><refentrytitle>systemd-pcrlock</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+        <citerefentry><refentrytitle>systemd-pcrlock</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         tool. This permits locking LUKS2 volumes to a local policy of allowed PCR values with
         variants. See
         <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         for details on enrolling TPM2 pcrlock policies. If this option is not specified but it is attempted
-        to unlock a LUKS2 volume with a TPM2 pcrlock enrollment a suitable signature file
+        to unlock a LUKS2 volume with a TPM2 pcrlock enrollment, a suitable signature file
         <filename>pcrlock.json</filename> is searched for in <filename>/run/systemd/</filename> and
         <filename>/var/lib/systemd/</filename> (in this order).</para>
 
@@ -877,7 +934,7 @@
 
         <listitem><para>Selects one or more TPM2 PCR banks to measure the volume key into, as configured with
         <option>tpm2-measure-pcr=</option> above. Multiple banks may be specified, separated by a colon
-        character. If not specified automatically determines available and used banks. Expects a message
+        character. If not specified, automatically determines available and used banks. Expects a message
         digest name (e.g. <literal>sha1</literal>, <literal>sha256</literal>, …) as argument, to identify the
         bank.</para>
 
@@ -893,7 +950,7 @@
         for supported formats). Defaults to 30s. Once the specified timeout elapsed authentication via
         password is attempted. Note that this timeout applies to waiting for the security device to show up —
         it does not apply to the PIN prompt for the device (should one be needed) or similar. Pass 0 to turn
-        off the time-out and wait forever.</para>
+        off the timeout and wait forever.</para>
 
         <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
@@ -927,10 +984,10 @@
         <citerefentry><refentrytitle>systemd.mount</refentrytitle><manvolnum>5</manvolnum></citerefentry>
         units marked with <option>x-initrd.mount</option>.</para>
 
-        <para>Although it's not necessary to mark the mount entry for the root file system with
+        <para>Although it is not necessary to mark the mount entry for the root file system with
         <option>x-initrd.mount</option>, <option>x-initrd.attach</option> is still recommended with
         the encrypted block device containing the root file system as otherwise systemd will
-        attempt to detach the device during the regular system shutdown while it's still in
+        attempt to detach the device during the regular system shutdown while it is still in
         use. With this option the device will still be detached but later after the root file
         system is unmounted.</para>
 
@@ -973,10 +1030,10 @@
     and use this to determine which key to send, allowing a single listening socket to serve keys for
     multiple volumes. If the PKCS#11 logic is used (see above), the socket source name is picked in similar
     fashion, except that the literal string <literal>/cryptsetup-pkcs11/</literal> is used. And similarly for
-    FIDO2 (<literal>/cryptsetup-fido2/</literal>) and TPM2 (<literal>/cryptsetup-tpm2/</literal>). A different
-    path component is used so that services providing key material know that the secret key was not requested
-    directly, but instead an encrypted key that will be decrypted via the PKCS#11/FIDO2/TPM2 logic to acquire
-    the final secret key.</para>
+    FIDO2 (<literal>/cryptsetup-fido2-salt/</literal>) and TPM2 (<literal>/cryptsetup-tpm2/</literal>).
+    A different path component is used so that services providing key material know that the secret key was
+    not requested directly, but instead an encrypted key that will be decrypted via the PKCS#11/FIDO2/TPM2
+    logic to acquire the final secret key.</para>
   </refsect1>
 
   <refsect1>

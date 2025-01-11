@@ -396,6 +396,7 @@ static int ipv4acd_on_packet(
                 }
                 break;
 
+        case IPV4ACD_STATE_STARTED:
         case IPV4ACD_STATE_WAITING_PROBE:
         case IPV4ACD_STATE_PROBING:
         case IPV4ACD_STATE_WAITING_ANNOUNCE:
@@ -564,7 +565,8 @@ int sd_ipv4acd_get_address(sd_ipv4acd *acd, struct in_addr *address) {
 }
 
 int sd_ipv4acd_is_running(sd_ipv4acd *acd) {
-        assert_return(acd, false);
+        if (!acd)
+                return false;
 
         return acd->state != IPV4ACD_STATE_INIT;
 }

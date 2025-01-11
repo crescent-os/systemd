@@ -172,7 +172,7 @@ COREDUMP_CMDLINE=/usr/lib64/firefox/firefox -contentproc -childID 5 -isForBrowse
 COREDUMP_CGROUP=/user.slice/user-1000.slice/user@1000.service/app.slice/app-….scope
 COREDUMP_FILENAME=/var/lib/systemd/coredump/core.Web….552351.….zst
 …
-    </programlisting>
+</programlisting>
 
     <para>The following fields are saved (if known) with the journal entry</para>
 
@@ -305,7 +305,7 @@ flags:   ...
 pos:     ...
 flags:   ...
 ...
-        </programlisting>
+</programlisting>
 
         <para>The first line contains the file descriptor number <replaceable>fd</replaceable> and the path,
         while subsequent lines show the contents of
@@ -412,12 +412,14 @@ flags:   ...
         <term><varname>COREDUMP_PACKAGE_VERSION=</varname></term>
         <term><varname>COREDUMP_PACKAGE_JSON=</varname></term>
 
-        <listitem><para>If the executable contained .package metadata ELF notes, they will be
-        parsed and attached. The <varname>package</varname> and <varname>packageVersion</varname>
-        of the 'main' ELF module (ie: the executable) will be appended individually. The
-        JSON-formatted content of all modules will be appended as a single JSON object, each with
-        the module name as the key. For more information about this metadata format and content, see
-        <ulink url="https://systemd.io/COREDUMP_PACKAGE_METADATA/">the coredump metadata spec</ulink>.</para>
+        <listitem><para>If the executable contained .package metadata ELF notes, they will be parsed and
+        attached. The <varname>package</varname> and <varname>version</varname> of the 'main' ELF module
+        (i.e., the executable) will be appended individually. The JSON-formatted content of all modules will
+        be appended as a single JSON object, each with the module name as the key. For more information about
+        this metadata format and content, see the
+        <ulink url="https://systemd.io/PACKAGE_METADATA_FOR_EXECUTABLE_FILES/">Package Metadata for  Executable Files</ulink>
+        document.
+        </para>
 
         <xi:include href="version-info.xml" xpointer="v249"/>
         </listitem>

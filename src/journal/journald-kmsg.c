@@ -98,7 +98,7 @@ static bool is_us(const char *identifier, const char *pid) {
 
 void dev_kmsg_record(Server *s, char *p, size_t l) {
 
-        _cleanup_free_ char *message = NULL, *syslog_priority = NULL, *syslog_pid = NULL, *syslog_facility = NULL, *syslog_identifier = NULL, *source_time = NULL, *identifier = NULL, *pid = NULL;
+        _cleanup_free_ char *message = NULL, *syslog_pid = NULL, *syslog_identifier = NULL, *identifier = NULL, *pid = NULL;
         struct iovec iovec[N_IOVEC_META_FIELDS + 7 + N_IOVEC_KERNEL_FIELDS + 2 + N_IOVEC_UDEV_FIELDS];
         char *kernel_device = NULL;
         unsigned long long usec;
@@ -253,16 +253,25 @@ void dev_kmsg_record(Server *s, char *p, size_t l) {
                 }
         }
 
-        if (asprintf(&source_time, "_SOURCE_MONOTONIC_TIMESTAMP=%llu", usec) >= 0)
-                iovec[n++] = IOVEC_MAKE_STRING(source_time);
+        char source_boot_time[STRLEN("_SOURCE_BOOTTIME_TIMESTAMP=") + DECIMAL_STR_MAX(unsigned long long)];
+        xsprintf(source_boot_time, "_SOURCE_BOOTTIME_TIMESTAMP=%llu", usec);
+        iovec[n++] = IOVEC_MAKE_STRING(source_boot_time);
+
+        /* Historically, we stored the timestamp 'usec' as _SOURCE_MONOTONIC_TIMESTAMP, so we cannot remove
+         * the field as it is already used in other projects. This is for backward compatibility. */
+        char source_monotonic_time[STRLEN("_SOURCE_MONOTONIC_TIMESTAMP=") + DECIMAL_STR_MAX(unsigned long long)];
+        xsprintf(source_monotonic_time, "_SOURCE_MONOTONIC_TIMESTAMP=%llu", usec);
+        iovec[n++] = IOVEC_MAKE_STRING(source_monotonic_time);
 
         iovec[n++] = IOVEC_MAKE_STRING("_TRANSPORT=kernel");
 
-        if (asprintf(&syslog_priority, "PRIORITY=%i", priority & LOG_PRIMASK) >= 0)
-                iovec[n++] = IOVEC_MAKE_STRING(syslog_priority);
+        char syslog_priority[STRLEN("PRIORITY=") + DECIMAL_STR_MAX(int)];
+        xsprintf(syslog_priority, "PRIORITY=%i", LOG_PRI(priority));
+        iovec[n++] = IOVEC_MAKE_STRING(syslog_priority);
 
-        if (asprintf(&syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority)) >= 0)
-                iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
+        char syslog_facility[STRLEN("SYSLOG_FACILITY=") + DECIMAL_STR_MAX(int)];
+        xsprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
+        iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
 
         if (LOG_FAC(priority) == LOG_KERN)
                 iovec[n++] = IOVEC_MAKE_STRING("SYSLOG_IDENTIFIER=kernel");
@@ -377,20 +386,17 @@ static int dispatch_dev_kmsg(sd_event_source *es, int fd, uint32_t revents, void
 }
 
 int server_open_dev_kmsg(Server *s) {
-        mode_t mode;
         int r;
 
         assert(s);
 
-        if (s->read_kmsg)
-                mode = O_RDWR|O_CLOEXEC|O_NONBLOCK|O_NOCTTY;
-        else
-                mode = O_WRONLY|O_CLOEXEC|O_NONBLOCK|O_NOCTTY;
+        mode_t mode = O_CLOEXEC|O_NONBLOCK|O_NOCTTY|
+                (s->read_kmsg ? O_RDWR : O_WRONLY);
 
         s->dev_kmsg_fd = open("/dev/kmsg", mode);
         if (s->dev_kmsg_fd < 0) {
                 log_full_errno(errno == ENOENT ? LOG_DEBUG : LOG_WARNING,
-                               errno, "Failed to open /dev/kmsg, ignoring: %m");
+                               errno, "Failed to open /dev/kmsg for %s access, ignoring: %m", accmode_to_string(mode));
                 return 0;
         }
 
@@ -399,6 +405,7 @@ int server_open_dev_kmsg(Server *s) {
 
         r = sd_event_add_io(s->event, &s->dev_kmsg_event_source, s->dev_kmsg_fd, EPOLLIN, dispatch_dev_kmsg, s);
         if (r == -EPERM) { /* This will fail with EPERM on older kernels where /dev/kmsg is not readable. */
+                log_debug_errno(r, "Not reading from /dev/kmsg since that's not supported, apparently.");
                 r = 0;
                 goto finish;
         }

@@ -4,7 +4,7 @@
 # Polish translation
 
 # The catalog format is documented on
-# https://www.freedesktop.org/wiki/Software/systemd/catalog
+# https://systemd.io/CATALOG
 
 # For an explanation why we do all this, see https://xkcd.com/1024/
 
@@ -122,6 +122,18 @@ Support: %SUPPORT_URL%
 Documentation: sd-login(3)
 
 Stanowisko @SEAT_ID@ zostało usunięte i nie jest już dostępne.
+
+-- b2bcbaf5edf948e093ce50bbea0e81ec
+Subject: Klawisz SAK (Secure Attention Key) został naciśnięty na stanowisku @SEAT_ID@
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-logind.service(8)
+
+Klawisz SAK (Secure Attention Key), Ctrl+Alt+Shift+Esc, został naciśnięty
+na stanowisku @SEAT_ID@.
+
+Naciśnięcie klawisza SAK wskazuje na bezpośrednie żądanie użytkownika,
+aby system wyświetlił zabezpieczone okno lub ekran logowania.
 
 -- c7a787079b354eaaa9e77b371893cd27
 Subject: Zmiana czasu
@@ -564,15 +576,29 @@ Defined-By: systemd
 Support: %SUPPORT_URL%
 
 Możliwe są następujące „etykiety”:
-• „cgroups-missing” — jądro zostało skompilowane bez obsługi cgroups
-  lub dostęp do oczekiwanych plików interfejsu jest ograniczony,
-• „var-run-bad” — /var/run nie jest dowiązaniem symbolicznym do /run,
+• „unmerged-usr” — /bin, /sbin, /lib* nie są dowiązaniami symbolicznymi
+  do swoich odpowiedników pod /usr/,
+• „unmerged-bin” — /usr/sbin nie jest dowiązaniem symbolicznym do /usr/bin/,
+• „var-run-bad” — /var/run nie jest dowiązaniem symbolicznym do /run/,
+• „cgroupsv1” — system używa przestarzałej hierarchii cgroup v1,
+• „local-hwclock” — lokalny zegar sprzętowy (RTC) jest skonfigurowany
+  do działania w czasie lokalnym zamiast w uniwersalnym czasie
+  koordynowanym (UTC),
+• „support-ended” — system działa po końcu wsparcia zadeklarowanym
+  przez producenta,
+• „old-kernel” — system działa na wersji jądra starszej niż minimalna
+  obsługiwana przez tę wersję systemd,
 • „overflowuid-not-65534” — identyfikator użytkownika dla „nieznanych”
   użytkowników (przy wykorzystaniu przestrzeni nazw użytkowników lub NFS)
   nie wynosi 65534,
 • „overflowgid-not-65534” — identyfikator grupy dla „nieznanych”
   użytkowników (przy wykorzystaniu przestrzeni nazw użytkowników lub NFS)
-  nie wynosi 65534.
+  nie wynosi 65534,
+• „short-uid-range” — zakres UID przydzielony do działającego wystąpienia
+  systemd pokrywa mniej niż 0…65534,
+• „short-gid-range” — zakres GID przydzielony do działającego wystąpienia
+  systemd pokrywa mniej niż 0…65534.
+
 Obecny system ma etykietę „@TAINT@”.
 
 -- fe6faa94e7774663a0da52717891d8ef
@@ -709,16 +735,6 @@ Support: %SUPPORT_URL%
 Po raz pierwszy podczas obecnego uruchomienia uzyskano synchronizację NTP
 i zainicjowano regulację lokalnego zegara systemowego.
 
--- 7db73c8af0d94eeb822ae04323fe6ab6
-Subject: Początkowe przestawienie zegara
-Defined-By: systemd
-Support: %SUPPORT_URL%
-
-Przestawiono zegar systemowy na podstawie pliku ze znacznikiem czasu na dysku
-w celu zapewnienia, że nadal jest w przybliżeniu monotoniczny — nawet między
-ponownymi uruchomieniami — jeśli zegar czasu rzeczywistego jest niedostępny
-lub zawodny.
-
 -- 3f7d5ef3e54f4302b4f0b143bb270cab
 Subject: Rozszerzono PCR układu TPM
 Defined-By: systemd
@@ -787,3 +803,31 @@ Documentation: https://systemd.io/PORTABLE_SERVICES/
 Z systemu odłączono usługę przenośną @PORTABLE_ROOT@ (z rozszerzeniami:
 @PORTABLE_EXTENSION@) i nie jest już dostępna do użytku. Polecenie
 „portablectl list” wyświetli listę dołączonych usług przenośnych.
+
+-- ad7089f928ac4f7ea00c07457d47ba8a
+Subject: Niepowodzenie upoważnienia podczas próby zapisania klucza SRK w układzie TPM
+Defined-By: systemd
+Support: %SUPPORT_URL%
+Documentation: man:systemd-tpm2-setup.service(8)
+
+Wystąpiło niepowodzenie upoważnienia podczas próby zapisania klucza
+SRK (Storage Root Key) na układzie TPM (Trusted Platform Module).
+Najprawdopodobniej oznacza to, że kod PIN/hasło (authValue) zostało
+ustawione na hierarchii właściciela (Owner) układu TPM.
+
+Automatyczny zapis klucza SRK na układach TPM w takich przypadkach
+nie jest obsługiwany. Aby usunąć ustawienie ochrony kodem PIN/hasłem
+na hierarchii właściciela, należy wykonać to polecenie:
+„tpm2_changeauth -c o -p <POPRZEDNIE-HASŁO> ""”.
+
+-- 9cf56b8baf9546cf9478783a8de42113
+Subject: Obcy proces zmienił sysctl zarządzane przez systemd-networkd
+Defined-By: systemd
+Support: %SUPPORT_URL%
+
+Ustawienie konfiguracji sysctl @SYSCTL@, które jest zarządzane przez
+systemd-networkd, zostało zmienione przez inny, niepowiązany proces
+(„@OBJECT_COMM@”, PID @OBJECT_PID@). To tworzy konflikt właścicielstwa,
+co prawdopodobnie spowoduje problemy w późniejszym czasie.
+
+Wartość zmieniła się na „@NEWVALUE@”, a powinna wynosić „@OURVALUE@”.

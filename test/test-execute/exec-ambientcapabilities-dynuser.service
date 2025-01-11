@@ -8,3 +8,5 @@ Type=oneshot
 AmbientCapabilities=CAP_CHOWN CAP_SETUID CAP_NET_RAW
 DynamicUser=yes
 PrivateUsers=yes
+EnvironmentFile=-/usr/lib/systemd/systemd-asan-env
+ReadWritePaths=-/coverage

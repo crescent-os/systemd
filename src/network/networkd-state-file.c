@@ -5,6 +5,7 @@
 
 #include "alloc-util.h"
 #include "dns-domain.h"
+#include "dns-resolver-internal.h"
 #include "escape.h"
 #include "fd-util.h"
 #include "fileio.h"
@@ -15,6 +16,7 @@
 #include "networkd-manager-bus.h"
 #include "networkd-manager.h"
 #include "networkd-network.h"
+#include "networkd-ntp.h"
 #include "networkd-state-file.h"
 #include "ordered-set.h"
 #include "set.h"
@@ -101,7 +103,7 @@ static int link_put_dns(Link *link, OrderedSet **s) {
         if (r < 0)
                 return r;
 
-        if (link->dhcp_lease && link->network->dhcp_use_dns) {
+        if (link->dhcp_lease && link_get_use_dns(link, NETWORK_CONFIG_SOURCE_DHCP4)) {
                 const struct in_addr *addresses;
 
                 r = sd_dhcp_lease_get_dns(link->dhcp_lease, &addresses);
@@ -112,7 +114,25 @@ static int link_put_dns(Link *link, OrderedSet **s) {
                 }
         }
 
-        if (link->dhcp6_lease && link->network->dhcp6_use_dns) {
+        if (link->dhcp_lease && link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_DHCP4)) {
+                sd_dns_resolver *resolvers;
+
+                r = sd_dhcp_lease_get_dnr(link->dhcp_lease, &resolvers);
+                if (r >= 0) {
+                        struct in_addr_full **dot_servers;
+                        size_t n = 0;
+                        CLEANUP_ARRAY(dot_servers, n, in_addr_full_array_free);
+
+                        r = dns_resolvers_to_dot_addrs(resolvers, r, &dot_servers, &n);
+                        if (r < 0)
+                                return r;
+                        r = ordered_set_put_dns_servers(s, link->ifindex, dot_servers, n);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (link->dhcp6_lease && link_get_use_dns(link, NETWORK_CONFIG_SOURCE_DHCP6)) {
                 const struct in6_addr *addresses;
 
                 r = sd_dhcp6_lease_get_dns(link->dhcp6_lease, &addresses);
@@ -123,11 +143,48 @@ static int link_put_dns(Link *link, OrderedSet **s) {
                 }
         }
 
-        if (link->network->ndisc_use_dns) {
+        if (link->dhcp6_lease && link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_DHCP6)) {
+                sd_dns_resolver *resolvers;
+
+                r = sd_dhcp6_lease_get_dnr(link->dhcp6_lease, &resolvers);
+                if (r >= 0 ) {
+                        struct in_addr_full **dot_servers;
+                        size_t n = 0;
+                        CLEANUP_ARRAY(dot_servers, n, in_addr_full_array_free);
+
+                        r = dns_resolvers_to_dot_addrs(resolvers, r, &dot_servers, &n);
+                        if (r < 0)
+                                return r;
+
+                        r = ordered_set_put_dns_servers(s, link->ifindex, dot_servers, n);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (link_get_use_dns(link, NETWORK_CONFIG_SOURCE_NDISC)) {
                 NDiscRDNSS *a;
 
                 SET_FOREACH(a, link->ndisc_rdnss) {
                         r = ordered_set_put_in6_addrv(s, &a->address, 1);
+                        if (r < 0)
+                                return r;
+                }
+        }
+
+        if (link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_NDISC)) {
+                NDiscDNR *a;
+
+                SET_FOREACH(a, link->ndisc_dnr) {
+                        struct in_addr_full **dot_servers = NULL;
+                        size_t n = 0;
+                        CLEANUP_ARRAY(dot_servers, n, in_addr_full_array_free);
+
+                        r = dns_resolvers_to_dot_addrs(&a->resolver, 1, &dot_servers, &n);
+                        if (r < 0)
+                                return r;
+
+                        r = ordered_set_put_dns_servers(s, link->ifindex, dot_servers, n);
                         if (r < 0)
                                 return r;
                 }
@@ -150,7 +207,7 @@ static int link_put_ntp(Link *link, OrderedSet **s) {
         if (r < 0)
                 return r;
 
-        if (link->dhcp_lease && link->network->dhcp_use_ntp) {
+        if (link->dhcp_lease && link_get_use_ntp(link, NETWORK_CONFIG_SOURCE_DHCP4)) {
                 const struct in_addr *addresses;
 
                 r = sd_dhcp_lease_get_ntp(link->dhcp_lease, &addresses);
@@ -161,7 +218,7 @@ static int link_put_ntp(Link *link, OrderedSet **s) {
                 }
         }
 
-        if (link->dhcp6_lease && link->network->dhcp6_use_ntp) {
+        if (link->dhcp6_lease && link_get_use_ntp(link, NETWORK_CONFIG_SOURCE_DHCP6)) {
                 const struct in6_addr *addresses;
                 char **fqdn;
 
@@ -190,7 +247,7 @@ static int link_put_sip(Link *link, OrderedSet **s) {
         assert(link->network);
         assert(s);
 
-        if (link->dhcp_lease && link->network->dhcp_use_ntp) {
+        if (link->dhcp_lease && link->network->dhcp_use_sip) {
                 const struct in_addr *addresses;
 
                 r = sd_dhcp_lease_get_sip(link->dhcp_lease, &addresses);
@@ -206,7 +263,7 @@ static int link_put_sip(Link *link, OrderedSet **s) {
 
 static int link_put_domains(Link *link, bool is_route, OrderedSet **s) {
         OrderedSet *link_domains, *network_domains;
-        DHCPUseDomains use_domains;
+        UseDomains use_domains;
         int r;
 
         assert(link);
@@ -215,7 +272,7 @@ static int link_put_domains(Link *link, bool is_route, OrderedSet **s) {
 
         link_domains = is_route ? link->route_domains : link->search_domains;
         network_domains = is_route ? link->network->route_domains : link->network->search_domains;
-        use_domains = is_route ? DHCP_USE_DOMAINS_ROUTE : DHCP_USE_DOMAINS_YES;
+        use_domains = is_route ? USE_DOMAINS_ROUTE : USE_DOMAINS_YES;
 
         if (link_domains)
                 return ordered_set_put_string_set(s, link_domains);
@@ -224,7 +281,7 @@ static int link_put_domains(Link *link, bool is_route, OrderedSet **s) {
         if (r < 0)
                 return r;
 
-        if (link->dhcp_lease && link->network->dhcp_use_domains == use_domains) {
+        if (link->dhcp_lease && link_get_use_domains(link, NETWORK_CONFIG_SOURCE_DHCP4) == use_domains) {
                 const char *domainname;
                 char **domains;
 
@@ -243,7 +300,7 @@ static int link_put_domains(Link *link, bool is_route, OrderedSet **s) {
                 }
         }
 
-        if (link->dhcp6_lease && link->network->dhcp6_use_domains == use_domains) {
+        if (link->dhcp6_lease && link_get_use_domains(link, NETWORK_CONFIG_SOURCE_DHCP6) == use_domains) {
                 char **domains;
 
                 r = sd_dhcp6_lease_get_domains(link->dhcp6_lease, &domains);
@@ -254,7 +311,7 @@ static int link_put_domains(Link *link, bool is_route, OrderedSet **s) {
                 }
         }
 
-        if (link->network->ndisc_use_domains == use_domains) {
+        if (link_get_use_domains(link, NETWORK_CONFIG_SOURCE_NDISC) == use_domains) {
                 NDiscDNSSL *a;
 
                 SET_FOREACH(a, link->ndisc_dnssl) {
@@ -276,10 +333,6 @@ int manager_save(Manager *m) {
                 address_state = LINK_ADDRESS_STATE_OFF;
         LinkOnlineState online_state;
         size_t links_offline = 0, links_online = 0;
-        _cleanup_(unlink_and_freep) char *temp_path = NULL;
-        _cleanup_strv_free_ char **p = NULL;
-        _cleanup_fclose_ FILE *f = NULL;
-        Link *link;
         int r;
 
         assert(m);
@@ -287,6 +340,7 @@ int manager_save(Manager *m) {
         if (isempty(m->state_file))
                 return 0; /* Do not update state file when running in test mode. */
 
+        Link *link;
         HASHMAP_FOREACH(link, m->links_by_index) {
                 if (link->flags & IFF_LOOPBACK)
                         continue;
@@ -335,20 +389,14 @@ int manager_save(Manager *m) {
                 (links_offline > 0 ? LINK_ONLINE_STATE_PARTIAL : LINK_ONLINE_STATE_ONLINE) :
                 (links_offline > 0 ? LINK_ONLINE_STATE_OFFLINE : _LINK_ONLINE_STATE_INVALID);
 
-        operstate_str = link_operstate_to_string(operstate);
-        assert(operstate_str);
+        operstate_str = ASSERT_PTR(link_operstate_to_string(operstate));
+        carrier_state_str = ASSERT_PTR(link_carrier_state_to_string(carrier_state));
+        address_state_str = ASSERT_PTR(link_address_state_to_string(address_state));
+        ipv4_address_state_str = ASSERT_PTR(link_address_state_to_string(ipv4_address_state));
+        ipv6_address_state_str = ASSERT_PTR(link_address_state_to_string(ipv6_address_state));
 
-        carrier_state_str = link_carrier_state_to_string(carrier_state);
-        assert(carrier_state_str);
-
-        address_state_str = link_address_state_to_string(address_state);
-        assert(address_state_str);
-
-        ipv4_address_state_str = link_address_state_to_string(ipv4_address_state);
-        assert(ipv4_address_state_str);
-
-        ipv6_address_state_str = link_address_state_to_string(ipv6_address_state);
-        assert(ipv6_address_state_str);
+        _cleanup_(unlink_and_freep) char *temp_path = NULL;
+        _cleanup_fclose_ FILE *f = NULL;
 
         r = fopen_temporary(m->state_file, &f, &temp_path);
         if (r < 0)
@@ -384,6 +432,8 @@ int manager_save(Manager *m) {
                 return r;
 
         temp_path = mfree(temp_path);
+
+        _cleanup_strv_free_ char **p = NULL;
 
         if (m->operational_state != operstate) {
                 m->operational_state = operstate;
@@ -528,7 +578,65 @@ static void serialize_addresses(
                 fputc('\n', f);
 }
 
-static void link_save_domains(Link *link, FILE *f, OrderedSet *static_domains, DHCPUseDomains use_domains) {
+static void serialize_resolvers(
+                FILE *f,
+                const char *lvalue,
+                bool *space,
+                sd_dhcp_lease *lease,
+                bool conditional,
+                sd_dhcp6_lease *lease6,
+                bool conditional6) {
+
+        bool _space = false;
+        if (!space)
+                space = &_space;
+
+        if (lvalue)
+                fprintf(f, "%s=", lvalue);
+
+        if (lease && conditional) {
+                sd_dns_resolver *resolvers;
+                _cleanup_strv_free_ char **names = NULL;
+                int r;
+
+                r = sd_dhcp_lease_get_dnr(lease, &resolvers);
+                if (r < 0 && r != -ENODATA)
+                        log_warning_errno(r, "Failed to get DNR from DHCP lease, ignoring: %m");
+
+                if (r > 0) {
+                        r = dns_resolvers_to_dot_strv(resolvers, r, &names);
+                        if (r < 0)
+                                return (void) log_warning_errno(r, "Failed to get DoT servers from DHCP DNR, ignoring: %m");
+                        if (r > 0)
+                                fputstrv(f, names, NULL, space);
+                }
+        }
+
+        if (lease6 && conditional6) {
+                sd_dns_resolver *resolvers;
+                _cleanup_strv_free_ char **names = NULL;
+                int r;
+
+                r = sd_dhcp6_lease_get_dnr(lease6, &resolvers);
+                if (r < 0 && r != -ENODATA)
+                        log_warning_errno(r, "Failed to get DNR from DHCPv6 lease, ignoring: %m");
+
+                if (r > 0) {
+                        r = dns_resolvers_to_dot_strv(resolvers, r, &names);
+                        if (r < 0)
+                                return (void) log_warning_errno(r, "Failed to get DoT servers from DHCPv6 DNR, ignoring: %m");
+                        if (r > 0)
+                                fputstrv(f, names, NULL, space);
+                }
+        }
+
+        if (lvalue)
+                fputc('\n', f);
+
+        return;
+}
+
+static void link_save_domains(Link *link, FILE *f, OrderedSet *static_domains, UseDomains use_domains) {
         bool space = false;
         const char *p;
 
@@ -539,10 +647,10 @@ static void link_save_domains(Link *link, FILE *f, OrderedSet *static_domains, D
         ORDERED_SET_FOREACH(p, static_domains)
                 fputs_with_separator(f, p, NULL, &space);
 
-        if (use_domains == DHCP_USE_DOMAINS_NO)
+        if (use_domains == USE_DOMAINS_NO)
                 return;
 
-        if (link->dhcp_lease && link->network->dhcp_use_domains == use_domains) {
+        if (link->dhcp_lease && link_get_use_domains(link, NETWORK_CONFIG_SOURCE_DHCP4) == use_domains) {
                 const char *domainname;
                 char **domains;
 
@@ -552,14 +660,14 @@ static void link_save_domains(Link *link, FILE *f, OrderedSet *static_domains, D
                         fputstrv(f, domains, NULL, &space);
         }
 
-        if (link->dhcp6_lease && link->network->dhcp6_use_domains == use_domains) {
+        if (link->dhcp6_lease && link_get_use_domains(link, NETWORK_CONFIG_SOURCE_DHCP6) == use_domains) {
                 char **domains;
 
                 if (sd_dhcp6_lease_get_domains(link->dhcp6_lease, &domains) >= 0)
                         fputstrv(f, domains, NULL, &space);
         }
 
-        if (link->network->ndisc_use_domains == use_domains) {
+        if (link_get_use_domains(link, NETWORK_CONFIG_SOURCE_NDISC) == use_domains) {
                 NDiscDNSSL *dd;
 
                 SET_FOREACH(dd, link->ndisc_dnssl)
@@ -567,9 +675,32 @@ static void link_save_domains(Link *link, FILE *f, OrderedSet *static_domains, D
         }
 }
 
+static int serialize_config_files(FILE *f, const char *prefix, const char *main_config, char * const *dropins) {
+        assert(f);
+        assert(prefix);
+        assert(main_config);
+
+        fprintf(f, "%s_FILE=%s\n", prefix, main_config);
+
+        bool space = false;
+
+        fprintf(f, "%s_FILE_DROPINS=\"", prefix);
+        STRV_FOREACH(d, dropins) {
+                _cleanup_free_ char *escaped = NULL;
+
+                escaped = xescape(*d, ":");
+                if (!escaped)
+                        return -ENOMEM;
+
+                fputs_with_separator(f, escaped, ":", &space);
+        }
+        fputs("\"\n", f);
+
+        return 0;
+}
+
 static int link_save(Link *link) {
-        const char *admin_state, *oper_state, *carrier_state, *address_state, *ipv4_address_state, *ipv6_address_state,
-                *captive_portal;
+        const char *admin_state, *oper_state, *carrier_state, *address_state, *ipv4_address_state, *ipv6_address_state;
         _cleanup_(unlink_and_freep) char *temp_path = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
@@ -583,23 +714,12 @@ static int link_save(Link *link) {
         if (link->state == LINK_STATE_LINGER)
                 return 0;
 
-        admin_state = link_state_to_string(link->state);
-        assert(admin_state);
-
-        oper_state = link_operstate_to_string(link->operstate);
-        assert(oper_state);
-
-        carrier_state = link_carrier_state_to_string(link->carrier_state);
-        assert(carrier_state);
-
-        address_state = link_address_state_to_string(link->address_state);
-        assert(address_state);
-
-        ipv4_address_state = link_address_state_to_string(link->ipv4_address_state);
-        assert(ipv4_address_state);
-
-        ipv6_address_state = link_address_state_to_string(link->ipv6_address_state);
-        assert(ipv6_address_state);
+        admin_state = ASSERT_PTR(link_state_to_string(link->state));
+        oper_state = ASSERT_PTR(link_operstate_to_string(link->operstate));
+        carrier_state = ASSERT_PTR(link_carrier_state_to_string(link->carrier_state));
+        address_state = ASSERT_PTR(link_address_state_to_string(link->address_state));
+        ipv4_address_state = ASSERT_PTR(link_address_state_to_string(link->ipv4_address_state));
+        ipv6_address_state = ASSERT_PTR(link_address_state_to_string(link->ipv6_address_state));
 
         r = fopen_temporary(link->state_file, &f, &temp_path);
         if (r < 0)
@@ -617,8 +737,14 @@ static int link_save(Link *link) {
                 "IPV6_ADDRESS_STATE=%s\n",
                 admin_state, oper_state, carrier_state, address_state, ipv4_address_state, ipv6_address_state);
 
+        if (link->netdev) {
+                r = serialize_config_files(f, "NETDEV", link->netdev->filename, link->netdev->dropins);
+                if (r < 0)
+                        return r;
+        }
+
         if (link->network) {
-                const char *online_state;
+                const char *online_state, *captive_portal;
                 bool space = false;
 
                 online_state = link_online_state_to_string(link->online_state);
@@ -640,19 +766,9 @@ static int link_save(Link *link) {
                 fprintf(f, "ACTIVATION_POLICY=%s\n",
                         activation_policy_to_string(link->network->activation_policy));
 
-                fprintf(f, "NETWORK_FILE=%s\n", link->network->filename);
-
-                fputs("NETWORK_FILE_DROPINS=\"", f);
-                STRV_FOREACH(d, link->network->dropins) {
-                        _cleanup_free_ char *escaped = NULL;
-
-                        escaped = xescape(*d, ":");
-                        if (!escaped)
-                                return -ENOMEM;
-
-                        fputs_with_separator(f, escaped, ":", &space);
-                }
-                fputs("\"\n", f);
+                r = serialize_config_files(f, "NETWORK", link->network->filename, link->network->dropins);
+                if (r < 0)
+                        return r;
 
                 /************************************************************/
 
@@ -663,17 +779,32 @@ static int link_save(Link *link) {
                         space = false;
                         link_save_dns(link, f, link->network->dns, link->network->n_dns, &space);
 
+                        /* DNR resolvers are not required to provide Do53 service, however resolved doesn't
+                         * know how to handle such a server so for now Do53 service is required, and
+                         * assumed. */
+                        serialize_resolvers(f, NULL, &space,
+                                            link->dhcp_lease,
+                                            link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_DHCP4),
+                                            link->dhcp6_lease,
+                                            link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_DHCP6));
+
+                        if (link_get_use_dnr(link, NETWORK_CONFIG_SOURCE_NDISC)) {
+                                NDiscDNR *dnr;
+                                SET_FOREACH(dnr, link->ndisc_dnr)
+                                        serialize_dnr(f, &dnr->resolver, 1, &space);
+                        }
+
                         serialize_addresses(f, NULL, &space,
                                             NULL,
                                             link->dhcp_lease,
-                                            link->network->dhcp_use_dns,
+                                            link_get_use_dns(link, NETWORK_CONFIG_SOURCE_DHCP4),
                                             SD_DHCP_LEASE_DNS,
                                             link->dhcp6_lease,
-                                            link->network->dhcp6_use_dns,
+                                            link_get_use_dns(link, NETWORK_CONFIG_SOURCE_DHCP6),
                                             sd_dhcp6_lease_get_dns,
                                             NULL);
 
-                        if (link->network->ndisc_use_dns) {
+                        if (link_get_use_dns(link, NETWORK_CONFIG_SOURCE_NDISC)) {
                                 NDiscRDNSS *dd;
 
                                 SET_FOREACH(dd, link->ndisc_rdnss)
@@ -693,10 +824,10 @@ static int link_save(Link *link) {
                         serialize_addresses(f, "NTP", NULL,
                                             link->network->ntp,
                                             link->dhcp_lease,
-                                            link->network->dhcp_use_ntp,
+                                            link_get_use_ntp(link, NETWORK_CONFIG_SOURCE_DHCP4),
                                             SD_DHCP_LEASE_NTP,
                                             link->dhcp6_lease,
-                                            link->network->dhcp6_use_ntp,
+                                            link_get_use_ntp(link, NETWORK_CONFIG_SOURCE_DHCP6),
                                             sd_dhcp6_lease_get_ntp_addrs,
                                             sd_dhcp6_lease_get_ntp_fqdn);
 
@@ -720,18 +851,18 @@ static int link_save(Link *link) {
 
                 fputs("DOMAINS=", f);
                 if (link->search_domains)
-                        link_save_domains(link, f, link->search_domains, DHCP_USE_DOMAINS_NO);
+                        link_save_domains(link, f, link->search_domains, USE_DOMAINS_NO);
                 else
-                        link_save_domains(link, f, link->network->search_domains, DHCP_USE_DOMAINS_YES);
+                        link_save_domains(link, f, link->network->search_domains, USE_DOMAINS_YES);
                 fputc('\n', f);
 
                 /************************************************************/
 
                 fputs("ROUTE_DOMAINS=", f);
                 if (link->route_domains)
-                        link_save_domains(link, f, link->route_domains, DHCP_USE_DOMAINS_NO);
+                        link_save_domains(link, f, link->route_domains, USE_DOMAINS_NO);
                 else
-                        link_save_domains(link, f, link->network->route_domains, DHCP_USE_DOMAINS_ROUTE);
+                        link_save_domains(link, f, link->network->route_domains, USE_DOMAINS_ROUTE);
                 fputc('\n', f);
 
                 /************************************************************/
@@ -777,8 +908,9 @@ static int link_save(Link *link) {
                 if (!set_isempty(nta_anchors)) {
                         const char *n;
 
-                        fputs("DNSSEC_NTA=", f);
                         space = false;
+
+                        fputs("DNSSEC_NTA=", f);
                         SET_FOREACH(n, nta_anchors)
                                 fputs_with_separator(f, n, NULL, &space);
                         fputc('\n', f);
@@ -793,9 +925,7 @@ static int link_save(Link *link) {
                 if (r < 0)
                         return r;
 
-                fprintf(f,
-                        "DHCP_LEASE=%s\n",
-                        link->lease_file);
+                fprintf(f, "DHCP_LEASE=%s\n", link->lease_file);
         } else
                 (void) unlink(link->lease_file);
 
@@ -821,6 +951,11 @@ void link_dirty(Link *link) {
 
         assert(link);
         assert(link->manager);
+
+        /* When the manager is in MANAGER_STOPPED, it is not necessary to update state files anymore, as they
+         * will be removed soon anyway. Moreover, we cannot call link_ref() in that case. */
+        if (link->manager->state == MANAGER_STOPPED)
+                return;
 
         /* The serialized state in /run is no longer up-to-date. */
 

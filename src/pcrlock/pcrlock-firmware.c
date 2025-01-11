@@ -100,12 +100,12 @@ int validate_firmware_header(
         if (size < (uint64_t) offsetof(TCG_PCClientPCREvent, event) + (uint64_t) h->eventDataSize)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log too short for TCG_PCClientPCREvent events data.");
 
-        if (h->pcrIndex != 0)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected PCR index %" PRIu32, h->pcrIndex);
         if (h->eventType != EV_NO_ACTION)
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected event type 0x%" PRIx32, h->eventType);
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected event type 0x%08" PRIx32 ". (Probably not a TPM2 event log?)", h->eventType);
+        if (h->pcrIndex != 0)
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected PCR index %" PRIu32 ". (Probably not a TPM2 event log?)", h->pcrIndex);
         if (!memeqzero(h->digest, sizeof(h->digest)))
-                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected non-zero digest.");
+                return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header has unexpected non-zero digest. (Probably not a TPM2 event log?)");
 
         if (h->eventDataSize < offsetof(TCG_EfiSpecIDEvent, digestSizes))
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header too short for TCG_EfiSpecIdEvent.");
@@ -128,7 +128,7 @@ int validate_firmware_header(
 
         log_debug("TPM PC Client Platform Firmware Profile: family %u.%u, revision %u.%u",
                   id->specVersionMajor, id->specVersionMinor,
-                  id->specErrata / 100, id->specErrata % 100);
+                  id->specErrata / 100U, id->specErrata % 100U);
 
         if (h->eventDataSize < (uint64_t) offsetof(TCG_EfiSpecIDEvent, digestSizes) + (uint64_t) (id->numberOfAlgorithms * sizeof(TCG_EfiSpecIdEventAlgorithmSize)) + 1U)
                 return log_error_errno(SYNTHETIC_ERRNO(EBADMSG), "Event log header doesn't fit all algorithms.");

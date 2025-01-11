@@ -195,7 +195,7 @@ TEST(execution_order) {
         execute_directories(dirs, DEFAULT_TIMEOUT_USEC, ignore_stdout, ignore_stdout_args, NULL, NULL, EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
 
         assert_se(read_full_file(output, &contents, NULL) >= 0);
-        assert_se(streq(contents, "30-override\n80-foo\n90-bar\nlast\n"));
+        ASSERT_STREQ(contents, "30-override\n80-foo\n90-bar\nlast\n");
 }
 
 static int gather_stdout_one(int fd, void *arg) {
@@ -279,7 +279,7 @@ TEST(stdout_gathering) {
 
         log_info("got: %s", output);
 
-        assert_se(streq(output, "a\nb\nc\nd\n"));
+        ASSERT_STREQ(output, "a\nb\nc\nd\n");
 }
 
 TEST(environment_gathering) {
@@ -331,7 +331,7 @@ TEST(environment_gathering) {
         assert_se(chmod(name3, 0755) == 0);
 
         /* When booting in containers or without initrd there might not be any PATH in the environment and if
-         * there is no PATH /bin/sh built-in PATH may leak and override systemd's DEFAULT_PATH which is not
+         * there is no PATH /bin/sh built-in PATH may leak and override systemd's default path which is not
          * good. Force our own PATH in environment, to prevent expansion of sh built-in $PATH */
         old = getenv("PATH");
         r = setenv("PATH", "no-sh-built-in-path", 1);
@@ -346,15 +346,14 @@ TEST(environment_gathering) {
         STRV_FOREACH(p, env)
                 log_info("got env: \"%s\"", *p);
 
-        assert_se(streq(strv_env_get(env, "A"), "22:23:24"));
-        assert_se(streq(strv_env_get(env, "B"), "12"));
-        assert_se(streq(strv_env_get(env, "C"), "001"));
-        assert_se(streq(strv_env_get(env, "PATH"), "no-sh-built-in-path:/no/such/file"));
+        ASSERT_STREQ(strv_env_get(env, "A"), "22:23:24");
+        ASSERT_STREQ(strv_env_get(env, "B"), "12");
+        ASSERT_STREQ(strv_env_get(env, "C"), "001");
+        ASSERT_STREQ(strv_env_get(env, "PATH"), "no-sh-built-in-path:/no/such/file");
 
-        /* now retest with "default" path passed in, as created by
-         * manager_default_environment */
+        /* Now retest with some "default" path passed. */
         env = strv_free(env);
-        env = strv_new("PATH=" DEFAULT_PATH);
+        env = strv_new("PATH=" DEFAULT_PATH_WITHOUT_SBIN);
         assert_se(env);
 
         r = execute_directories(dirs, DEFAULT_TIMEOUT_USEC, gather_environment, args, NULL, env, EXEC_DIR_PARALLEL | EXEC_DIR_IGNORE_ERRORS);
@@ -363,10 +362,10 @@ TEST(environment_gathering) {
         STRV_FOREACH(p, env)
                 log_info("got env: \"%s\"", *p);
 
-        assert_se(streq(strv_env_get(env, "A"), "22:23:24"));
-        assert_se(streq(strv_env_get(env, "B"), "12"));
-        assert_se(streq(strv_env_get(env, "C"), "001"));
-        assert_se(streq(strv_env_get(env, "PATH"), DEFAULT_PATH ":/no/such/file"));
+        ASSERT_STREQ(strv_env_get(env, "A"), "22:23:24");
+        ASSERT_STREQ(strv_env_get(env, "B"), "12");
+        ASSERT_STREQ(strv_env_get(env, "C"), "001");
+        ASSERT_STREQ(strv_env_get(env, "PATH"), DEFAULT_PATH_WITHOUT_SBIN ":/no/such/file");
 
         /* reset environ PATH */
         assert_se(set_unset_env("PATH", old, true) == 0);
@@ -403,7 +402,9 @@ TEST(error_catching) {
         if (access(name, X_OK) < 0 && ERRNO_IS_PRIVILEGE(errno))
                 return;
 
-        r = execute_directories(dirs, DEFAULT_TIMEOUT_USEC, NULL, NULL, NULL, NULL, EXEC_DIR_NONE);
+        r = execute_directories(dirs, DEFAULT_TIMEOUT_USEC,
+                                /* callbacks = */ NULL, /* callback_args = */ NULL,
+                                /* argv = */ NULL, /* envp = */ NULL, /* flags = */ 0);
 
         /* we should exit with the error code of the first script that failed */
         assert_se(r == 42);
@@ -421,7 +422,6 @@ TEST(exec_command_flags_from_strv) {
         assert_se(FLAGS_SET(flags, EXEC_COMMAND_NO_ENV_EXPAND));
         assert_se(FLAGS_SET(flags, EXEC_COMMAND_NO_SETUID));
         assert_se(FLAGS_SET(flags, EXEC_COMMAND_IGNORE_FAILURE));
-        assert_se(!FLAGS_SET(flags, EXEC_COMMAND_AMBIENT_MAGIC));
         assert_se(!FLAGS_SET(flags, EXEC_COMMAND_FULLY_PRIVILEGED));
 
         r = exec_command_flags_from_strv(invalid_strv, &flags);
@@ -430,27 +430,19 @@ TEST(exec_command_flags_from_strv) {
 }
 
 TEST(exec_command_flags_to_strv) {
-        _cleanup_strv_free_ char **opts = NULL, **empty_opts = NULL, **invalid_opts = NULL;
-        ExecCommandFlags flags = 0;
-        int r;
+        _cleanup_strv_free_ char **opts = NULL;
 
-        flags |= (EXEC_COMMAND_AMBIENT_MAGIC|EXEC_COMMAND_NO_ENV_EXPAND|EXEC_COMMAND_IGNORE_FAILURE);
+        ASSERT_OK(exec_command_flags_to_strv(EXEC_COMMAND_NO_ENV_EXPAND|EXEC_COMMAND_IGNORE_FAILURE, &opts));
+        assert_se(strv_equal(opts, STRV_MAKE("ignore-failure", "no-env-expand")));
 
-        r = exec_command_flags_to_strv(flags, &opts);
+        opts = strv_free(opts);
 
-        assert_se(r == 0);
-        assert_se(strv_equal(opts, STRV_MAKE("ignore-failure", "ambient", "no-env-expand")));
+        ASSERT_OK(exec_command_flags_to_strv(0, &opts));
+        assert_se(strv_isempty(opts));
 
-        r = exec_command_flags_to_strv(0, &empty_opts);
+        opts = strv_free(opts);
 
-        assert_se(r == 0);
-        assert_se(strv_equal(empty_opts, STRV_MAKE_EMPTY));
-
-        flags = _EXEC_COMMAND_FLAGS_INVALID;
-
-        r = exec_command_flags_to_strv(flags, &invalid_opts);
-
-        assert_se(r == -EINVAL);
+        ASSERT_ERROR(exec_command_flags_to_strv(1U << 20, &opts), EINVAL);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

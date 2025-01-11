@@ -3,10 +3,12 @@
 #include "conf-files.h"
 #include "conf-parser.h"
 #include "constants.h"
-#include "resolved-dnssd.h"
-#include "resolved-dns-rr.h"
-#include "resolved-manager.h"
+#include "hexdecoct.h"
+#include "path-util.h"
 #include "resolved-conf.h"
+#include "resolved-dns-rr.h"
+#include "resolved-dnssd.h"
+#include "resolved-manager.h"
 #include "specifier.h"
 #include "strv.h"
 
@@ -40,7 +42,7 @@ DnssdService *dnssd_service_free(DnssdService *service) {
                 return NULL;
 
         if (service->manager)
-                hashmap_remove(service->manager->dnssd_services, service->name);
+                hashmap_remove(service->manager->dnssd_services, service->id);
 
         dns_resource_record_unref(service->ptr_rr);
         dns_resource_record_unref(service->sub_ptr_rr);
@@ -48,8 +50,8 @@ DnssdService *dnssd_service_free(DnssdService *service) {
 
         dnssd_txtdata_free_all(service->txt_data_items);
 
-        free(service->filename);
-        free(service->name);
+        free(service->path);
+        free(service->id);
         free(service->type);
         free(service->subtype);
         free(service->name_template);
@@ -62,45 +64,59 @@ void dnssd_service_clear_on_reload(Hashmap *services) {
 
         HASHMAP_FOREACH(service, services)
                 if (service->config_source == RESOLVE_CONFIG_SOURCE_FILE) {
-                        hashmap_remove(services, service->name);
+                        hashmap_remove(services, service->id);
                         dnssd_service_free(service);
                 }
 }
 
-static int dnssd_service_load(Manager *manager, const char *filename) {
+static int dnssd_id_from_path(const char *path, char **ret_id) {
+        int r;
+
+        assert(path);
+        assert(ret_id);
+
+        _cleanup_free_ char *fn = NULL;
+        r = path_extract_filename(path, &fn);
+        if (r < 0)
+                return r;
+
+        char *d = endswith(fn, ".dnssd");
+        if (!d)
+                return -EINVAL;
+
+        *d = '\0';
+
+        *ret_id = TAKE_PTR(fn);
+        return 0;
+}
+
+static int dnssd_service_load(Manager *manager, const char *path) {
         _cleanup_(dnssd_service_freep) DnssdService *service = NULL;
         _cleanup_(dnssd_txtdata_freep) DnssdTxtData *txt_data = NULL;
-        char *d;
-        const char *dropin_dirname;
+        _cleanup_free_ char *dropin_dirname = NULL;
         int r;
 
         assert(manager);
-        assert(filename);
+        assert(path);
 
         service = new0(DnssdService, 1);
         if (!service)
                 return log_oom();
 
-        service->filename = strdup(filename);
-        if (!service->filename)
+        service->path = strdup(path);
+        if (!service->path)
                 return log_oom();
 
-        service->name = strdup(basename(filename));
-        if (!service->name)
+        r = dnssd_id_from_path(path, &service->id);
+        if (r < 0)
+                return log_error_errno(r, "Failed to extract DNS-SD service id from filename: %m");
+
+        dropin_dirname = strjoin(service->id, ".dnssd.d");
+        if (!dropin_dirname)
                 return log_oom();
-
-        d = endswith(service->name, ".dnssd");
-        if (!d)
-                return -EINVAL;
-
-        assert(streq(d, ".dnssd"));
-
-        *d = '\0';
-
-        dropin_dirname = strjoina(service->name, ".dnssd.d");
 
         r = config_parse_many(
-                        STRV_MAKE_CONST(filename), DNSSD_SERVICE_DIRS, dropin_dirname, /* root = */ NULL,
+                        STRV_MAKE_CONST(path), DNSSD_SERVICE_DIRS, dropin_dirname, /* root = */ NULL,
                         "Service\0",
                         config_item_perf_lookup, resolved_dnssd_gperf_lookup,
                         CONFIG_PARSE_WARN,
@@ -113,12 +129,12 @@ static int dnssd_service_load(Manager *manager, const char *filename) {
         if (!service->name_template)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s doesn't define service instance name",
-                                       service->name);
+                                       service->id);
 
         if (!service->type)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "%s doesn't define service type",
-                                       service->name);
+                                       service->id);
 
         if (!service->txt_data_items) {
                 txt_data = new0(DnssdTxtData, 1);
@@ -133,7 +149,7 @@ static int dnssd_service_load(Manager *manager, const char *filename) {
                 TAKE_PTR(txt_data);
         }
 
-        r = hashmap_ensure_put(&manager->dnssd_services, &string_hash_ops, service->name, service);
+        r = hashmap_ensure_put(&manager->dnssd_services, &string_hash_ops, service->id, service);
         if (r < 0)
                 return r;
 
@@ -364,12 +380,12 @@ int dnssd_signal_conflict(Manager *manager, const char *name) {
                 if (s->withdrawn)
                         continue;
 
-                if (dns_name_equal(dns_resource_key_name(s->srv_rr->key), name)) {
+                if (dns_name_equal(dns_resource_key_name(s->srv_rr->key), name) > 0) {
                         _cleanup_free_ char *path = NULL;
 
                         s->withdrawn = true;
 
-                        r = sd_bus_path_encode("/org/freedesktop/resolve1/dnssd", s->name, &path);
+                        r = sd_bus_path_encode("/org/freedesktop/resolve1/dnssd", s->id, &path);
                         if (r < 0)
                                 return log_error_errno(r, "Can't get D-BUS object path: %m");
 
@@ -383,6 +399,227 @@ int dnssd_signal_conflict(Manager *manager, const char *name) {
 
                         break;
                 }
+        }
+
+        return 0;
+}
+
+int config_parse_dnssd_service_name(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        static const Specifier specifier_table[] = {
+                { 'a', specifier_architecture,    NULL },
+                { 'b', specifier_boot_id,         NULL },
+                { 'B', specifier_os_build_id,     NULL },
+                { 'H', specifier_hostname,        NULL }, /* We will use specifier_dnssd_hostname(). */
+                { 'm', specifier_machine_id,      NULL },
+                { 'o', specifier_os_id,           NULL },
+                { 'v', specifier_kernel_release,  NULL },
+                { 'w', specifier_os_version_id,   NULL },
+                { 'W', specifier_os_variant_id,   NULL },
+                {}
+        };
+        DnssdService *s = ASSERT_PTR(userdata);
+        _cleanup_free_ char *name = NULL;
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                s->name_template = mfree(s->name_template);
+                return 0;
+        }
+
+        r = specifier_printf(rvalue, DNS_LABEL_MAX, specifier_table, NULL, NULL, &name);
+        if (r < 0) {
+                log_syntax(unit, LOG_WARNING, filename, line, r,
+                           "Invalid service instance name template '%s', ignoring assignment: %m", rvalue);
+                return 0;
+        }
+
+        if (!dns_service_name_is_valid(name)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0,
+                           "Service instance name template '%s' renders to invalid name '%s'. Ignoring assignment.",
+                           rvalue, name);
+                return 0;
+        }
+
+        return free_and_strdup_warn(&s->name_template, rvalue);
+}
+
+int config_parse_dnssd_service_type(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        DnssdService *s = ASSERT_PTR(userdata);
+        int r;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                s->type = mfree(s->type);
+                return 0;
+        }
+
+        if (!dnssd_srv_type_is_valid(rvalue)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Service type is invalid. Ignoring.");
+                return 0;
+        }
+
+        r = free_and_strdup(&s->type, rvalue);
+        if (r < 0)
+                return log_oom();
+
+        return 0;
+}
+
+int config_parse_dnssd_service_subtype(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        DnssdService *s = ASSERT_PTR(userdata);
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                s->subtype = mfree(s->subtype);
+                return 0;
+        }
+
+        if (!dns_subtype_name_is_valid(rvalue)) {
+                log_syntax(unit, LOG_WARNING, filename, line, 0, "Service subtype is invalid. Ignoring.");
+                return 0;
+        }
+
+        return free_and_strdup_warn(&s->subtype, rvalue);
+}
+
+int config_parse_dnssd_txt(
+                const char *unit,
+                const char *filename,
+                unsigned line,
+                const char *section,
+                unsigned section_line,
+                const char *lvalue,
+                int ltype,
+                const char *rvalue,
+                void *data,
+                void *userdata) {
+
+        _cleanup_(dnssd_txtdata_freep) DnssdTxtData *txt_data = NULL;
+        DnssdService *s = ASSERT_PTR(userdata);
+        DnsTxtItem *last = NULL;
+
+        assert(filename);
+        assert(lvalue);
+        assert(rvalue);
+
+        if (isempty(rvalue)) {
+                /* Flush out collected items */
+                s->txt_data_items = dnssd_txtdata_free_all(s->txt_data_items);
+                return 0;
+        }
+
+        txt_data = new0(DnssdTxtData, 1);
+        if (!txt_data)
+                return log_oom();
+
+        for (;;) {
+                _cleanup_free_ char *word = NULL, *key = NULL, *value = NULL;
+                _cleanup_free_ void *decoded = NULL;
+                size_t length = 0;
+                DnsTxtItem *i;
+                int r;
+
+                r = extract_first_word(&rvalue, &word, NULL,
+                                       EXTRACT_UNQUOTE|EXTRACT_CUNESCAPE|EXTRACT_UNESCAPE_RELAX);
+                if (r == 0)
+                        break;
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r < 0) {
+                        log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid syntax, ignoring: %s", rvalue);
+                        return 0;
+                }
+
+                r = split_pair(word, "=", &key, &value);
+                if (r == -ENOMEM)
+                        return log_oom();
+                if (r == -EINVAL)
+                        key = TAKE_PTR(word);
+
+                if (!ascii_is_valid(key)) {
+                        log_syntax(unit, LOG_WARNING, filename, line, 0, "Invalid key, ignoring: %s", key);
+                        continue;
+                }
+
+                switch (ltype) {
+
+                case DNS_TXT_ITEM_DATA:
+                        if (value) {
+                                r = unbase64mem(value, &decoded, &length);
+                                if (r == -ENOMEM)
+                                        return log_oom();
+                                if (r < 0) {
+                                        log_syntax(unit, LOG_WARNING, filename, line, r,
+                                                   "Invalid base64 encoding, ignoring: %s", value);
+                                        continue;
+                                }
+                        }
+
+                        r = dnssd_txt_item_new_from_data(key, decoded, length, &i);
+                        if (r < 0)
+                                return log_oom();
+                        break;
+
+                case DNS_TXT_ITEM_TEXT:
+                        r = dnssd_txt_item_new_from_string(key, value, &i);
+                        if (r < 0)
+                                return log_oom();
+                        break;
+
+                default:
+                        assert_not_reached();
+                }
+
+                LIST_INSERT_AFTER(items, txt_data->txts, last, i);
+                last = i;
+        }
+
+        if (txt_data->txts) {
+                LIST_PREPEND(items, s->txt_data_items, txt_data);
+                TAKE_PTR(txt_data);
         }
 
         return 0;

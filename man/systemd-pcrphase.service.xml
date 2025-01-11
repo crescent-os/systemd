@@ -141,7 +141,7 @@
       <varlistentry>
         <term><option>--bank=</option></term>
 
-        <listitem><para>Takes the PCR banks to extend the specified word into. If not specified the tool
+        <listitem><para>Takes the PCR banks to extend the specified word into. If not specified, the tool
         automatically determines all enabled PCR banks and measures the word into all of
         them.</para>
 
@@ -158,7 +158,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--tpm2-device=</option><replaceable>PATH</replaceable></term>
+        <term><option>--tpm2-device=<replaceable>PATH</replaceable></option></term>
 
         <listitem><para>Controls which TPM2 device to use. Expects a device node path referring to the TPM2
         chip (e.g. <filename>/dev/tpmrm0</filename>). Alternatively the special value <literal>auto</literal>
@@ -173,7 +173,7 @@
         <term><option>--graceful</option></term>
 
         <listitem><para>If no TPM2 firmware, kernel subsystem, kernel driver or device support is found, exit
-        with exit status 0 (i.e. indicate success). If this is not specified any attempt to measure without a
+        with exit status 0 (i.e. indicate success). If this is not specified, any attempt to measure without a
         TPM2 device will cause the invocation to fail.</para>
 
         <xi:include href="version-info.xml" xpointer="v253"/></listitem>
@@ -215,7 +215,7 @@
         <filename>/run/log/systemd/tpm2-measure.log</filename>, which contains a <ulink
         url="https://www.rfc-editor.org/rfc/rfc7464.html">JSON-SEQ</ulink> series of objects that follow the
         general structure of the <ulink
-        url="https://trustedcomputinggroup.org/resource/canonical-event-log-format/">TCG Common Event Log
+        url="https://trustedcomputinggroup.org/resource/canonical-event-log-format/">TCG Canonical Event Log
         Format (CEL-JSON)</ulink> event objects (but lack the <literal>recnum</literal>
         field).</para>
 

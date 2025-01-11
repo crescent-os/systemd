@@ -5,14 +5,17 @@
 
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
 #include "hashmap.h"
 #include "macro.h"
 #include "time-util.h"
+#include "udev-config.h"
 #include "udev-ctrl.h"
-#include "udev-rules.h"
+#include "udev-def.h"
 
 typedef struct Event Event;
+typedef struct UdevRules UdevRules;
 typedef struct Worker Worker;
 
 typedef struct Manager {
@@ -20,14 +23,14 @@ typedef struct Manager {
         Hashmap *workers;
         LIST_HEAD(Event, events);
         char *cgroup;
-        int log_level;
 
         UdevRules *rules;
         Hashmap *properties;
 
         sd_device_monitor *monitor;
         UdevCtrl *ctrl;
-        int worker_watch[2];
+        sd_varlink_server *varlink_server;
+        int worker_notify_fd;
 
         /* used by udev-watch */
         int inotify_fd;
@@ -35,19 +38,14 @@ typedef struct Manager {
 
         sd_event_source *kill_workers_event;
 
-        sd_event_source *memory_pressure_event_source;
-        sd_event_source *sigrtmin18_event_source;
-
         usec_t last_usec;
 
-        ResolveNameTiming resolve_name_timing;
-        unsigned children_max;
-        usec_t exec_delay_usec;
-        usec_t timeout_usec;
-        int timeout_signal;
-        bool blockdev_read_only;
+        UdevConfig config_by_udev_conf;
+        UdevConfig config_by_command;
+        UdevConfig config_by_kernel;
+        UdevConfig config_by_control;
+        UdevConfig config;
 
-        bool udev_node_needs_cleanup;
         bool stop_exec_queue;
         bool exit;
 } Manager;
@@ -56,8 +54,13 @@ Manager* manager_new(void);
 Manager* manager_free(Manager *manager);
 DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
-void manager_adjust_arguments(Manager *manager);
-int manager_init(Manager *manager, int fd_ctrl, int fd_uevent);
+int manager_init(Manager *manager);
 int manager_main(Manager *manager);
+void manager_reload(Manager *manager, bool force);
+void manager_exit(Manager *manager);
+
+void notify_ready(Manager *manager);
+
+void manager_kill_workers(Manager *manager, bool force);
 
 bool devpath_conflict(const char *a, const char *b);

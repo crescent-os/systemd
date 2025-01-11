@@ -35,7 +35,9 @@
 
     <para>The <filename>.link</filename> files are read from the files located in the system network
     directory <filename>/usr/lib/systemd/network</filename> and
-    <filename>/usr/local/lib/systemd/network</filename>, the volatile runtime network directory
+    <filename>/usr/local/lib/systemd/network</filename>
+    <xi:include href="standard-conf.xml" xpointer="usr-local-footnote" />,
+    the volatile runtime network directory
     <filename>/run/systemd/network</filename>, and the local administration network directory
     <filename>/etc/systemd/network</filename>. All configuration files are collectively sorted and
     processed in alphanumeric order, regardless of the directories in which they live. However, files
@@ -376,7 +378,7 @@
 
           <para>This setting is useful to configure the <literal>ID_NET_MANAGED_BY=</literal> property which
           declares which network management service shall manage the interface, which is respected by
-          systemd-networkd and others. Use
+          <command>systemd-networkd</command> and others. Use
           <programlisting>Property=ID_NET_MANAGED_BY=io.systemd.Network</programlisting>
           to declare explicitly that <command>systemd-networkd</command> shall manage the interface, or set
           the property to something else to declare explicitly it shall not do so. See
@@ -602,10 +604,10 @@
           <para>Interface names must have a minimum length of 1 character and a maximum length of 15
           characters, and may contain any 7bit ASCII character, with the exception of control characters,
           <literal>:</literal>, <literal>/</literal> and <literal>%</literal>. While <literal>.</literal> is
-          an allowed character, it's recommended to avoid it when naming interfaces as various tools (such as
+          an allowed character, it is recommended to avoid it when naming interfaces as various tools (such as
           <citerefentry><refentrytitle>resolvconf</refentrytitle><manvolnum>1</manvolnum></citerefentry>) use
           it as separator character. Also, fully numeric interface names are not allowed (in order to avoid
-          ambiguity with interface specification by numeric indexes), as are the special strings
+          ambiguity with interface specification by numeric indexes), nor are the special strings
           <literal>.</literal>, <literal>..</literal>, <literal>all</literal> and
           <literal>default</literal>.</para>
 
@@ -887,7 +889,7 @@
             </tgroup>
           </table>
 
-          By default this is unset, i.e. all possible modes will be advertised.
+          By default, this is unset, i.e. all possible modes will be advertised.
           This option may be specified more than once, in which case all specified speeds and modes are advertised.
           If the empty string is assigned to this option, the list is reset, and all prior assignments have no effect.
           </para>
@@ -941,6 +943,18 @@
         </listitem>
       </varlistentry>
       <varlistentry>
+        <term><varname>PartialGenericSegmentationOffload=</varname></term>
+        <listitem>
+          <para>Takes a boolean. If set to true, Partial Generic Segmentation Offload (GSO_Partial) is
+          enabled. See
+          <ulink url="https://docs.kernel.org/networking/segmentation-offloads.html#partial-generic-segmentation-offload">
+          Partial Generic Segmentation Offload</ulink> for more details.
+          When unset, the kernel's default will be used.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
         <term><varname>GenericReceiveOffload=</varname></term>
         <listitem>
           <para>Takes a boolean. If set to true, Generic Receive Offload (GRO) is enabled.
@@ -972,10 +986,10 @@
         <listitem>
           <para>Configures Receive Packet Steering (RPS) list of CPUs to which RPS may forward traffic.
           Takes a list of CPU indices or ranges separated by either whitespace or commas. Alternatively,
-          takes the special value <literal>all</literal> in which will include all available CPUs in the mask.
+          takes the special value <literal>all</literal>, which will include all available CPUs in the mask.
           CPU ranges are specified by the lower and upper CPU indices separated by a dash (e.g. <literal>2-6</literal>).
-          This option may be specified more than once, in which case the specified CPU affinity masks are merged.
-          If an empty string is assigned, the mask is reset, all assignments prior to this will have no effect.
+          This option may be specified more than once, in which case the specified list of CPU ranges are merged.
+          If an empty string is assigned, the list is reset, all assignments prior to this will have no effect.
           Defaults to unset and RPS CPU list is unchanged. To disable RPS when it was previously enabled, use the
           special value <literal>disable</literal>.</para>
 
@@ -1025,6 +1039,25 @@
           When unset, the kernel's default will be used.</para>
 
           <xi:include href="version-info.xml" xpointer="v250"/>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>ReceiveFCS=</varname></term>
+        <listitem>
+          <para>Takes a boolean. If set to true, pass the Frame Check Sequence (FCS) value up the stack
+          without trimming it, and allow userspace to calculate error rate or link health.
+          When unset, the kernel's default will be used.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
+        </listitem>
+      </varlistentry>
+      <varlistentry>
+        <term><varname>ReceiveAll=</varname></term>
+        <listitem>
+          <para>Takes a boolean. If set to true, allow to also receive damaged ethernet frames.
+          When unset, the kernel's default will be used.</para>
+
+          <xi:include href="version-info.xml" xpointer="v258"/>
         </listitem>
       </varlistentry>
       <varlistentry>
@@ -1433,7 +1466,7 @@ Config file /etc/systemd/network/10-eth0.link applies to device hub0
 link_config: autonegotiation is unset or enabled, the speed and duplex are not writable.
 hub0: Device has name_assign_type=4
 Using default interface naming scheme 'v240'.
-hub0: Policies didn't yield a name, using specified Name=hub0.
+hub0: Policies did not yield a name, using specified Name=hub0.
 ID_NET_LINK_FILE=/etc/systemd/network/10-eth0.link
 ID_NET_NAME=hub0
 …</programlisting>

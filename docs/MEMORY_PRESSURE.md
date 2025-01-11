@@ -169,7 +169,7 @@ pressure handling:
   setting controls whether to enable the memory pressure protocol for the
   service in question.
 
-* The `MemoryPressureThresholdSec=` setting allows to configure the threshold
+* The `MemoryPressureThresholdSec=` setting allows configuring the threshold
   when to signal memory pressure to the services. It takes a time value
   (usually in the millisecond range) that defines a threshold per 1s time
   window: if memory allocation latencies grow beyond this threshold
@@ -227,12 +227,12 @@ handling, it's typically sufficient to add a line such as:
 
 Other programming environments might have native APIs to watch memory
 pressure/low memory events. Most notable is probably GLib's
-[GMemoryMonitor](https://developer-old.gnome.org/gio/stable/GMemoryMonitor.html). It
+[GMemoryMonitor](https://docs.gtk.org/gio/iface.MemoryMonitor.html). It
 currently uses the per-system Linux PSI interface as the backend, but operates
 differently than the above: memory pressure events are picked up by a system
 service, which then propagates this through D-Bus to the applications. This is
 typically less than ideal, since this means each notification event has to
 traverse three processes before being handled. This traversal creates
 additional latencies at a time where the system is already experiencing adverse
-latencies. Moreover, it focusses on system-wide PSI events, even though
+latencies. Moreover, it focuses on system-wide PSI events, even though
 service-local ones are generally the better approach.

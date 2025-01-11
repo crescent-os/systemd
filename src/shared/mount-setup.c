@@ -69,7 +69,7 @@ static bool check_recursiveprot_supported(void) {
 
         r = mount_option_supported("cgroup2", "memory_recursiveprot", NULL);
         if (r < 0)
-                log_debug_errno(r, "Failed to determiner whether the 'memory_recursiveprot' mount option is supported, assuming not: %m");
+                log_debug_errno(r, "Failed to determine whether the 'memory_recursiveprot' mount option is supported, assuming not: %m");
         else if (r == 0)
                 log_debug("This kernel version does not support 'memory_recursiveprot', not using mount option.");
 
@@ -93,7 +93,7 @@ static const MountPoint mount_table[] = {
 #endif
         { "tmpfs",       "/dev/shm",                  "tmpfs",      "mode=01777",                               MS_NOSUID|MS_NODEV|MS_STRICTATIME,
           NULL,          MNT_FATAL|MNT_IN_CONTAINER },
-        { "devpts",      "/dev/pts",                  "devpts",     "mode=0620,gid=" STRINGIFY(TTY_GID),        MS_NOSUID|MS_NOEXEC,
+        { "devpts",      "/dev/pts",                  "devpts",     "mode=" STRINGIFY(TTY_MODE) ",gid=" STRINGIFY(TTY_GID), MS_NOSUID|MS_NOEXEC,
           NULL,          MNT_IN_CONTAINER           },
 #if ENABLE_SMACK
         { "tmpfs",       "/run",                      "tmpfs",      "mode=0755,smackfsroot=*" TMPFS_LIMITS_RUN, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
@@ -125,7 +125,7 @@ bool mount_point_is_api(const char *path) {
         /* Checks if this mount point is considered "API", and hence
          * should be ignored */
 
-        FOREACH_ARRAY(i, mount_table, ELEMENTSOF(mount_table))
+        FOREACH_ELEMENT(i, mount_table)
                 if (path_equal(path, i->where))
                         return true;
 
@@ -195,10 +195,7 @@ static int mount_one(const MountPoint *p, bool relabel) {
                   p->type,
                   strna(p->options));
 
-        if (FLAGS_SET(p->mode, MNT_FOLLOW_SYMLINK))
-                r = mount_follow_verbose(priority, p->what, p->where, p->type, p->flags, p->options);
-        else
-                r = mount_nofollow_verbose(priority, p->what, p->where, p->type, p->flags, p->options);
+        r = mount_verbose_full(priority, p->what, p->where, p->type, p->flags, p->options, FLAGS_SET(p->mode, MNT_FOLLOW_SYMLINK));
         if (r < 0)
                 return FLAGS_SET(p->mode, MNT_FATAL) ? r : 0;
 
@@ -515,13 +512,29 @@ int mount_cgroup_legacy_controllers(bool loaded_policy) {
         _cleanup_set_free_ Set *controllers = NULL;
         int r;
 
+        /* Before we actually start deleting cgroup v1 code, make it harder to boot in cgroupv1 mode first.
+         * See also #30852. */
+
+        if (detect_container() <= 0) { /* If in container, we have to follow host's cgroup hierarchy. Only
+                                        * do the deprecation checks below if we're not in a container. */
+                if (cg_is_legacy_force_enabled())
+                        log_warning("Legacy support for cgroup v1 enabled via SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1.");
+                else if (cg_is_legacy_enabled()) {
+                        log_full(LOG_CRIT,
+                                 "Legacy cgroup v1 configured. This will stop being supported soon.\n"
+                                 "Will proceed with cgroup v2 after 30 s.\n"
+                                 "Set systemd.unified_cgroup_hierarchy=1 to switch to cgroup v2 "
+                                 "or set SYSTEMD_CGROUP_ENABLE_LEGACY_FORCE=1 to reenable v1 temporarily.");
+                        (void) usleep_safe(30 * USEC_PER_SEC);
+
+                        return 0;
+                }
+        }
+
         if (!cg_is_legacy_wanted())
                 return 0;
 
-        if (!cg_is_legacy_force_enabled())
-                return -ERFKILL;
-
-        FOREACH_ARRAY(mp, cgroupv1_mount_table, ELEMENTSOF(cgroupv1_mount_table)) {
+        FOREACH_ELEMENT(mp, cgroupv1_mount_table) {
                 r = mount_one(mp, loaded_policy);
                 if (r < 0)
                         return r;

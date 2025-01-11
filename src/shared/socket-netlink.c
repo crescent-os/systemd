@@ -1,9 +1,10 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+/* Make sure the net/if.h header is included before any linux/ one */
+#include <net/if.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <linux/net_namespace.h>
-#include <net/if.h>
 #include <string.h>
 
 #include "alloc-util.h"
@@ -346,6 +347,15 @@ struct in_addr_full *in_addr_full_free(struct in_addr_full *a) {
         return mfree(a);
 }
 
+void in_addr_full_array_free(struct in_addr_full *addrs[], size_t n) {
+        assert(addrs || n == 0);
+
+        FOREACH_ARRAY(a, addrs, n)
+                in_addr_full_freep(a);
+
+        free(addrs);
+}
+
 int in_addr_full_new(
                 int family,
                 const union in_addr_union *a,
@@ -396,7 +406,7 @@ int in_addr_full_new_from_string(const char *s, struct in_addr_full **ret) {
         return in_addr_full_new(family, &a, port, ifindex, server_name, ret);
 }
 
-const char *in_addr_full_to_string(struct in_addr_full *a) {
+const char* in_addr_full_to_string(struct in_addr_full *a) {
         assert(a);
 
         if (!a->cached_server_string)
@@ -418,15 +428,9 @@ int netns_get_nsid(int netnsfd, uint32_t *ret) {
         int r;
 
         if (netnsfd < 0) {
-                r = namespace_open(
-                                0,
-                                /* ret_pidns_fd = */ NULL,
-                                /* ret_mntns_fd = */ NULL,
-                                &_netns_fd,
-                                /* ret_userns_fd = */ NULL,
-                                /* ret_root_fd = */ NULL);
-                if (r < 0)
-                        return r;
+                _netns_fd = namespace_open_by_type(NAMESPACE_NET);
+                if (_netns_fd < 0)
+                        return _netns_fd;
 
                 netnsfd = _netns_fd;
         }
@@ -465,7 +469,7 @@ int netns_get_nsid(int netnsfd, uint32_t *ret) {
                 if (r < 0)
                         return r;
 
-                if (u == UINT32_MAX) /* no NSID assigned yet */
+                if (u == (uint32_t) NETNSA_NSID_NOT_ASSIGNED) /* no NSID assigned yet */
                         return -ENODATA;
 
                 if (ret)

@@ -2,24 +2,27 @@
 
 #include <sys/auxv.h>
 
+#include "sd-varlink.h"
+
 #include "conf-files.h"
 #include "dirent-util.h"
 #include "dlfcn-util.h"
 #include "errno-util.h"
 #include "fd-util.h"
 #include "format-util.h"
+#include "json-util.h"
 #include "missing_syscall.h"
 #include "parse-util.h"
 #include "set.h"
 #include "socket-util.h"
 #include "strv.h"
+#include "uid-classification.h"
 #include "user-record-nss.h"
 #include "user-util.h"
-#include "userdb-dropin.h"
 #include "userdb.h"
-#include "varlink.h"
+#include "userdb-dropin.h"
 
-DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(link_hash_ops, void, trivial_hash_func, trivial_compare_func, Varlink, varlink_unref);
+DEFINE_PRIVATE_HASH_OPS_WITH_VALUE_DESTRUCTOR(link_hash_ops, void, trivial_hash_func, trivial_compare_func, sd_varlink, sd_varlink_unref);
 
 typedef enum LookupWhat {
         LOOKUP_USER,
@@ -114,8 +117,8 @@ static UserDBIterator* userdb_iterator_new(LookupWhat what, UserDBFlags flags) {
         *i = (UserDBIterator) {
                 .what = what,
                 .flags = flags,
-                .synthesize_root = !FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE),
-                .synthesize_nobody = !FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE),
+                .synthesize_root = !FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC),
+                .synthesize_nobody = !FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC),
         };
 
         return i;
@@ -138,12 +141,12 @@ static int userdb_iterator_block_nss_systemd(UserDBIterator *iterator) {
 }
 
 struct user_group_data {
-        JsonVariant *record;
+        sd_json_variant *record;
         bool incomplete;
 };
 
 static void user_group_data_done(struct user_group_data *d) {
-        json_variant_unref(d->record);
+        sd_json_variant_unref(d->record);
 }
 
 struct membership_data {
@@ -157,10 +160,10 @@ static void membership_data_done(struct membership_data *d) {
 }
 
 static int userdb_on_query_reply(
-                Varlink *link,
-                JsonVariant *parameters,
+                sd_varlink *link,
+                sd_json_variant *parameters,
                 const char *error_id,
-                VarlinkReplyFlags flags,
+                sd_varlink_reply_flags_t flags,
                 void *userdata) {
 
         UserDBIterator *iterator = ASSERT_PTR(userdata);
@@ -169,15 +172,21 @@ static int userdb_on_query_reply(
         if (error_id) {
                 log_debug("Got lookup error: %s", error_id);
 
+                /* Convert various forms of record not found into -ESRCH, since NSS typically doesn't care,
+                 * about the details. Note that if a userName specification is refused as invalid parameter,
+                 * we also turn this into -ESRCH following the logic that there cannot be a user record for a
+                 * completely invalid user name. */
                 if (STR_IN_SET(error_id,
                                "io.systemd.UserDatabase.NoRecordFound",
-                               "io.systemd.UserDatabase.ConflictingRecordFound"))
+                               "io.systemd.UserDatabase.ConflictingRecordFound") ||
+                    sd_varlink_error_is_invalid_parameter(error_id, parameters, "userName") ||
+                    sd_varlink_error_is_invalid_parameter(error_id, parameters, "groupName"))
                         r = -ESRCH;
                 else if (streq(error_id, "io.systemd.UserDatabase.ServiceNotAvailable"))
                         r = -EHOSTDOWN;
                 else if (streq(error_id, "io.systemd.UserDatabase.EnumerationNotSupported"))
                         r = -EOPNOTSUPP;
-                else if (streq(error_id, VARLINK_ERROR_TIMEOUT))
+                else if (streq(error_id, SD_VARLINK_ERROR_TIMEOUT))
                         r = -ETIMEDOUT;
                 else
                         r = -EIO;
@@ -190,16 +199,16 @@ static int userdb_on_query_reply(
         case LOOKUP_USER: {
                 _cleanup_(user_group_data_done) struct user_group_data user_data = {};
 
-                static const JsonDispatch dispatch_table[] = {
-                        { "record",     _JSON_VARIANT_TYPE_INVALID, json_dispatch_variant, offsetof(struct user_group_data, record),     0 },
-                        { "incomplete", JSON_VARIANT_BOOLEAN,       json_dispatch_boolean, offsetof(struct user_group_data, incomplete), 0 },
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "record",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_variant, offsetof(struct user_group_data, record),     0 },
+                        { "incomplete", SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, offsetof(struct user_group_data, incomplete), 0 },
                         {}
                 };
                 _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
 
                 assert_se(!iterator->found_user);
 
-                r = json_dispatch(parameters, dispatch_table, JSON_ALLOW_EXTENSIONS, &user_data);
+                r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &user_data);
                 if (r < 0)
                         goto finish;
 
@@ -236,7 +245,7 @@ static int userdb_on_query_reply(
                 iterator->n_found++;
 
                 /* More stuff coming? then let's just exit cleanly here */
-                if (FLAGS_SET(flags, VARLINK_REPLY_CONTINUES))
+                if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES))
                         return 0;
 
                 /* Otherwise, let's remove this link and exit cleanly then */
@@ -247,16 +256,16 @@ static int userdb_on_query_reply(
         case LOOKUP_GROUP: {
                 _cleanup_(user_group_data_done) struct user_group_data group_data = {};
 
-                static const JsonDispatch dispatch_table[] = {
-                        { "record",     _JSON_VARIANT_TYPE_INVALID, json_dispatch_variant, offsetof(struct user_group_data, record),     0 },
-                        { "incomplete", JSON_VARIANT_BOOLEAN,       json_dispatch_boolean, offsetof(struct user_group_data, incomplete), 0 },
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "record",     _SD_JSON_VARIANT_TYPE_INVALID, sd_json_dispatch_variant, offsetof(struct user_group_data, record),     0 },
+                        { "incomplete", SD_JSON_VARIANT_BOOLEAN,       sd_json_dispatch_stdbool, offsetof(struct user_group_data, incomplete), 0 },
                         {}
                 };
                 _cleanup_(group_record_unrefp) GroupRecord *g = NULL;
 
                 assert_se(!iterator->found_group);
 
-                r = json_dispatch(parameters, dispatch_table, JSON_ALLOW_EXTENSIONS, &group_data);
+                r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &group_data);
                 if (r < 0)
                         goto finish;
 
@@ -290,7 +299,7 @@ static int userdb_on_query_reply(
                 iterator->found_group = TAKE_PTR(g);
                 iterator->n_found++;
 
-                if (FLAGS_SET(flags, VARLINK_REPLY_CONTINUES))
+                if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES))
                         return 0;
 
                 r = 0;
@@ -300,16 +309,16 @@ static int userdb_on_query_reply(
         case LOOKUP_MEMBERSHIP: {
                 _cleanup_(membership_data_done) struct membership_data membership_data = {};
 
-                static const JsonDispatch dispatch_table[] = {
-                        { "userName",  JSON_VARIANT_STRING, json_dispatch_user_group_name, offsetof(struct membership_data, user_name),  JSON_RELAX },
-                        { "groupName", JSON_VARIANT_STRING, json_dispatch_user_group_name, offsetof(struct membership_data, group_name), JSON_RELAX },
+                static const sd_json_dispatch_field dispatch_table[] = {
+                        { "userName",  SD_JSON_VARIANT_STRING, json_dispatch_user_group_name, offsetof(struct membership_data, user_name),  SD_JSON_RELAX },
+                        { "groupName", SD_JSON_VARIANT_STRING, json_dispatch_user_group_name, offsetof(struct membership_data, group_name), SD_JSON_RELAX },
                         {}
                 };
 
                 assert(!iterator->found_user_name);
                 assert(!iterator->found_group_name);
 
-                r = json_dispatch(parameters, dispatch_table, JSON_ALLOW_EXTENSIONS, &membership_data);
+                r = sd_json_dispatch(parameters, dispatch_table, SD_JSON_ALLOW_EXTENSIONS, &membership_data);
                 if (r < 0)
                         goto finish;
 
@@ -317,7 +326,7 @@ static int userdb_on_query_reply(
                 iterator->found_group_name = TAKE_PTR(membership_data.group_name);
                 iterator->n_found++;
 
-                if (FLAGS_SET(flags, VARLINK_REPLY_CONTINUES))
+                if (FLAGS_SET(flags, SD_VARLINK_REPLY_CONTINUES))
                         return 0;
 
                 r = 0;
@@ -335,7 +344,7 @@ finish:
                 iterator->error = -r;
 
         assert_se(set_remove(iterator->links, link) == link);
-        link = varlink_unref(link);
+        link = sd_varlink_unref(link);
         return 0;
 }
 
@@ -344,20 +353,20 @@ static int userdb_connect(
                 const char *path,
                 const char *method,
                 bool more,
-                JsonVariant *query) {
+                sd_json_variant *query) {
 
-        _cleanup_(varlink_unrefp) Varlink *vl = NULL;
+        _cleanup_(sd_varlink_unrefp) sd_varlink *vl = NULL;
         int r;
 
         assert(iterator);
         assert(path);
         assert(method);
 
-        r = varlink_connect_address(&vl, path);
+        r = sd_varlink_connect_address(&vl, path);
         if (r < 0)
                 return log_debug_errno(r, "Unable to connect to %s: %m", path);
 
-        varlink_set_userdata(vl, iterator);
+        sd_varlink_set_userdata(vl, iterator);
 
         if (!iterator->event) {
                 r = sd_event_new(&iterator->event);
@@ -365,20 +374,20 @@ static int userdb_connect(
                         return log_debug_errno(r, "Unable to allocate event loop: %m");
         }
 
-        r = varlink_attach_event(vl, iterator->event, SD_EVENT_PRIORITY_NORMAL);
+        r = sd_varlink_attach_event(vl, iterator->event, SD_EVENT_PRIORITY_NORMAL);
         if (r < 0)
                 return log_debug_errno(r, "Failed to attach varlink connection to event loop: %m");
 
-        (void) varlink_set_description(vl, path);
+        (void) sd_varlink_set_description(vl, path);
 
-        r = varlink_bind_reply(vl, userdb_on_query_reply);
+        r = sd_varlink_bind_reply(vl, userdb_on_query_reply);
         if (r < 0)
                 return log_debug_errno(r, "Failed to bind reply callback: %m");
 
         if (more)
-                r = varlink_observe(vl, method, query);
+                r = sd_varlink_observe(vl, method, query);
         else
-                r = varlink_invoke(vl, method, query);
+                r = sd_varlink_invoke(vl, method, query);
         if (r < 0)
                 return log_debug_errno(r, "Failed to invoke varlink method: %m");
 
@@ -392,7 +401,7 @@ static int userdb_start_query(
                 UserDBIterator *iterator,
                 const char *method,
                 bool more,
-                JsonVariant *query,
+                sd_json_variant *query,
                 UserDBFlags flags) {
 
         _cleanup_strv_free_ char **except = NULL, **only = NULL;
@@ -426,12 +435,12 @@ static int userdb_start_query(
         }
 
         /* First, let's talk to the multiplexer, if we can */
-        if ((flags & (USERDB_AVOID_MULTIPLEXER|USERDB_EXCLUDE_DYNAMIC_USER|USERDB_EXCLUDE_NSS|USERDB_EXCLUDE_DROPIN|USERDB_DONT_SYNTHESIZE)) == 0 &&
+        if ((flags & (USERDB_AVOID_MULTIPLEXER|USERDB_EXCLUDE_DYNAMIC_USER|USERDB_EXCLUDE_NSS|USERDB_EXCLUDE_DROPIN|USERDB_DONT_SYNTHESIZE_INTRINSIC|USERDB_DONT_SYNTHESIZE_FOREIGN)) == 0 &&
             !strv_contains(except, "io.systemd.Multiplexer") &&
             (!only || strv_contains(only, "io.systemd.Multiplexer"))) {
-                _cleanup_(json_variant_unrefp) JsonVariant *patched_query = json_variant_ref(query);
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *patched_query = sd_json_variant_ref(query);
 
-                r = json_variant_set_field_string(&patched_query, "service", "io.systemd.Multiplexer");
+                r = sd_json_variant_set_field_string(&patched_query, "service", "io.systemd.Multiplexer");
                 if (r < 0)
                         return log_debug_errno(r, "Unable to set service JSON field: %m");
 
@@ -452,7 +461,7 @@ static int userdb_start_query(
         }
 
         FOREACH_DIRENT(de, d, return -errno) {
-                _cleanup_(json_variant_unrefp) JsonVariant *patched_query = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *patched_query = NULL;
                 _cleanup_free_ char *p = NULL;
                 bool is_nss, is_dropin;
 
@@ -486,8 +495,8 @@ static int userdb_start_query(
                 if (!p)
                         return -ENOMEM;
 
-                patched_query = json_variant_ref(query);
-                r = json_variant_set_field_string(&patched_query, "service", de->d_name);
+                patched_query = sd_json_variant_ref(query);
+                r = sd_json_variant_set_field_string(&patched_query, "service", de->d_name);
                 if (r < 0)
                         return log_debug_errno(r, "Unable to set service JSON field: %m");
 
@@ -591,34 +600,90 @@ static int userdb_process(
 static int synthetic_root_user_build(UserRecord **ret) {
         return user_record_build(
                         ret,
-                        JSON_BUILD_OBJECT(JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING("root")),
-                                          JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(0)),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(0)),
-                                          JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/root")),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING("root")),
+                                          SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(0)),
+                                          SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(0)),
+                                          SD_JSON_BUILD_PAIR("homeDirectory", JSON_BUILD_CONST_STRING("/root")),
+                                          SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
 }
 
 static int synthetic_nobody_user_build(UserRecord **ret) {
         return user_record_build(
                         ret,
-                        JSON_BUILD_OBJECT(JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING(NOBODY_USER_NAME)),
-                                          JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(UID_NOBODY)),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(GID_NOBODY)),
-                                          JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
-                                          JSON_BUILD_PAIR("locked", JSON_BUILD_BOOLEAN(true)),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("userName", JSON_BUILD_CONST_STRING(NOBODY_USER_NAME)),
+                                          SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(UID_NOBODY)),
+                                          SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(GID_NOBODY)),
+                                          SD_JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
+                                          SD_JSON_BUILD_PAIR("locked", SD_JSON_BUILD_BOOLEAN(true)),
+                                          SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+}
+
+static int synthetic_foreign_user_build(uid_t foreign_uid, UserRecord **ret) {
+        assert(ret);
+
+        if (!uid_is_valid(foreign_uid))
+                return -ESRCH;
+        if (foreign_uid > 0xFFFF)
+                return -ESRCH;
+
+        _cleanup_free_ char *un = NULL;
+        if (asprintf(&un, "foreign-" UID_FMT, foreign_uid) < 0)
+                return -ENOMEM;
+
+        _cleanup_free_ char *rn = NULL;
+        if (asprintf(&rn, "Foreign System Image UID " UID_FMT, foreign_uid) < 0)
+                return -ENOMEM;
+
+        return user_record_build(
+                        ret,
+                        SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(un)),
+                                        SD_JSON_BUILD_PAIR("realName", SD_JSON_BUILD_STRING(rn)),
+                                        SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_uid)),
+                                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_uid)),
+                                        SD_JSON_BUILD_PAIR("shell", JSON_BUILD_CONST_STRING(NOLOGIN)),
+                                        SD_JSON_BUILD_PAIR("locked", SD_JSON_BUILD_BOOLEAN(true)),
+                                        SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("foreign"))));
+}
+
+static int user_name_foreign_extract_uid(const char *name, uid_t *ret_uid) {
+        int r;
+
+        assert(name);
+        assert(ret_uid);
+
+        /* Parses the inner UID from a user name of the foreign UID range, in the form "foreign-NNN". Returns
+         * > 0 if that worked, 0 if it didn't. */
+
+        const char *e = startswith(name, "foreign-");
+        if (!e)
+                goto nomatch;
+
+        uid_t uid;
+        r = parse_uid(e, &uid);
+        if (r < 0)
+                goto nomatch;
+
+        if (uid > 0xFFFF)
+                goto nomatch;
+
+        *ret_uid = uid;
+        return 1;
+
+nomatch:
+        *ret_uid = UID_INVALID;
+        return 0;
 }
 
 int userdb_by_name(const char *name, UserDBFlags flags, UserRecord **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r;
 
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("userName", JSON_BUILD_STRING(name))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(name)));
         if (r < 0)
                 return r;
 
@@ -651,7 +716,7 @@ int userdb_by_name(const char *name, UserDBFlags flags, UserRecord **ret) {
                 }
         }
 
-        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE)) {
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC)) {
                 if (streq(name, "root"))
                         return synthetic_root_user_build(ret);
 
@@ -659,19 +724,28 @@ int userdb_by_name(const char *name, UserDBFlags flags, UserRecord **ret) {
                         return synthetic_nobody_user_build(ret);
         }
 
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_FOREIGN)) {
+                uid_t foreign_uid;
+                r = user_name_foreign_extract_uid(name, &foreign_uid);
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        return synthetic_foreign_user_build(foreign_uid, ret);
+                r = -ESRCH;
+        }
+
         return r;
 }
 
 int userdb_by_uid(uid_t uid, UserDBFlags flags, UserRecord **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r;
 
         if (!uid_is_valid(uid))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("uid", JSON_BUILD_UNSIGNED(uid))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)));
         if (r < 0)
                 return r;
 
@@ -702,13 +776,16 @@ int userdb_by_uid(uid_t uid, UserDBFlags flags, UserRecord **ret) {
                 }
         }
 
-        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE)) {
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC)) {
                 if (uid == 0)
                         return synthetic_root_user_build(ret);
 
                 if (uid == UID_NOBODY && synthesize_nobody())
                         return synthetic_nobody_user_build(ret);
         }
+
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_FOREIGN) && uid_is_foreign(uid))
+                return synthetic_foreign_user_build(uid - FOREIGN_UID_BASE, ret);
 
         return r;
 }
@@ -744,6 +821,8 @@ int userdb_all(UserDBFlags flags, UserDBIterator **ret) {
                 if (r < 0)
                         log_debug_errno(r, "Failed to find user drop-ins, ignoring: %m");
         }
+
+        /* Note that we do not enumerate the foreign users, since those would be just 64K of noise */
 
         /* propagate IPC error, but only if there are no drop-ins */
         if (qr < 0 &&
@@ -869,29 +948,53 @@ int userdb_iterator_get(UserDBIterator *iterator, UserRecord **ret) {
 static int synthetic_root_group_build(GroupRecord **ret) {
         return group_record_build(
                         ret,
-                        JSON_BUILD_OBJECT(JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING("root")),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(0)),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING("root")),
+                                          SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(0)),
+                                          SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
 }
 
 static int synthetic_nobody_group_build(GroupRecord **ret) {
         return group_record_build(
                         ret,
-                        JSON_BUILD_OBJECT(JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING(NOBODY_GROUP_NAME)),
-                                          JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(GID_NOBODY)),
-                                          JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+                        SD_JSON_BUILD_OBJECT(SD_JSON_BUILD_PAIR("groupName", JSON_BUILD_CONST_STRING(NOBODY_GROUP_NAME)),
+                                          SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(GID_NOBODY)),
+                                          SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("intrinsic"))));
+}
+
+static int synthetic_foreign_group_build(gid_t foreign_gid, GroupRecord **ret) {
+        assert(ret);
+
+        if (!gid_is_valid(foreign_gid))
+                return -ESRCH;
+        if (foreign_gid > 0xFFFF)
+                return -ESRCH;
+
+        _cleanup_free_ char *gn = NULL;
+        if (asprintf(&gn, "foreign-" GID_FMT, foreign_gid) < 0)
+                return -ENOMEM;
+
+        _cleanup_free_ char *d = NULL;
+        if (asprintf(&d, "Foreign System Image GID " GID_FMT, foreign_gid) < 0)
+                return -ENOMEM;
+
+        return group_record_build(
+                        ret,
+                        SD_JSON_BUILD_OBJECT(
+                                        SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(gn)),
+                                        SD_JSON_BUILD_PAIR("description", SD_JSON_BUILD_STRING(d)),
+                                        SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(FOREIGN_UID_BASE + foreign_gid)),
+                                        SD_JSON_BUILD_PAIR("disposition", JSON_BUILD_CONST_STRING("foreign"))));
 }
 
 int groupdb_by_name(const char *name, UserDBFlags flags, GroupRecord **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r;
 
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(name))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(name)));
         if (r < 0)
                 return r;
 
@@ -912,7 +1015,6 @@ int groupdb_by_name(const char *name, UserDBFlags flags, GroupRecord **ret) {
                         return r;
         }
 
-
         if (!FLAGS_SET(flags, USERDB_EXCLUDE_NSS) && !(iterator && iterator->nss_covered)) {
                 r = userdb_iterator_block_nss_systemd(iterator);
                 if (r >= 0) {
@@ -922,7 +1024,7 @@ int groupdb_by_name(const char *name, UserDBFlags flags, GroupRecord **ret) {
                 }
         }
 
-        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE)) {
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC)) {
                 if (streq(name, "root"))
                         return synthetic_root_group_build(ret);
 
@@ -930,19 +1032,28 @@ int groupdb_by_name(const char *name, UserDBFlags flags, GroupRecord **ret) {
                         return synthetic_nobody_group_build(ret);
         }
 
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_FOREIGN)) {
+                uid_t foreign_gid;
+                r = user_name_foreign_extract_uid(name, &foreign_gid); /* Same for UID + GID */
+                if (r < 0)
+                        return r;
+                if (r > 0)
+                        return synthetic_foreign_group_build(foreign_gid, ret);
+                r = -ESRCH;
+        }
+
         return r;
 }
 
 int groupdb_by_gid(gid_t gid, UserDBFlags flags, GroupRecord **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r;
 
         if (!gid_is_valid(gid))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("gid", JSON_BUILD_UNSIGNED(gid))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("gid", SD_JSON_BUILD_UNSIGNED(gid)));
         if (r < 0)
                 return r;
 
@@ -972,13 +1083,16 @@ int groupdb_by_gid(gid_t gid, UserDBFlags flags, GroupRecord **ret) {
                 }
         }
 
-        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE)) {
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_INTRINSIC)) {
                 if (gid == 0)
                         return synthetic_root_group_build(ret);
 
                 if (gid == GID_NOBODY && synthesize_nobody())
                         return synthetic_nobody_group_build(ret);
         }
+
+        if (!FLAGS_SET(flags, USERDB_DONT_SYNTHESIZE_FOREIGN) && gid_is_foreign(gid))
+                return synthetic_foreign_group_build(gid - FOREIGN_UID_BASE, ret);
 
         return r;
 }
@@ -1141,7 +1255,7 @@ static void discover_membership_dropins(UserDBIterator *i, UserDBFlags flags) {
 
 int membershipdb_by_user(const char *name, UserDBFlags flags, UserDBIterator **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r, qr;
 
         assert(ret);
@@ -1149,8 +1263,7 @@ int membershipdb_by_user(const char *name, UserDBFlags flags, UserDBIterator **r
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("userName", JSON_BUILD_STRING(name))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(name)));
         if (r < 0)
                 return r;
 
@@ -1187,7 +1300,7 @@ int membershipdb_by_user(const char *name, UserDBFlags flags, UserDBIterator **r
 
 int membershipdb_by_group(const char *name, UserDBFlags flags, UserDBIterator **ret) {
         _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
-        _cleanup_(json_variant_unrefp) JsonVariant *query = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *query = NULL;
         int r, qr;
 
         assert(ret);
@@ -1195,8 +1308,7 @@ int membershipdb_by_group(const char *name, UserDBFlags flags, UserDBIterator **
         if (!valid_user_group_name(name, VALID_USER_RELAX))
                 return -EINVAL;
 
-        r = json_build(&query, JSON_BUILD_OBJECT(
-                                       JSON_BUILD_PAIR("groupName", JSON_BUILD_STRING(name))));
+        r = sd_json_buildo(&query, SD_JSON_BUILD_PAIR("groupName", SD_JSON_BUILD_STRING(name)));
         if (r < 0)
                 return r;
 
@@ -1435,8 +1547,7 @@ int membershipdb_by_group_strv(const char *name, UserDBFlags flags, char ***ret)
                         return r;
         }
 
-        strv_sort(members);
-        strv_uniq(members);
+        strv_sort_uniq(members);
 
         *ret = TAKE_PTR(members);
         return 0;
@@ -1448,7 +1559,7 @@ int userdb_block_nss_systemd(int b) {
 
         /* Note that we might be called from libnss_systemd.so.2 itself, but that should be fine, really. */
 
-        dl = dlopen(LIBDIR "/libnss_systemd.so.2", RTLD_LAZY|RTLD_NODELETE);
+        dl = dlopen(LIBDIR "/libnss_systemd.so.2", RTLD_NOW|RTLD_NODELETE);
         if (!dl) {
                 /* If the file isn't installed, don't complain loudly */
                 log_debug("Failed to dlopen(libnss_systemd.so.2), ignoring: %s", dlerror());

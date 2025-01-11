@@ -13,6 +13,7 @@ Documentation=man:systemd-udevd.service(8) man:udev(7)
 DefaultDependencies=no
 After=systemd-sysusers.service systemd-hwdb-update.service
 Before=sysinit.target
+Wants=systemd-udev-load-credentials.service
 ConditionPathIsReadWrite=/sys
 
 [Service]
@@ -22,7 +23,7 @@ DelegateSubgroup=udev
 Type=notify-reload
 # Note that udev will reset the value internally for its workers
 OOMScoreAdjust=-1000
-Sockets=systemd-udevd-control.socket systemd-udevd-kernel.socket
+Sockets=systemd-udevd-control.socket systemd-udevd-kernel.socket systemd-udevd-varlink.socket
 Restart=always
 RestartSec=0
 ExecStart={{LIBEXECDIR}}/systemd-udevd

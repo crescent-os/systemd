@@ -14,10 +14,11 @@
                           CLONE_NEWNS|                                  \
                           CLONE_NEWPID|                                 \
                           CLONE_NEWUSER|                                \
-                          CLONE_NEWUTS))
+                          CLONE_NEWUTS|                                 \
+                          CLONE_NEWTIME))
 
 #define NAMESPACE_FLAGS_INITIAL  ULONG_MAX
 
 int namespace_flags_from_string(const char *name, unsigned long *ret);
 int namespace_flags_to_string(unsigned long flags, char **ret);
-const char *namespace_single_flag_to_string(unsigned long flag);
+const char* namespace_single_flag_to_string(unsigned long flag);

@@ -74,7 +74,7 @@ UDEV_TAG = Word(string.ascii_uppercase, alphanums + '_')
 # Those patterns are used in type-specific matches
 TYPES = {'mouse':    ('usb', 'bluetooth', 'ps2', '*'),
          'evdev':    ('name', 'atkbd', 'input'),
-         'fb':       ('pci'),
+         'fb':       ('pci', 'vmbus'),
          'id-input': ('modalias'),
          'touchpad': ('i8042', 'rmi', 'bluetooth', 'usb'),
          'joystick': ('i8042', 'rmi', 'bluetooth', 'usb'),
@@ -145,6 +145,7 @@ def property_grammar():
     mount_matrix_row = SIGNED_REAL + ',' + SIGNED_REAL + ',' + SIGNED_REAL
     mount_matrix = Group(mount_matrix_row + ';' + mount_matrix_row + ';' + mount_matrix_row)('MOUNT_MATRIX')
     xkb_setting = Optional(Word(alphanums + '+-/@._'))
+    id_input_setting = Optional(Or((Literal('0'), Literal('1'))))
 
     # Although this set doesn't cover all of characters in database entries, it's enough for test targets.
     name_literal = Word(printables + ' ')
@@ -154,25 +155,28 @@ def property_grammar():
              ('MOUSE_WHEEL_CLICK_ANGLE_HORIZONTAL', INTEGER),
              ('MOUSE_WHEEL_CLICK_COUNT', INTEGER),
              ('MOUSE_WHEEL_CLICK_COUNT_HORIZONTAL', INTEGER),
+             ('ID_INPUT_3D_MOUSE', Or((Literal('0'), Literal('1')))),
              ('ID_AUTOSUSPEND', Or((Literal('0'), Literal('1')))),
              ('ID_AUTOSUSPEND_DELAY_MS', INTEGER),
              ('ID_AV_PRODUCTION_CONTROLLER', Or((Literal('0'), Literal('1')))),
+             ('ID_AV_LIGHTS', Or((Literal('0'), Literal('1')))),
              ('ID_PERSIST', Or((Literal('0'), Literal('1')))),
              ('ID_PDA', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_ACCELEROMETER', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_JOYSTICK', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_KEY', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_KEYBOARD', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_MOUSE', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_POINTINGSTICK', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_SWITCH', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_TABLET', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_TABLET_PAD', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_TOUCHPAD', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_TOUCHSCREEN', Or((Literal('0'), Literal('1')))),
-             ('ID_INPUT_TRACKBALL', Or((Literal('0'), Literal('1')))),
+             ('ID_INPUT', id_input_setting),
+             ('ID_INPUT_ACCELEROMETER', id_input_setting),
+             ('ID_INPUT_JOYSTICK', id_input_setting),
+             ('ID_INPUT_KEY', id_input_setting),
+             ('ID_INPUT_KEYBOARD', id_input_setting),
+             ('ID_INPUT_MOUSE', id_input_setting),
+             ('ID_INPUT_POINTINGSTICK', id_input_setting),
+             ('ID_INPUT_SWITCH', id_input_setting),
+             ('ID_INPUT_TABLET', id_input_setting),
+             ('ID_INPUT_TABLET_PAD', id_input_setting),
+             ('ID_INPUT_TOUCHPAD', id_input_setting),
+             ('ID_INPUT_TOUCHSCREEN', id_input_setting),
+             ('ID_INPUT_TRACKBALL', id_input_setting),
              ('ID_SIGNAL_ANALYZER', Or((Literal('0'), Literal('1')))),
+             ('ID_HARDWARE_WALLET', Or((Literal('0'), Literal('1')))),
              ('POINTINGSTICK_SENSITIVITY', INTEGER),
              ('ID_INPUT_JOYSTICK_INTEGRATION', Or(('internal', 'external'))),
              ('ID_INPUT_TOUCHPAD_INTEGRATION', Or(('internal', 'external'))),

@@ -46,11 +46,10 @@
     the root file system, which is then responsible for probing all remaining hardware, mounting all
     necessary file systems and spawning all configured services.</para>
 
-    <para>On shutdown, the system manager stops all services, unmounts
-    all file systems (detaching the storage technologies backing
-    them), and then (optionally) jumps back into the initrd code which
-    unmounts/detaches the root file system and the storage it resides
-    on. As a last step, the system is powered down.</para>
+    <para>On shutdown, the system manager stops all services, unmounts all non-busy file systems (detaching
+    the storage technologies backing them), and then (optionally) jumps into the exitrd. The exitrd is backed
+    by tmpfs and unmounts/detaches the remaining file systems, including the real root. As a last step, the
+    system is powered down.</para>
 
     <para>Additional information about the system boot process may be
     found in
@@ -312,21 +311,23 @@ emergency.service    |              |              |
                                         v
                                   final.target
                                         |
-            ___________________________/ \_________________
-           /               |               |               \
-           |               |               |               |
-           v               |               |               |
-systemd-reboot.service     |               |               |
-           |               v               |               |
-           |    systemd-poweroff.service   |               |
-           v               |               v               |
-     <emphasis>reboot.target</emphasis>         |      systemd-halt.service     |
-                           v               |               v
-                   <emphasis>poweroff.target</emphasis>         |    systemd-kexec.service
-                                           v               |
-                                      <emphasis>halt.target</emphasis>          |
-                                                           v
-                                                     <emphasis>kexec.target</emphasis></programlisting>
+            ___________________________/ \_________________________________
+           /               |               |               |               \
+           |               |               |               |               |
+           v               |               |               |               |
+systemd-reboot.service     |               |               |               |
+           |               v               |               |               |
+           |    systemd-poweroff.service   |               |               |
+           v               |               v               |               |
+     <emphasis>reboot.target</emphasis>         |      systemd-halt.service     |               |
+                           v               |               v               |
+                   <emphasis>poweroff.target</emphasis>         |    systemd-kexec.service      |
+                                           v               |               |
+                                      <emphasis>halt.target</emphasis>          |  systemd-soft-reboot.service
+                                                           v               |
+                                                     <emphasis>kexec.target</emphasis>          |
+                                                                           v
+                                                                   <emphasis>soft-reboot.target</emphasis></programlisting>
 
     <para>Commonly used system shutdown targets are <emphasis>emphasized</emphasis>.</para>
 
@@ -338,8 +339,19 @@ systemd-reboot.service     |               |               |
     remaining file systems, kill any remaining processes and release any other remaining resources, in a simple and
     robust fashion, without taking any service or unit concept into account anymore. At that point, regular
     applications and resources are generally terminated and released already, the second phase hence operates only as
-    safety net for everything that couldn't be stopped or released for some reason during the primary, unit-based
+    safety net for everything that could not be stopped or released for some reason during the primary, unit-based
     shutdown phase described above.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>The exitrd</title>
+
+    <para>The "exitrd" is a concept symmetrical to the initrd. When the system manager is shutting down and
+    <filename>/run/initramfs/shutdown</filename> exists, it will switch root to
+    <filename>/run/initramfs/</filename> and execute <filename>/shutdown</filename>. This program runs from
+    the tmpfs mounted on <filename>/run/</filename>, so it can unmount the old root file system and perform
+    additional steps, for example dismantle complex storage or perform additional logging about the shutdown.
+    </para>
   </refsect1>
 
   <refsect1>
@@ -350,6 +362,7 @@ systemd-reboot.service     |               |               |
       <member><citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd.target</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd-halt.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-soft-reboot.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
     </simplelist></para>
   </refsect1>
 

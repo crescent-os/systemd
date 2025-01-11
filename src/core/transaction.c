@@ -4,6 +4,7 @@
 #include <unistd.h>
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "dbus-unit.h"
@@ -446,10 +447,10 @@ static int transaction_verify_order_one(Transaction *tr, Job *j, Job *from, unsi
          * the graph over 'before' edges in the actual job execution order. We traverse over both unit
          * ordering dependencies and we test with job_compare() whether it is the 'before' edge in the job
          * execution ordering. */
-        for (size_t d = 0; d < ELEMENTSOF(directions); d++) {
+        FOREACH_ELEMENT(d, directions) {
                 Unit *u;
 
-                UNIT_FOREACH_DEPENDENCY(u, j->unit, directions[d]) {
+                UNIT_FOREACH_DEPENDENCY(u, j->unit, *d) {
                         Job *o;
 
                         /* Is there a job for this unit? */
@@ -463,7 +464,7 @@ static int transaction_verify_order_one(Transaction *tr, Job *j, Job *from, unsi
                         }
 
                         /* Cut traversing if the job j is not really *before* o. */
-                        if (job_compare(j, o, directions[d]) >= 0)
+                        if (job_compare(j, o, *d) >= 0)
                                 continue;
 
                         r = transaction_verify_order_one(tr, o, j, generation, e);
@@ -619,6 +620,9 @@ static int transaction_apply(
         Job *j;
         int r;
 
+        assert(tr);
+        assert(m);
+
         /* Moves the transaction jobs to the set of active jobs */
 
         if (IN_SET(mode, JOB_ISOLATE, JOB_FLUSH)) {
@@ -657,12 +661,7 @@ static int transaction_apply(
                 /* Clean the job dependencies */
                 transaction_unlink_job(tr, j, false);
 
-                /* When RestartMode=direct is used, the service being restarted don't enter the inactive/failed
-                 * state, i.e. unit_process_job -> job_finish_and_invalidate is never called, and the previous
-                 * job might still be running (especially for Type=oneshot services). We need to refuse
-                 * late merge and re-enqueue the anchor job. */
-                installed_job = job_install(j,
-                                            /* refuse_late_merge = */ mode == JOB_RESTART_DEPENDENCIES && j == tr->anchor_job);
+                installed_job = job_install(j);
                 if (installed_job != j) {
                         /* j has been merged into a previously installed job */
                         if (tr->anchor_job == j)
@@ -704,10 +703,10 @@ int transaction_activate(
         int r;
         unsigned generation = 1;
 
-        assert(tr);
+        /* This applies the changes recorded in tr->jobs to the actual list of jobs, if possible. */
 
-        /* This applies the changes recorded in tr->jobs to
-         * the actual list of jobs, if possible. */
+        assert(tr);
+        assert(m);
 
         /* Reset the generation counter of all installed jobs. The detection of cycles
          * looks at installed jobs. If they had a non-zero generation from some previous
@@ -738,7 +737,6 @@ int transaction_activate(
                 r = transaction_verify_order(tr, &generation, e);
                 if (r >= 0)
                         break;
-
                 if (r != -EAGAIN)
                         return log_warning_errno(r, "Requested transaction contains an unfixable cyclic ordering dependency: %s", bus_error_message(e, r));
 
@@ -753,7 +751,6 @@ int transaction_activate(
                 r = transaction_merge_jobs(tr, e);
                 if (r >= 0)
                         break;
-
                 if (r != -EAGAIN)
                         return log_warning_errno(r, "Requested transaction contains unmergeable jobs: %s", bus_error_message(e, r));
 
@@ -816,9 +813,6 @@ static Job* transaction_add_one_job(Transaction *tr, JobType type, Unit *unit, b
         if (!j)
                 return NULL;
 
-        j->generation = 0;
-        j->marker = NULL;
-        j->matters_to_anchor = false;
         j->irreversible = tr->irreversible;
 
         LIST_PREPEND(transaction, f, j);
@@ -943,6 +937,7 @@ int transaction_add_job_and_dependencies(
         int r;
 
         assert(tr);
+        assert(type >= 0);
         assert(type < _JOB_TYPE_MAX);
         assert(type < _JOB_TYPE_MAX_IN_TRANSACTION);
         assert(unit);
@@ -964,7 +959,7 @@ int transaction_add_job_and_dependencies(
 
         if (type != JOB_STOP) {
                 r = bus_unit_validate_load_state(unit, e);
-                /* The time-based cache allows to start new units without daemon-reload, but if they are
+                /* The time-based cache allows new units to be started without daemon-reload, but if they are
                  * already referenced (because of dependencies or ordering) then we have to force a load of
                  * the fragment. As an optimization, check first if anything in the usual paths was modified
                  * since the last time the cache was loaded. Also check if the last time an attempt to load
@@ -1007,6 +1002,9 @@ int transaction_add_job_and_dependencies(
                 /* If the job has no parent job, it is the anchor job. */
                 assert(!tr->anchor_job);
                 tr->anchor_job = ret;
+
+                if (FLAGS_SET(flags, TRANSACTION_REENQUEUE_ANCHOR))
+                        ret->refuse_late_merge = true;
         }
 
         if (!is_new || FLAGS_SET(flags, TRANSACTION_IGNORE_REQUIREMENTS) || type == JOB_NOP)
@@ -1086,7 +1084,7 @@ int transaction_add_job_and_dependencies(
         if (IN_SET(type, JOB_RESTART, JOB_STOP) || (type == JOB_START && FLAGS_SET(flags, TRANSACTION_PROPAGATE_START_AS_RESTART))) {
                 bool is_stop = type == JOB_STOP;
 
-                UNIT_FOREACH_DEPENDENCY(dep, ret->unit, is_stop ? UNIT_ATOM_PROPAGATE_STOP : UNIT_ATOM_PROPAGATE_RESTART) {
+                UNIT_FOREACH_DEPENDENCY(dep, ret->unit, UNIT_ATOM_PROPAGATE_STOP) {
                         /* We propagate RESTART only as TRY_RESTART, in order not to start dependencies that
                          * are not around. */
                         JobType nt;

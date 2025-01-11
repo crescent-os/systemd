@@ -23,17 +23,17 @@ All tools:
 * `$SYSTEMD_OFFLINE=[0|1]` — if set to `1`, then `systemctl` will refrain from
   talking to PID 1; this has the same effect as the historical detection of
   `chroot()`. Setting this variable to `0` instead has a similar effect as
-  `$SYSTEMD_IGNORE_CHROOT=1`; i.e. tools will try to communicate with PID 1
+  `$SYSTEMD_IN_CHROOT=0`; i.e. tools will try to communicate with PID 1
   even if a `chroot()` environment is detected. You almost certainly want to
   set this to `1` if you maintain a package build system or similar and are
   trying to use a modern container system and not plain `chroot()`.
 
-* `$SYSTEMD_IGNORE_CHROOT=1` — if set, don't check whether being invoked in a
-  `chroot()` environment. This is particularly relevant for systemctl, as it
-  will not alter its behaviour for `chroot()` environments if set. Normally it
-  refrains from talking to PID 1 in such a case; turning most operations such
-  as `start` into no-ops.  If that's what's explicitly desired, you might
-  consider setting `$SYSTEMD_OFFLINE=1`.
+* `$SYSTEMD_IN_CHROOT=0|1` — takes a boolean. If set, overrides chroot detection.
+  This is particularly relevant for systemctl, as it will not alter its behaviour
+  for `chroot()` environments if `SYSTEMD_IN_CHROOT=0`. Normally it refrains from
+  talking to PID 1 in such a case; turning most operations such as `start` into
+  no-ops. If that's what's explicitly desired, you might consider setting
+  `$SYSTEMD_OFFLINE=1`.
 
 * `$SYSTEMD_FIRST_BOOT=0|1` — if set, assume "first boot" condition to be false
   or true, instead of checking the flag file created by PID 1.
@@ -183,6 +183,17 @@ All tools:
   expected format is six groups of two hexadecimal digits separated by colons,
   e.g. `SYSTEMD_NSPAWN_NETWORK_MAC=12:34:56:78:90:AB`
 
+`systemd-vmspawn`:
+
+* `$SYSTEMD_VMSPAWN_NETWORK_MAC=...` — if set, allows users to set a specific MAC
+  address for a VM, ensuring that it uses the provided value instead of
+  generating a random one. It is effective when used with `--network-tap`. The
+  expected format is six groups of two hexadecimal digits separated by colons,
+  e.g. `SYSTEMD_VMSPAWN_NETWORK_MAC=12:34:56:78:90:AB`
+
+* `$SYSTEMD_VMSPAWN_QEMU_EXTRA=…` – may contain additional command line
+  arguments to append the qemu command line.
+
 `systemd-logind`:
 
 * `$SYSTEMD_BYPASS_HIBERNATION_MEMORY_CHECK=1` — if set, report that
@@ -330,7 +341,7 @@ All tools:
   for cases where we don't need to track given unit type, e.g. `--user` manager
   often doesn't need to deal with device or swap units because they are
   handled by the `--system` manager (PID 1). Note that setting certain unit
-  type as unsupported may not prevent loading some units of that type if they
+  type as unsupported might not prevent loading some units of that type if they
   are referenced by other units of another supported type.
 
 * `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST` — can be set to override the mount
@@ -339,6 +350,13 @@ All tools:
   processing of mount units to stall. The burst limit may be adjusted when the
   default is not appropriate for a given system. Defaults to `5`, accepts
   positive integers.
+
+* `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_INTERVAL_SEC` — can be set to override the mount
+  units interval rate limit for parsing `/proc/self/mountinfo`. Similar to
+  `$SYSTEMD_DEFAULT_MOUNT_RATE_LIMIT_BURST`, the interval limit maybe adjusted when
+  the default is not appropriate for a given system. The default value is 1 and the
+  default application time unit is second, and the time unit can beoverriden as usual
+  by specifying it explicitly, see the systemd.time(7) man page.
 
 `systemd-remount-fs`:
 
@@ -393,7 +411,7 @@ All tools:
   subvolumes if the backing filesystem supports them. If set to `0`, these
   lines will always create directories.
 
-`systemd-sysusers`
+`systemd-sysusers`:
 
 * `$SOURCE_DATE_EPOCH` — if unset, the field of the date of last password change
   in `/etc/shadow` will be the number of days from Jan 1, 1970 00:00 UTC until
@@ -623,6 +641,10 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
 
 * `$SYSTEMD_REPART_OVERRIDE_FSTYPE` – if set the value will override the file
   system type specified in Format= lines in partition definition files.
+  Additionally, the filesystem for all partitions with a specific designator can
+  be overridden via a correspondingly named environment variable. For example,
+  to override the filesystem type for all partitions with `Type=root`, you can
+  set `SYSTEMD_REPART_OVERRIDE_FSTYPE_ROOT=ext4`.
 
 `systemd-nspawn`, `systemd-networkd`:
 
@@ -675,4 +697,54 @@ Tools using the Varlink protocol (such as `varlinkctl`) or sd-bus (such as
 * `$SYSTEMD_VARLINK_LISTEN` – interpreted by some tools that provide a Varlink
   service. Takes a file system path: if specified the tool will listen on an
   `AF_UNIX` stream socket on the specified path in addition to whatever else it
-  would listen on.
+  would listen on. If set to "-" the tool will turn stdin/stdout into a Varlink
+  connection.
+
+`systemd-mountfsd`:
+
+* `$SYSTEMD_MOUNTFSD_TRUSTED_DIRECTORIES` – takes a boolean argument. If true
+  disk images from the usual disk image directories (`/var/lib/machines/`,
+  `/var/lib/confexts/`, …) will be considered "trusted", i.e. are validated
+  with a more relaxed image policy (typically not requiring Verity signature
+  checking) than those from other directories (where Verity signature checks
+  are mandatory). If false all images are treated the same, regardless if
+  placed in the usual disk image directories or elsewhere. If not set defaults
+  to a compile time setting.
+
+* `$SYSTEMD_MOUNTFSD_IMAGE_POLICY_TRUSTED`,
+  `$SYSTEMD_MOUNTFSD_IMAGE_POLICY_UNTRUSTED` – the default image policy to
+  apply to trusted and untrusted disk images. An image is considered trusted if
+  placed in a trusted disk image directory (see above), or if suitable polkit
+  authentication was acquired. See `systemd.image-policy(7)` for the valid
+  syntax for image policy strings.
+
+`systemd-run`, `run0`, `systemd-nspawn`, `systemd-vmspawn`:
+
+* `$SYSTEMD_TINT_BACKGROUND` – Takes a boolean. When false the automatic
+  tinting of the background for containers, VMs, and interactive `systemd-run`
+  and `run0` invocations is turned off. Note that this environment variable has
+  no effect if the background color is explicitly selected via the relevant
+  `--background=` switch of the tool.
+
+* `$SYSTEMD_ADJUST_TERMINAL_TITLE` – Takes a boolean. When false the terminal
+  window title will not be updated for interactive invocation of the mentioned
+  tools.
+
+`systemd-hostnamed`, `systemd-importd`, `systemd-localed`, `systemd-machined`,
+`systemd-portabled`, `systemd-timedated`:
+
+* `SYSTEMD_EXIT_ON_IDLE` – Takes a boolean. When false, the exit-on-idle logic
+  of these services is disabled, making it easier to debug them.
+
+`systemd-ask-password`:
+
+* `$SYSTEMD_ASK_PASSWORD_KEYRING_TIMEOUT_SEC` - takes a timespan, which controls
+  the expiration time of keys stored in the kernel keyring by `systemd-ask-password`.
+  If unset, the default expiration of 150 seconds is used. If set to `0`, keys are
+  not cached in the kernel keyring. If set to `infinity`, keys are cached without an
+  expiration time in the kernel keyring.
+
+* `SYSTEMD_ASK_PASSWORD_KEYRING_TYPE` - takes a keyring ID or one of `thread`,
+  `process`, `session`, `user`, `user-session`, or `group`. Controls the kernel
+  keyring in which `systemd-ask-password` caches the queried password. Defaults
+  to `user`.

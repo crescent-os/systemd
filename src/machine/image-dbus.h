@@ -2,11 +2,12 @@
 #pragma once
 
 #include "bus-object.h"
+#include "discover-image.h"
 #include "machined.h"
 
 extern const BusObjectImplementation image_object;
 
-char *image_bus_path(const char *name);
+char* image_bus_path(const char *name);
 
 int bus_image_method_remove(sd_bus_message *message, void *userdata, sd_bus_error *error);
 int bus_image_method_rename(sd_bus_message *message, void *userdata, sd_bus_error *error);

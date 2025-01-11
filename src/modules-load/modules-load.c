@@ -23,27 +23,6 @@ static const char conf_file_dirs[] = CONF_PATHS_NULSTR("modules-load.d");
 
 STATIC_DESTRUCTOR_REGISTER(arg_proc_cmdline_modules, strv_freep);
 
-static void systemd_kmod_log(void *data, int priority, const char *file, int line,
-                             const char *fn, const char *format, va_list args) {
-
-        DISABLE_WARNING_FORMAT_NONLITERAL;
-        log_internalv(priority, 0, file, line, fn, format, args);
-        REENABLE_WARNING;
-}
-
-static int add_modules(const char *p) {
-        _cleanup_strv_free_ char **k = NULL;
-
-        k = strv_split(p, ",");
-        if (!k)
-                return log_oom();
-
-        if (strv_extend_strv(&arg_proc_cmdline_modules, k, true) < 0)
-                return log_oom();
-
-        return 0;
-}
-
 static int parse_proc_cmdline_item(const char *key, const char *value, void *data) {
         int r;
 
@@ -52,9 +31,9 @@ static int parse_proc_cmdline_item(const char *key, const char *value, void *dat
                 if (proc_cmdline_value_missing(key, value))
                         return 0;
 
-                r = add_modules(value);
+                r = strv_split_and_extend(&arg_proc_cmdline_modules, value, ",", /* filter_duplicates = */ true);
                 if (r < 0)
-                        return r;
+                        return log_error_errno(r, "Failed to parse modules_load= kernel command line option: %m");
         }
 
         return 0;
@@ -156,7 +135,7 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int run(int argc, char *argv[]) {
-        _cleanup_(kmod_unrefp) struct kmod_ctx *ctx = NULL;
+        _cleanup_(sym_kmod_unrefp) struct kmod_ctx *ctx = NULL;
         int r, k;
 
         r = parse_argv(argc, argv);
@@ -171,12 +150,9 @@ static int run(int argc, char *argv[]) {
         if (r < 0)
                 log_warning_errno(r, "Failed to parse kernel command line, ignoring: %m");
 
-        ctx = kmod_new(NULL, NULL);
-        if (!ctx)
-                return log_oom();
-
-        kmod_load_resources(ctx);
-        kmod_set_log_fn(ctx, systemd_kmod_log, NULL);
+        r = module_setup_context(&ctx);
+        if (r < 0)
+                return log_error_errno(r, "Failed to initialize libkmod context: %m");
 
         r = 0;
 

@@ -21,7 +21,7 @@ static void test_uid_to_name_one(uid_t uid, const char *name) {
                 log_info("(skipping detailed tests because nobody is not synthesized)");
                 return;
         }
-        assert_se(streq_ptr(t, name));
+        ASSERT_STREQ(t, name);
 }
 
 TEST(uid_to_name) {
@@ -41,7 +41,7 @@ static void test_gid_to_name_one(gid_t gid, const char *name) {
                 log_info("(skipping detailed tests because nobody is not synthesized)");
                 return;
         }
-        assert_se(streq_ptr(t, name));
+        ASSERT_STREQ(t, name);
 }
 
 TEST(gid_to_name) {
@@ -318,6 +318,24 @@ TEST(valid_home) {
         assert_se(valid_home("/"));
         assert_se(valid_home("/home"));
         assert_se(valid_home("/home/foo"));
+        assert_se(valid_home("/home/foo/"));
+}
+
+TEST(valid_shell) {
+        assert_se(!valid_shell(NULL));
+        assert_se(!valid_shell(""));
+        assert_se(!valid_shell("."));
+        assert_se(!valid_shell("/shell/.."));
+        assert_se(!valid_shell("/shell/../"));
+        assert_se(!valid_shell("/shell\n/foo"));
+        assert_se(!valid_shell("./piep"));
+        assert_se(!valid_shell("piep"));
+        assert_se(!valid_shell("/shell/user:lennart"));
+        assert_se(!valid_shell("/"));
+        assert_se(!valid_shell("/bin/sh/"));
+        assert_se(valid_shell("/shell"));
+        assert_se(valid_shell("/shell/foo"));
+        assert_se(valid_shell("/bin/sh"));
 }
 
 static void test_get_user_creds_one(const char *id, const char *name, uid_t uid, gid_t gid, const char *home, const char *shell) {
@@ -338,7 +356,7 @@ static void test_get_user_creds_one(const char *id, const char *name, uid_t uid,
                 return;
         }
         assert_se(r == 0);
-        assert_se(streq_ptr(id, name));
+        ASSERT_STREQ(id, name);
         assert_se(ruid == uid);
         assert_se(rgid == gid);
         assert_se(path_equal(rhome, home));
@@ -364,7 +382,7 @@ static void test_get_group_creds_one(const char *id, const char *name, gid_t gid
                 return;
         }
         assert_se(r == 0);
-        assert_se(streq_ptr(id, name));
+        ASSERT_STREQ(id, name);
         assert_se(rgid == gid);
 }
 
@@ -426,9 +444,8 @@ TEST(gid_lists_ops) {
         assert_se(nresult >= 0);
         assert_se(memcmp_nn(result2, ELEMENTSOF(result2), res4, nresult) == 0);
 
-        nresult = getgroups_alloc(&gids);
-        assert_se(nresult >= 0 || nresult == -EINVAL || nresult == -ENOMEM);
-        assert_se(gids);
+        ASSERT_OK(nresult = getgroups_alloc(&gids));
+        assert_se(gids || nresult == 0);
 }
 
 TEST(parse_uid_range) {
@@ -466,7 +483,7 @@ static void test_mangle_gecos_one(const char *input, const char *expected) {
         _cleanup_free_ char *p = NULL;
 
         assert_se(p = mangle_gecos(input));
-        assert_se(streq(p, expected));
+        ASSERT_STREQ(p, expected);
         assert_se(valid_gecos(p));
 }
 

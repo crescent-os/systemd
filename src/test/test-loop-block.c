@@ -49,10 +49,10 @@ static void verify_dissected_image(DissectedImage *dissected) {
 static void verify_dissected_image_harder(DissectedImage *dissected) {
         verify_dissected_image(dissected);
 
-        assert_se(streq(dissected->partitions[PARTITION_ESP].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat"));
-        assert_se(streq(dissected->partitions[PARTITION_ROOT].fstype, "ext4"));
-        assert_se(streq(dissected->partitions[PARTITION_HOME].fstype, "ext4"));
+        ASSERT_STREQ(dissected->partitions[PARTITION_ESP].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_XBOOTLDR].fstype, "vfat");
+        ASSERT_STREQ(dissected->partitions[PARTITION_ROOT].fstype, "ext4");
+        ASSERT_STREQ(dissected->partitions[PARTITION_HOME].fstype, "ext4");
 }
 
 static void* thread_func(void *ptr) {
@@ -224,15 +224,11 @@ static int run(int argc, char *argv[]) {
         dissected = dissected_image_unref(dissected);
 #endif
 
-        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
-                log_tests_skipped("not running privileged");
-                return 0;
-        }
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0)
+                return log_tests_skipped("not running privileged");
 
-        if (detect_container() > 0) {
-                log_tests_skipped("Test not supported in a container, requires udev/uevent notifications");
-                return 0;
-        }
+        if (detect_container() > 0)
+                return log_tests_skipped("Test not supported in a container, requires udev/uevent notifications");
 
         assert_se(loop_device_make(fd, O_RDWR, 0, UINT64_MAX, 0, LO_FLAGS_PARTSCAN, LOCK_EX, &loop) >= 0);
 
@@ -251,16 +247,16 @@ static int run(int argc, char *argv[]) {
         assert_se(r >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ESP].node, "vfat", "EFI", NULL, id, true, false, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_XBOOTLDR].node, "vfat", "xbootldr", NULL, id, true, false, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_ROOT].node, "ext4", "root", NULL, id, true, false, 0, NULL, NULL, NULL) >= 0);
 
         assert_se(sd_id128_randomize(&id) >= 0);
-        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, true, false, 0, NULL) >= 0);
+        assert_se(make_filesystem(dissected->partitions[PARTITION_HOME].node, "ext4", "home", NULL, id, true, false, 0, NULL, NULL, NULL) >= 0);
 
         dissected = dissected_image_unref(dissected);
 
@@ -328,7 +324,7 @@ static int run(int argc, char *argv[]) {
         log_notice("All threads started now.");
 
         if (arg_n_threads == 1)
-                assert_se(thread_func(FD_TO_PTR(fd)) == NULL);
+                ASSERT_NULL(thread_func(FD_TO_PTR(fd)));
         else
                 for (unsigned i = 0; i < arg_n_threads; i++) {
                         log_notice("Joining thread #%u.", i);

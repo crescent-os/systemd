@@ -27,18 +27,16 @@
 #include "user-util.h"
 
 CustomMount* custom_mount_add(CustomMount **l, size_t *n, CustomMountType t) {
-        CustomMount *c, *ret;
+        CustomMount *ret;
 
         assert(l);
         assert(n);
         assert(t >= 0);
         assert(t < _CUSTOM_MOUNT_TYPE_MAX);
 
-        c = reallocarray(*l, *n + 1, sizeof(CustomMount));
-        if (!c)
+        if (!GREEDY_REALLOC(*l, *n + 1))
                 return NULL;
 
-        *l = c;
         ret = *l + *n;
         (*n)++;
 
@@ -444,24 +442,41 @@ int tmpfs_patch_options(
 }
 
 int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
-        const char *full, *top;
-        int r;
+        _cleanup_free_ char *top = NULL, *full = NULL;;
         unsigned long extra_flags = 0;
+        int r;
 
-        top = prefix_roota(dest, "/sys");
-        r = path_is_fs_type(top, SYSFS_MAGIC);
+        top = path_join(dest, "/sys");
+        if (!top)
+                return log_oom();
+
+        r = path_is_mount_point(top);
         if (r < 0)
-                return log_error_errno(r, "Failed to determine filesystem type of %s: %m", top);
-        /* /sys might already be mounted as sysfs by the outer child in the
-         * !netns case. In this case, it's all good. Don't touch it because we
-         * don't have the right to do so, see https://github.com/systemd/systemd/issues/1555.
-         */
-        if (r > 0)
-                return 0;
+                return log_error_errno(r, "Failed to determine if '%s' is a mountpoint: %m", top);
+        if (r == 0) {
+                /* If this is not a mount point yet, then mount a tmpfs there */
+                r = mount_nofollow_verbose(LOG_ERR, "tmpfs", top, "tmpfs", MS_NOSUID|MS_NOEXEC|MS_NODEV, "mode=0555" TMPFS_LIMITS_SYS);
+                if (r < 0)
+                        return r;
+        } else {
+                r = path_is_fs_type(top, SYSFS_MAGIC);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to determine filesystem type of %s: %m", top);
 
-        full = prefix_roota(top, "/full");
+                /* /sys/ might already be mounted as sysfs by the outer child in the !netns case. In this case, it's
+                 * all good. Don't touch it because we don't have the right to do so, see
+                 * https://github.com/systemd/systemd/issues/1555.
+                 */
+                if (r > 0)
+                        return 0;
+        }
 
-        (void) mkdir(full, 0755);
+        full = path_join(top, "/full");
+        if (!full)
+                return log_oom();
+
+        if (mkdir(full, 0755) < 0 && errno != EEXIST)
+                return log_error_errno(errno, "Failed to create directory '%s': %m", full);
 
         if (FLAGS_SET(mount_settings, MOUNT_APPLY_APIVFS_RO))
                 extra_flags |= MS_RDONLY;
@@ -501,10 +516,11 @@ int mount_sysfs(const char *dest, MountSettingsMask mount_settings) {
         if (rmdir(full) < 0)
                 return log_error_errno(errno, "Failed to remove %s: %m", full);
 
-        /* Create mountpoint for cgroups. Otherwise we are not allowed since we
-         * remount /sys read-only.
-         */
-        const char *x = prefix_roota(top, "/fs/cgroup");
+        /* Create mountpoint for cgroups. Otherwise we are not allowed since we remount /sys/ read-only. */
+        _cleanup_free_ char *x = path_join(top, "/fs/cgroup");
+        if (!x)
+                return log_oom();
+
         (void) mkdir_p(x, 0755);
 
         return mount_nofollow_verbose(LOG_ERR, NULL, top, NULL,
@@ -541,7 +557,7 @@ int mount_all(const char *dest,
         } MountPoint;
 
         static const MountPoint mount_table[] = {
-                /* First we list inner child mounts (i.e. mounts applied *after* entering user namespacing) */
+                /* First we list inner child mounts (i.e. mounts applied *after* entering user namespacing when we are privileged) */
                 { "proc",            "/proc",           "proc",  NULL,        PROC_DEFAULT_MOUNT_FLAGS,
                   MOUNT_FATAL|MOUNT_IN_USERNS|MOUNT_MKDIR|MOUNT_FOLLOW_SYMLINKS }, /* we follow symlinks here since not following them requires /proc/ already being mounted, which we don't have here. */
 
@@ -575,15 +591,15 @@ int mount_all(const char *dest,
                 { "mqueue",                 "/dev/mqueue",                  "mqueue", NULL,                            MS_NOSUID|MS_NOEXEC|MS_NODEV,
                   MOUNT_IN_USERNS|MOUNT_MKDIR },
 
-                /* Then we list outer child mounts (i.e. mounts applied *before* entering user namespacing) */
+                /* Then we list outer child mounts (i.e. mounts applied *before* entering user namespacing when we are privileged) */
                 { "tmpfs",                  "/tmp",                         "tmpfs", "mode=01777" NESTED_TMPFS_LIMITS, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
                   MOUNT_FATAL|MOUNT_APPLY_TMPFS_TMP|MOUNT_MKDIR },
                 { "tmpfs",                  "/sys",                         "tmpfs", "mode=0555" TMPFS_LIMITS_SYS,     MS_NOSUID|MS_NOEXEC|MS_NODEV,
-                  MOUNT_FATAL|MOUNT_APPLY_APIVFS_NETNS|MOUNT_MKDIR },
+                  MOUNT_FATAL|MOUNT_APPLY_APIVFS_NETNS|MOUNT_MKDIR|MOUNT_PRIVILEGED },
                 { "sysfs",                  "/sys",                         "sysfs", NULL,                             SYS_DEFAULT_MOUNT_FLAGS,
-                  MOUNT_FATAL|MOUNT_APPLY_APIVFS_RO|MOUNT_MKDIR },    /* skipped if above was mounted */
+                  MOUNT_FATAL|MOUNT_APPLY_APIVFS_RO|MOUNT_MKDIR|MOUNT_PRIVILEGED },    /* skipped if above was mounted */
                 { "sysfs",                  "/sys",                         "sysfs", NULL,                             MS_NOSUID|MS_NOEXEC|MS_NODEV,
-                  MOUNT_FATAL|MOUNT_MKDIR },                          /* skipped if above was mounted */
+                  MOUNT_FATAL|MOUNT_MKDIR|MOUNT_PRIVILEGED },                          /* skipped if above was mounted */
                 { "tmpfs",                  "/dev",                         "tmpfs", "mode=0755" TMPFS_LIMITS_PRIVATE_DEV, MS_NOSUID|MS_STRICTATIME,
                   MOUNT_FATAL|MOUNT_MKDIR },
                 { "tmpfs",                  "/dev/shm",                     "tmpfs", "mode=01777" NESTED_TMPFS_LIMITS, MS_NOSUID|MS_NODEV|MS_STRICTATIME,
@@ -604,11 +620,11 @@ int mount_all(const char *dest,
                   MOUNT_FATAL|MOUNT_IN_USERNS },
 #if HAVE_SELINUX
                 { "/sys/fs/selinux",        "/sys/fs/selinux",              NULL,    NULL,                             MS_BIND,
-                  MOUNT_MKDIR },  /* Bind mount first (mkdir/chown the mount point in case /sys/ is mounted as minimal skeleton tmpfs) */
+                  MOUNT_MKDIR|MOUNT_PRIVILEGED },  /* Bind mount first (mkdir/chown the mount point in case /sys/ is mounted as minimal skeleton tmpfs) */
                 { NULL,                     "/sys/fs/selinux",              NULL,    NULL,                             MS_BIND|MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV|MS_REMOUNT,
-                  0 },            /* Then, make it r/o (don't mkdir/chown the mount point here, the previous entry already did that) */
+                  MOUNT_PRIVILEGED },              /* Then, make it r/o (don't mkdir/chown the mount point here, the previous entry already did that) */
                 { NULL,                     "/sys/fs/selinux",              NULL,    NULL,                             MS_PRIVATE,
-                  0 },            /* Turn off propagation (we only want that for the mount propagation tunnel dir) */
+                  MOUNT_PRIVILEGED },              /* Turn off propagation (we only want that for the mount propagation tunnel dir) */
 #endif
         };
 
@@ -617,31 +633,36 @@ int mount_all(const char *dest,
         bool ro = FLAGS_SET(mount_settings, MOUNT_APPLY_APIVFS_RO);
         bool in_userns = FLAGS_SET(mount_settings, MOUNT_IN_USERNS);
         bool tmpfs_tmp = FLAGS_SET(mount_settings, MOUNT_APPLY_TMPFS_TMP);
+        bool privileged = FLAGS_SET(mount_settings, MOUNT_PRIVILEGED);
         int r;
 
-        for (size_t k = 0; k < ELEMENTSOF(mount_table); k++) {
+        FOREACH_ELEMENT(m, mount_table) {
                 _cleanup_free_ char *where = NULL, *options = NULL, *prefixed = NULL;
-                bool fatal = FLAGS_SET(mount_table[k].mount_settings, MOUNT_FATAL);
+                bool fatal = FLAGS_SET(m->mount_settings, MOUNT_FATAL);
                 const char *o;
 
-                if (in_userns != FLAGS_SET(mount_table[k].mount_settings, MOUNT_IN_USERNS))
+                /* If we are not privileged but the entry is marked as privileged and to be mounted outside the user namespace, then skip it */
+                if (!privileged && FLAGS_SET(m->mount_settings, MOUNT_PRIVILEGED) && !FLAGS_SET(m->mount_settings, MOUNT_IN_USERNS))
                         continue;
 
-                if (!netns && FLAGS_SET(mount_table[k].mount_settings, MOUNT_APPLY_APIVFS_NETNS))
+                if (in_userns != FLAGS_SET(m->mount_settings, MOUNT_IN_USERNS))
                         continue;
 
-                if (!ro && FLAGS_SET(mount_table[k].mount_settings, MOUNT_APPLY_APIVFS_RO))
+                if (!netns && FLAGS_SET(m->mount_settings, MOUNT_APPLY_APIVFS_NETNS))
                         continue;
 
-                if (!tmpfs_tmp && FLAGS_SET(mount_table[k].mount_settings, MOUNT_APPLY_TMPFS_TMP))
+                if (!ro && FLAGS_SET(m->mount_settings, MOUNT_APPLY_APIVFS_RO))
                         continue;
 
-                r = chase(mount_table[k].where, dest, CHASE_NONEXISTENT|CHASE_PREFIX_ROOT, &where, NULL);
+                if (!tmpfs_tmp && FLAGS_SET(m->mount_settings, MOUNT_APPLY_TMPFS_TMP))
+                        continue;
+
+                r = chase(m->where, dest, CHASE_NONEXISTENT|CHASE_PREFIX_ROOT, &where, NULL);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), mount_table[k].where);
+                        return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), m->where);
 
                 /* Skip this entry if it is not a remount. */
-                if (mount_table[k].what) {
+                if (m->what) {
                         r = path_is_mount_point(where);
                         if (r < 0 && r != -ENOENT)
                                 return log_error_errno(r, "Failed to detect whether %s is a mount point: %m", where);
@@ -649,10 +670,10 @@ int mount_all(const char *dest,
                                 continue;
                 }
 
-                if ((mount_table[k].mount_settings & (MOUNT_MKDIR|MOUNT_TOUCH)) != 0) {
+                if ((m->mount_settings & (MOUNT_MKDIR|MOUNT_TOUCH)) != 0) {
                         uid_t u = (use_userns && !in_userns) ? uid_shift : UID_INVALID;
 
-                        if (FLAGS_SET(mount_table[k].mount_settings, MOUNT_TOUCH))
+                        if (FLAGS_SET(m->mount_settings, MOUNT_TOUCH))
                                 r = mkdir_parents_safe(dest, where, 0755, u, u, 0);
                         else
                                 r = mkdir_p_safe(dest, where, 0755, u, u, 0);
@@ -669,7 +690,7 @@ int mount_all(const char *dest,
                         }
                 }
 
-                if (FLAGS_SET(mount_table[k].mount_settings, MOUNT_TOUCH)) {
+                if (FLAGS_SET(m->mount_settings, MOUNT_TOUCH)) {
                         r = touch(where);
                         if (r < 0 && r != -EEXIST) {
                                 if (fatal && r != -EROFS)
@@ -681,8 +702,8 @@ int mount_all(const char *dest,
                         }
                 }
 
-                o = mount_table[k].options;
-                if (streq_ptr(mount_table[k].type, "tmpfs")) {
+                o = m->options;
+                if (streq_ptr(m->type, "tmpfs")) {
                         r = tmpfs_patch_options(o, in_userns ? 0 : uid_shift, selinux_apifs_context, &options);
                         if (r < 0)
                                 return log_oom();
@@ -690,24 +711,24 @@ int mount_all(const char *dest,
                                 o = options;
                 }
 
-                if (FLAGS_SET(mount_table[k].mount_settings, MOUNT_PREFIX_ROOT)) {
+                if (FLAGS_SET(m->mount_settings, MOUNT_PREFIX_ROOT)) {
                         /* Optionally prefix the mount source with the root dir. This is useful in bind
                          * mounts to be created within the container image before we transition into it. Note
                          * that MOUNT_IN_USERNS is run after we transitioned hence prefixing is not necessary
                          * for those. */
-                        r = chase(mount_table[k].what, dest, CHASE_PREFIX_ROOT, &prefixed, NULL);
+                        r = chase(m->what, dest, CHASE_PREFIX_ROOT, &prefixed, NULL);
                         if (r < 0)
-                                return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), mount_table[k].what);
+                                return log_error_errno(r, "Failed to resolve %s%s: %m", strempty(dest), m->what);
                 }
 
                 r = mount_verbose_full(
                                 fatal ? LOG_ERR : LOG_DEBUG,
-                                prefixed ?: mount_table[k].what,
+                                prefixed ?: m->what,
                                 where,
-                                mount_table[k].type,
-                                mount_table[k].flags,
+                                m->type,
+                                m->flags,
                                 o,
-                                FLAGS_SET(mount_table[k].mount_settings, MOUNT_FOLLOW_SYMLINKS));
+                                FLAGS_SET(m->mount_settings, MOUNT_FOLLOW_SYMLINKS));
                 if (r < 0 && fatal)
                         return r;
         }
@@ -1039,18 +1060,29 @@ bool has_custom_root_mount(const CustomMount *mounts, size_t n) {
         return false;
 }
 
-static int setup_volatile_state(const char *directory, uid_t uid_shift, const char *selinux_apifs_context) {
-        _cleanup_free_ char *buf = NULL;
-        const char *p, *options;
+static int setup_volatile_state(const char *directory) {
         int r;
 
         assert(directory);
 
         /* --volatile=state means we simply overmount /var with a tmpfs, and the rest read-only. */
 
+        /* First, remount the root directory. */
         r = bind_remount_recursive(directory, MS_RDONLY, MS_RDONLY, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to remount %s read-only: %m", directory);
+
+        return 0;
+}
+
+static int setup_volatile_state_after_remount_idmap(const char *directory, uid_t uid_shift, const char *selinux_apifs_context) {
+        _cleanup_free_ char *buf = NULL;
+        const char *p, *options;
+        int r;
+
+        assert(directory);
+
+        /* Then, after remount_idmap(), overmount /var/ with a tmpfs. */
 
         p = prefix_roota(directory, "/var");
         r = mkdir(p, 0755);
@@ -1227,10 +1259,26 @@ int setup_volatile_mode(
                 return setup_volatile_yes(directory, uid_shift, selinux_apifs_context);
 
         case VOLATILE_STATE:
-                return setup_volatile_state(directory, uid_shift, selinux_apifs_context);
+                return setup_volatile_state(directory);
 
         case VOLATILE_OVERLAY:
                 return setup_volatile_overlay(directory, uid_shift, selinux_apifs_context);
+
+        default:
+                return 0;
+        }
+}
+
+int setup_volatile_mode_after_remount_idmap(
+                const char *directory,
+                VolatileMode mode,
+                uid_t uid_shift,
+                const char *selinux_apifs_context) {
+
+        switch (mode) {
+
+        case VOLATILE_STATE:
+                return setup_volatile_state_after_remount_idmap(directory, uid_shift, selinux_apifs_context);
 
         default:
                 return 0;
@@ -1358,8 +1406,10 @@ done:
 #define NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS "/run/host/proc"
 #define NSPAWN_PRIVATE_FULLY_VISIBLE_SYSFS "/run/host/sys"
 
-int pin_fully_visible_fs(void) {
+int pin_fully_visible_api_fs(void) {
         int r;
+
+        log_debug("Pinning fully visible API FS");
 
         (void) mkdir_p(NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS, 0755);
         (void) mkdir_p(NSPAWN_PRIVATE_FULLY_VISIBLE_SYSFS, 0755);
@@ -1375,7 +1425,7 @@ int pin_fully_visible_fs(void) {
         return 0;
 }
 
-static int do_wipe_fully_visible_fs(void) {
+static int do_wipe_fully_visible_api_fs(void) {
         if (umount2(NSPAWN_PRIVATE_FULLY_VISIBLE_PROCFS, MNT_DETACH) < 0)
                 return log_error_errno(errno, "Failed to unmount temporary proc: %m");
 
@@ -1391,18 +1441,15 @@ static int do_wipe_fully_visible_fs(void) {
         return 0;
 }
 
-int wipe_fully_visible_fs(int mntns_fd) {
+int wipe_fully_visible_api_fs(int mntns_fd) {
         _cleanup_close_ int orig_mntns_fd = -EBADF;
         int r, rr;
 
-        r = namespace_open(0,
-                           /* ret_pidns_fd = */ NULL,
-                           &orig_mntns_fd,
-                           /* ret_netns_fd = */ NULL,
-                           /* ret_userns_fd = */ NULL,
-                           /* ret_root_fd = */ NULL);
-        if (r < 0)
-                return log_error_errno(r, "Failed to pin originating mount namespace: %m");
+        log_debug("Wiping fully visible API FS");
+
+        orig_mntns_fd = namespace_open_by_type(NAMESPACE_MOUNT);
+        if (orig_mntns_fd < 0)
+                return log_error_errno(orig_mntns_fd, "Failed to pin originating mount namespace: %m");
 
         r = namespace_enter(/* pidns_fd = */ -EBADF,
                             mntns_fd,
@@ -1412,7 +1459,7 @@ int wipe_fully_visible_fs(int mntns_fd) {
         if (r < 0)
                 return log_error_errno(r, "Failed to enter mount namespace: %m");
 
-        rr = do_wipe_fully_visible_fs();
+        rr = do_wipe_fully_visible_api_fs();
 
         r = namespace_enter(/* pidns_fd = */ -EBADF,
                             orig_mntns_fd,

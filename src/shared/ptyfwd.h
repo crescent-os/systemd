@@ -25,15 +25,11 @@ typedef enum PTYForwardFlags {
 
 typedef int (*PTYForwardHandler)(PTYForward *f, int rcode, void *userdata);
 
-int pty_forward_new(sd_event *event, int master, PTYForwardFlags flags, PTYForward **f);
-PTYForward *pty_forward_free(PTYForward *f);
-
-int pty_forward_get_last_char(PTYForward *f, char *ch);
+int pty_forward_new(sd_event *event, int master, PTYForwardFlags flags, PTYForward **ret);
+PTYForward* pty_forward_free(PTYForward *f);
 
 int pty_forward_set_ignore_vhangup(PTYForward *f, bool ignore_vhangup);
 bool pty_forward_get_ignore_vhangup(PTYForward *f);
-
-bool pty_forward_is_done(PTYForward *f);
 
 void pty_forward_set_handler(PTYForward *f, PTYForwardHandler handler, void *userdata);
 
@@ -49,5 +45,7 @@ int pty_forward_set_title(PTYForward *f, const char *title);
 int pty_forward_set_titlef(PTYForward *f, const char *format, ...) _printf_(2,3);
 
 int pty_forward_set_title_prefix(PTYForward *f, const char *prefix);
+
+bool shall_set_terminal_title(void);
 
 DEFINE_TRIVIAL_CLEANUP_FUNC(PTYForward*, pty_forward_free);

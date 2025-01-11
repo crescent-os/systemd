@@ -2,7 +2,7 @@
 #pragma once
 
 typedef struct Session Session;
-typedef enum KillWho KillWho;
+typedef enum KillWhom KillWhom;
 
 #include "list.h"
 #include "login-util.h"
@@ -29,6 +29,7 @@ typedef enum SessionClass {
         SESSION_BACKGROUND_LIGHT,   /* Like SESSION_BACKGROUND, but without the service manager */
         SESSION_MANAGER,            /* The service manager */
         SESSION_MANAGER_EARLY,      /* The service manager for root (which is allowed to run before systemd-user-sessions.service) */
+        SESSION_NONE,               /* A session not registered with logind */
         _SESSION_CLASS_MAX,
         _SESSION_CLASS_INVALID = -EINVAL,
 } SessionClass;
@@ -44,7 +45,7 @@ typedef enum SessionClass {
 #define SESSION_CLASS_WANTS_SERVICE_MANAGER(class) IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER, SESSION_LOCK_SCREEN, SESSION_BACKGROUND)
 
 /* Which session classes can pin our user tracking? */
-#define SESSION_CLASS_PIN_USER(class) (!IN_SET((class), SESSION_MANAGER, SESSION_MANAGER_EARLY))
+#define SESSION_CLASS_PIN_USER(class) (!IN_SET((class), SESSION_MANAGER, SESSION_MANAGER_EARLY, SESSION_NONE))
 
 /* Which session classes decide whether system is idle? (should only cover sessions that have input, and are not idle screens themselves)*/
 #define SESSION_CLASS_CAN_IDLE(class) (IN_SET((class), SESSION_USER, SESSION_USER_EARLY, SESSION_GREETER))
@@ -77,11 +78,11 @@ typedef enum SessionType {
 
 #define SESSION_TYPE_IS_GRAPHICAL(type) IN_SET(type, SESSION_X11, SESSION_WAYLAND, SESSION_MIR)
 
-enum KillWho {
+enum KillWhom {
         KILL_LEADER,
         KILL_ALL,
-        _KILL_WHO_MAX,
-        _KILL_WHO_INVALID = -EINVAL,
+        _KILL_WHOM_MAX,
+        _KILL_WHOM_INVALID = -EINVAL,
 };
 
 typedef enum TTYValidity {
@@ -191,7 +192,7 @@ int session_finalize(Session *s);
 int session_release(Session *s);
 int session_save(Session *s);
 int session_load(Session *s);
-int session_kill(Session *s, KillWho who, int signo);
+int session_kill(Session *s, KillWhom whom, int signo, sd_bus_error *error);
 
 SessionState session_get_state(Session *u);
 
@@ -204,8 +205,8 @@ SessionType session_type_from_string(const char *s) _pure_;
 const char* session_class_to_string(SessionClass t) _const_;
 SessionClass session_class_from_string(const char *s) _pure_;
 
-const char *kill_who_to_string(KillWho k) _const_;
-KillWho kill_who_from_string(const char *s) _pure_;
+const char* kill_whom_to_string(KillWhom k) _const_;
+KillWhom kill_whom_from_string(const char *s) _pure_;
 
 const char* tty_validity_to_string(TTYValidity t) _const_;
 TTYValidity tty_validity_from_string(const char *s) _pure_;
@@ -215,6 +216,10 @@ void session_leave_vt(Session *s);
 bool session_is_controller(Session *s, const char *sender);
 int session_set_controller(Session *s, const char *sender, bool force, bool prepare);
 void session_drop_controller(Session *s);
+
+bool session_job_pending(Session *s);
+
+int session_send_create_reply(Session *s, const sd_bus_error *error);
 
 static inline bool SESSION_IS_SELF(const char *name) {
         return isempty(name) || streq(name, "self");

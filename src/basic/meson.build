@@ -33,6 +33,7 @@ basic_sources = files(
         'fd-util.c',
         'fileio.c',
         'filesystems.c',
+        'format-ifname.c',
         'format-util.c',
         'fs-util.c',
         'gcrypt-util.c',
@@ -57,6 +58,7 @@ basic_sources = files(
         'lock-util.c',
         'log.c',
         'login-util.c',
+        'keyring-util.c',
         'memfd-util.c',
         'memory-util.c',
         'mempool.c',
@@ -68,9 +70,9 @@ basic_sources = files(
         'ordered-set.c',
         'os-util.c',
         'parse-util.c',
-        'path-lookup.c',
         'path-util.c',
         'percent-util.c',
+        'pidfd-util.c',
         'pidref.c',
         'prioq.c',
         'proc-cmdline.c',
@@ -104,7 +106,6 @@ basic_sources = files(
         'uid-classification.c',
         'uid-range.c',
         'unit-def.c',
-        'unit-file.c',
         'unit-name.c',
         'user-util.c',
         'utf8.c',
@@ -130,7 +131,7 @@ generate_arphrd_list = find_program('generate-arphrd-list.sh')
 arphrd_list_txt = custom_target(
         'arphrd-list.txt',
         output : 'arphrd-list.txt',
-        command : [generate_arphrd_list, cpp, config_h],
+        command : [generate_arphrd_list, cpp, files('linux/if_arp.h'), config_h],
         capture : true)
 
 generate_cap_list = find_program('generate-cap-list.sh')
@@ -234,13 +235,15 @@ run_target(
 
 ############################################################
 
-filesystem_includes = ['linux/magic.h',
-                       'linux/gfs2_ondisk.h']
+filesystem_includes = files(
+        'linux/magic.h',
+        'missing_magic.h',
+)
 
 check_filesystems = find_program('check-filesystems.sh')
 r = run_command([check_filesystems, cpp, files('filesystems-gperf.gperf')] + filesystem_includes, check: false)
 if r.returncode() != 0
-        error('Unknown filesystems defined in kernel headers:\n\n' + r.stdout())
+        warning('Unknown filesystems defined in kernel headers:\n\n' + r.stdout())
 endif
 
 filesystems_gperf_h = custom_target(
@@ -271,7 +274,7 @@ filesystem_switch_case_h = custom_target(
 
 basic_sources += [filesystem_list_h, filesystem_switch_case_h, filesystems_gperf_h]
 
-libbasic = static_library(
+libbasic_static = static_library(
         'basic',
         basic_sources,
         fundamental_sources,

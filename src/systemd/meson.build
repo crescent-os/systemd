@@ -11,9 +11,12 @@ _systemd_headers = [
         'sd-hwdb.h',
         'sd-id128.h',
         'sd-journal.h',
+        'sd-json.h',
         'sd-login.h',
         'sd-messages.h',
         'sd-path.h',
+        'sd-varlink.h',
+        'sd-varlink-idl.h',
 ]
 
 # https://github.com/mesonbuild/meson/issues/1633
@@ -40,7 +43,9 @@ _not_installed_headers = [
         'sd-ndisc.h',
         'sd-ndisc-neighbor.h',
         'sd-ndisc-protocol.h',
+        'sd-ndisc-redirect.h',
         'sd-ndisc-router.h',
+        'sd-ndisc-router-solicit.h',
         'sd-netlink.h',
         'sd-network.h',
         'sd-radv.h',

@@ -37,8 +37,8 @@ TEST(set_free_with_destructor) {
         struct Item items[4] = {};
 
         assert_se(m = set_new(NULL));
-        for (size_t i = 0; i < ELEMENTSOF(items) - 1; i++)
-                assert_se(set_put(m, items + i) == 1);
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(set_put(m, item) == 1);
 
         m = set_free_with_destructor(m, item_seen);
         assert_se(items[0].seen == 1);
@@ -54,8 +54,8 @@ TEST(set_free_with_hash_ops) {
         struct Item items[4] = {};
 
         assert_se(m = set_new(&item_hash_ops));
-        for (size_t i = 0; i < ELEMENTSOF(items) - 1; i++)
-                assert_se(set_put(m, items + i) == 1);
+        FOREACH_ARRAY(item, items, ELEMENTSOF(items) - 1)
+                assert_se(set_put(m, item) == 1);
 
         m = set_free(m);
         assert_se(items[0].seen == 1);
@@ -231,28 +231,28 @@ TEST(set_strjoin) {
         /* Single entry */
         assert_se(set_put_strdup(&m, "aaa") == 1);
         assert_se(set_strjoin(m, NULL, false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, " ", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "xxx", false, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, NULL, true, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "", true, &joined) >= 0);
-        assert_se(streq(joined, "aaa"));
+        ASSERT_STREQ(joined, "aaa");
         joined = mfree(joined);
         assert_se(set_strjoin(m, " ", true, &joined) >= 0);
-        assert_se(streq(joined, " aaa "));
+        ASSERT_STREQ(joined, " aaa ");
         joined = mfree(joined);
         assert_se(set_strjoin(m, "xxx", true, &joined) >= 0);
-        assert_se(streq(joined, "xxxaaaxxx"));
+        ASSERT_STREQ(joined, "xxxaaaxxx");
 
         /* Two entries */
         assert_se(set_put_strdup(&m, "bbb") == 1);

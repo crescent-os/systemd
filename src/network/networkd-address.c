@@ -3,16 +3,21 @@
 #include <net/if.h>
 #include <net/if_arp.h>
 
+#include "af-list.h"
 #include "alloc-util.h"
+#include "bitfield.h"
 #include "firewall-util.h"
+#include "in-addr-prefix-util.h"
 #include "logarithm.h"
 #include "memory-util.h"
 #include "netlink-util.h"
 #include "networkd-address-pool.h"
 #include "networkd-address.h"
+#include "networkd-dhcp-prefix-delegation.h"
 #include "networkd-dhcp-server.h"
 #include "networkd-ipv4acd.h"
 #include "networkd-manager.h"
+#include "networkd-ndisc.h"
 #include "networkd-netlabel.h"
 #include "networkd-network.h"
 #include "networkd-queue.h"
@@ -23,8 +28,8 @@
 #include "strv.h"
 #include "strxcpyx.h"
 
-#define ADDRESSES_PER_LINK_MAX 2048U
-#define STATIC_ADDRESSES_PER_NETWORK_MAX 1024U
+#define ADDRESSES_PER_LINK_MAX 16384U
+#define STATIC_ADDRESSES_PER_NETWORK_MAX 8192U
 
 #define KNOWN_FLAGS                             \
         (IFA_F_SECONDARY |                      \
@@ -80,7 +85,7 @@ int address_flags_to_string_alloc(uint32_t flags, int family, char **ret) {
         assert(ret);
 
         for (size_t i = 0; i < ELEMENTSOF(map); i++)
-                if (FLAGS_SET(flags, 1 << i) && map[i])
+                if (BIT_SET(flags, i) && map[i])
                         if (!strextend_with_separator(
                                             &str, ",",
                                             family == AF_INET6 && (1 << i) == IFA_F_SECONDARY ? "temporary" : map[i]))
@@ -133,8 +138,6 @@ void link_get_address_states(
                 *ret_all = address_state_from_scope(MIN(ipv4_scope, ipv6_scope));
 }
 
-static void address_hash_func(const Address *a, struct siphash *state);
-static int address_compare_func(const Address *a1, const Address *a2);
 static void address_detach(Address *address);
 
 DEFINE_PRIVATE_HASH_OPS_WITH_KEY_DESTRUCTOR(
@@ -260,6 +263,7 @@ static Address* address_free(Address *address) {
         config_section_free(address->section);
         free(address->label);
         free(address->netlabel);
+        ipv6_token_unref(address->token);
         nft_set_context_clear(&address->nft_set_context);
         return mfree(address);
 }
@@ -443,7 +447,7 @@ static int address_ipv4_prefix(const Address *a, struct in_addr *ret) {
         return 0;
 }
 
-static void address_hash_func(const Address *a, struct siphash *state) {
+void address_hash_func(const Address *a, struct siphash *state) {
         assert(a);
 
         siphash24_compress_typesafe(a->family, state);
@@ -473,7 +477,7 @@ static void address_hash_func(const Address *a, struct siphash *state) {
         }
 }
 
-static int address_compare_func(const Address *a1, const Address *a2) {
+int address_compare_func(const Address *a1, const Address *a2) {
         int r;
 
         r = CMP(a1->family, a2->family);
@@ -608,6 +612,7 @@ int address_dup(const Address *src, Address **ret) {
         dest->section = NULL;
         dest->link = NULL;
         dest->label = NULL;
+        dest->token = ipv6_token_ref(src->token);
         dest->netlabel = NULL;
         dest->nft_set_context.sets = NULL;
         dest->nft_set_context.n_sets = 0;
@@ -640,12 +645,7 @@ static int address_set_masquerade(Address *address, bool add) {
         if (!address->link->network)
                 return 0;
 
-        if (address->family == AF_INET &&
-            !FLAGS_SET(address->link->network->ip_masquerade, ADDRESS_FAMILY_IPV4))
-                return 0;
-
-        if (address->family == AF_INET6 &&
-            !FLAGS_SET(address->link->network->ip_masquerade, ADDRESS_FAMILY_IPV6))
+        if (!FLAGS_SET(address->link->network->ip_masquerade, AF_TO_ADDRESS_FAMILY(address->family)))
                 return 0;
 
         if (address->scope >= RT_SCOPE_LINK)
@@ -800,8 +800,49 @@ static int address_update(Address *address) {
         return 0;
 }
 
-static int address_drop(Address *address) {
-        Link *link = ASSERT_PTR(ASSERT_PTR(address)->link);
+static int address_removed_maybe_kernel_dad(Link *link, Address *address) {
+        int r;
+
+        assert(link);
+        assert(address);
+
+        if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
+                return 0;
+
+        if (address->family != AF_INET6)
+                return 0;
+
+        if (!FLAGS_SET(address->flags, IFA_F_TENTATIVE))
+                return 0;
+
+        log_link_info(link, "Address %s with tentative flag is removed, maybe a duplicated address is assigned on another node or link?",
+                      IN6_ADDR_TO_STRING(&address->in_addr.in6));
+
+        /* Reset the address state, as the object may be reused in the below. */
+        address->state = 0;
+
+        switch (address->source) {
+        case NETWORK_CONFIG_SOURCE_STATIC:
+                r = link_reconfigure_radv_address(address, link);
+                break;
+        case NETWORK_CONFIG_SOURCE_DHCP_PD:
+                r = dhcp_pd_reconfigure_address(address, link);
+                break;
+        case NETWORK_CONFIG_SOURCE_NDISC:
+                r = ndisc_reconfigure_address(address, link);
+                break;
+        default:
+                r = 0;
+        }
+        if (r < 0)
+                return log_link_warning_errno(link, r, "Failed to configure an alternative address: %m");
+
+        return 0;
+}
+
+static int address_drop(Address *in, bool removed_by_us) {
+        _cleanup_(address_unrefp) Address *address = address_ref(ASSERT_PTR(in));
+        Link *link = ASSERT_PTR(address->link);
         int r;
 
         r = address_set_masquerade(address, /* add = */ false);
@@ -820,6 +861,14 @@ static int address_drop(Address *address) {
         ipv4acd_detach(link, address);
 
         address_detach(address);
+
+        if (!removed_by_us) {
+                r = address_removed_maybe_kernel_dad(link, address);
+                if (r < 0) {
+                        link_enter_failed(link);
+                        return r;
+                }
+        }
 
         link_update_operstate(link, /* also_update_master = */ true);
         link_check_ready(link);
@@ -935,7 +984,14 @@ int address_get_harder(Link *link, const Address *in, Address **ret) {
         return 0;
 }
 
-int link_get_address(Link *link, int family, const union in_addr_union *address, unsigned char prefixlen, Address **ret) {
+int link_get_address_full(
+                Link *link,
+                int family,
+                const union in_addr_union *address,
+                const union in_addr_union *peer, /* optional, can be NULL */
+                unsigned char prefixlen,         /* optional, can be 0 */
+                Address **ret) {
+
         Address *a;
         int r;
 
@@ -943,11 +999,11 @@ int link_get_address(Link *link, int family, const union in_addr_union *address,
         assert(IN_SET(family, AF_INET, AF_INET6));
         assert(address);
 
-        /* This find an Address object on the link which matches the given address and prefix length
-         * and does not have peer address. When the prefixlen is zero, then an Address object with an
-         * arbitrary prefixlen will be returned. */
+        /* This finds an Address object on the link which matches the given address, peer, and prefix length.
+         * If the prefixlen is zero, then an Address object with an arbitrary prefixlen will be returned.
+         * If the peer is NULL, then an Address object with an arbitrary peer will be returned. */
 
-        if (family == AF_INET6 || prefixlen != 0) {
+        if (family == AF_INET6 || (prefixlen != 0 && peer)) {
                 _cleanup_(address_unrefp) Address *tmp = NULL;
 
                 /* In this case, we can use address_get(). */
@@ -958,6 +1014,8 @@ int link_get_address(Link *link, int family, const union in_addr_union *address,
 
                 tmp->family = family;
                 tmp->in_addr = *address;
+                if (peer)
+                        tmp->in_addr_peer = *peer;
                 tmp->prefixlen = prefixlen;
 
                 r = address_get(link, tmp, &a);
@@ -967,7 +1025,7 @@ int link_get_address(Link *link, int family, const union in_addr_union *address,
                 if (family == AF_INET6) {
                         /* IPv6 addresses are managed without peer address and prefix length. Hence, we need
                          * to check them explicitly. */
-                        if (in_addr_is_set(family, &a->in_addr_peer))
+                        if (peer && !in_addr_equal(family, &a->in_addr_peer, peer))
                                 return -ENOENT;
                         if (prefixlen != 0 && a->prefixlen != prefixlen)
                                 return -ENOENT;
@@ -986,7 +1044,10 @@ int link_get_address(Link *link, int family, const union in_addr_union *address,
                 if (!in_addr_equal(family, &a->in_addr, address))
                         continue;
 
-                if (in_addr_is_set(family, &a->in_addr_peer))
+                if (peer && !in_addr_equal(family, &a->in_addr_peer, peer))
+                        continue;
+
+                if (prefixlen != 0 && a->prefixlen != prefixlen)
                         continue;
 
                 if (ret)
@@ -998,7 +1059,14 @@ int link_get_address(Link *link, int family, const union in_addr_union *address,
         return -ENOENT;
 }
 
-int manager_get_address(Manager *manager, int family, const union in_addr_union *address, unsigned char prefixlen, Address **ret) {
+int manager_get_address_full(
+                Manager *manager,
+                int family,
+                const union in_addr_union *address,
+                const union in_addr_union *peer,
+                unsigned char prefixlen,
+                Address **ret) {
+
         Link *link;
 
         assert(manager);
@@ -1009,24 +1077,11 @@ int manager_get_address(Manager *manager, int family, const union in_addr_union 
                 if (!IN_SET(link->state, LINK_STATE_CONFIGURING, LINK_STATE_CONFIGURED))
                         continue;
 
-                if (link_get_address(link, family, address, prefixlen, ret) >= 0)
+                if (link_get_address_full(link, family, address, peer, prefixlen, ret) >= 0)
                         return 0;
         }
 
         return -ENOENT;
-}
-
-bool manager_has_address(Manager *manager, int family, const union in_addr_union *address) {
-        Address *a;
-
-        assert(manager);
-        assert(IN_SET(family, AF_INET, AF_INET6));
-        assert(address);
-
-        if (manager_get_address(manager, family, address, 0, &a) < 0)
-                return false;
-
-        return address_is_ready(a);
 }
 
 const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) {
@@ -1042,7 +1097,7 @@ const char* format_lifetime(char *buf, size_t l, usec_t lifetime_usec) {
         return buf;
 }
 
-static void log_address_debug(const Address *address, const char *str, const Link *link) {
+void log_address_debug(const Address *address, const char *str, const Link *link) {
         _cleanup_free_ char *state = NULL, *flags_str = NULL, *scope_str = NULL;
 
         assert(address);
@@ -1073,6 +1128,23 @@ static void log_address_debug(const Address *address, const char *str, const Lin
                        strna(flags_str), strna(scope_str),
                        address->family == AF_INET ? ", label: " : "",
                        address->family == AF_INET ? strna(address->label) : "");
+}
+
+static void address_forget(Link *link, Address *address, bool removed_by_us, const char *msg) {
+        assert(link);
+        assert(address);
+        assert(msg);
+
+        Request *req;
+        if (address_get_request(link, address, &req) >= 0)
+                address_enter_removed(req->userdata);
+
+        if (!address->link && address_get(link, address, &address) < 0)
+                return;
+
+        address_enter_removed(address);
+        log_address_debug(address, msg, link);
+        (void) address_drop(address, removed_by_us);
 }
 
 static int address_set_netlink_message(const Address *address, sd_netlink_message *m, Link *link) {
@@ -1127,16 +1199,8 @@ static int address_remove_handler(sd_netlink *rtnl, sd_netlink_message *m, Remov
                                             (r == -EADDRNOTAVAIL || !address->link) ? LOG_DEBUG : LOG_WARNING,
                                             r, "Could not drop address");
 
-                if (address->link) {
-                        /* If the address cannot be removed, then assume the address is already removed. */
-                        log_address_debug(address, "Forgetting", link);
-
-                        Request *req;
-                        if (address_get_request(link, address, &req) >= 0)
-                                address_enter_removed(req->userdata);
-
-                        (void) address_drop(address);
-                }
+                /* If the address cannot be removed, then assume the address is already removed. */
+                address_forget(link, address, /* removed_by_us = */ true, "Forgetting");
         }
 
         return 1;
@@ -1216,14 +1280,18 @@ bool link_address_is_dynamic(const Link *link, const Address *address) {
         if (address->lifetime_preferred_usec != USEC_INFINITY)
                 return true;
 
-        /* Even when the address is leased from a DHCP server, networkd assign the address
-         * without lifetime when KeepConfiguration=dhcp. So, let's check that we have
+        /* There is no way to drtermine if the IPv6 address is dynamic when the lifetime is infinity. */
+        if (address->family != AF_INET)
+                return false;
+
+        /* Even if an IPv4 address is leased from a DHCP server with a finite lifetime, networkd assign the
+         * address without lifetime when KeepConfiguration=dynamic. So, let's check that we have
          * corresponding routes with RTPROT_DHCP. */
         SET_FOREACH(route, link->manager->routes) {
                 if (route->source != NETWORK_CONFIG_SOURCE_FOREIGN)
                         continue;
 
-                /* The route is not assigned yet, or already removed. Ignoring. */
+                /* The route is not assigned yet, or already being removed. Ignoring. */
                 if (!route_exists(route))
                         continue;
 
@@ -1326,7 +1394,7 @@ int link_drop_ipv6ll_addresses(Link *link) {
         return 0;
 }
 
-int link_drop_foreign_addresses(Link *link) {
+int link_drop_unmanaged_addresses(Link *link) {
         Address *address;
         int r = 0;
 
@@ -1343,18 +1411,22 @@ int link_drop_foreign_addresses(Link *link) {
                 if (link->flags & IFF_LOOPBACK && in_addr_is_localhost_one(address->family, &address->in_addr) > 0)
                         continue;
 
-                /* Ignore addresses we configured. */
-                if (address->source != NETWORK_CONFIG_SOURCE_FOREIGN)
-                        continue;
-
                 /* Ignore addresses not assigned yet or already removing. */
                 if (!address_exists(address))
                         continue;
 
-                /* link_address_is_dynamic() is slightly heavy. Let's call the function only when KeepConfiguration= is set. */
-                if (IN_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DHCP, KEEP_CONFIGURATION_STATIC) &&
-                    link_address_is_dynamic(link, address) == (link->network->keep_configuration == KEEP_CONFIGURATION_DHCP))
-                        continue;
+                if (address->source == NETWORK_CONFIG_SOURCE_FOREIGN) {
+                        if (link->network->keep_configuration == KEEP_CONFIGURATION_YES)
+                                continue;
+
+                        /* link_address_is_dynamic() is slightly heavy. Let's call the function only when
+                         * KeepConfiguration=dynamic or static. */
+                        if (IN_SET(link->network->keep_configuration, KEEP_CONFIGURATION_DYNAMIC, KEEP_CONFIGURATION_STATIC) &&
+                            link_address_is_dynamic(link, address) == (link->network->keep_configuration == KEEP_CONFIGURATION_DYNAMIC))
+                                continue;
+
+                } else if (address->source != NETWORK_CONFIG_SOURCE_STATIC)
+                        continue; /* Ignore dynamically configurad addresses. */
 
                 address_mark(address);
         }
@@ -1404,15 +1476,6 @@ int link_drop_static_addresses(Link *link) {
         }
 
         return r;
-}
-
-void link_foreignize_addresses(Link *link) {
-        Address *address;
-
-        assert(link);
-
-        SET_FOREACH(address, link->addresses)
-                address->source = NETWORK_CONFIG_SOURCE_FOREIGN;
 }
 
 int address_configure_handler_internal(sd_netlink *rtnl, sd_netlink_message *m, Link *link, const char *error_msg) {
@@ -1496,7 +1559,7 @@ static int address_acquire(Link *link, const Address *address, union in_addr_uni
         assert(ret);
 
         r = address_acquire_from_dhcp_server_leases_file(link, address, ret);
-        if (r != -ENOENT)
+        if (!IN_SET(r, -ENOENT, -ENXIO, -EINVAL))
                 return r;
 
         r = address_pool_acquire(link->manager, address->family, address->prefixlen, &a);
@@ -1722,14 +1785,7 @@ int link_request_static_addresses(Link *link) {
 }
 
 int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, Manager *m) {
-        _cleanup_(address_unrefp) Address *tmp = NULL;
-        struct ifa_cacheinfo cinfo;
-        Link *link;
-        uint16_t type;
-        Address *address = NULL;
-        Request *req = NULL;
-        bool is_new = false, update_dhcp4;
-        int ifindex, r;
+        int r;
 
         assert(rtnl);
         assert(message);
@@ -1743,6 +1799,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        uint16_t type;
         r = sd_netlink_message_get_type(message, &type);
         if (r < 0) {
                 log_warning_errno(r, "rtnl: could not get message type, ignoring: %m");
@@ -1752,6 +1809,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        int ifindex;
         r = sd_rtnl_message_addr_get_ifindex(message, &ifindex);
         if (r < 0) {
                 log_warning_errno(r, "rtnl: could not get ifindex from message, ignoring: %m");
@@ -1761,6 +1819,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        Link *link;
         r = link_get_by_index(m, ifindex, &link);
         if (r < 0) {
                 /* when enumerating we might be out of sync, but we will get the address again, so just
@@ -1770,6 +1829,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 return 0;
         }
 
+        _cleanup_(address_unrefp) Address *tmp = NULL;
         r = address_new(&tmp);
         if (r < 0)
                 return log_oom();
@@ -1837,26 +1897,22 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 assert_not_reached();
         }
 
-        update_dhcp4 = tmp->family == AF_INET6;
-
-        /* Then, find the managed Address and Request objects corresponding to the received address. */
+        /* Then, find the managed Address object corresponding to the received address. */
+        Address *address = NULL;
         (void) address_get(link, tmp, &address);
-        (void) address_get_request(link, tmp, &req);
 
         if (type == RTM_DELADDR) {
-                if (address) {
-                        address_enter_removed(address);
-                        log_address_debug(address, "Forgetting removed", link);
-                        (void) address_drop(address);
-                } else
+                if (address)
+                        address_forget(link, address,
+                                       /* removed_by_us = */ FLAGS_SET(address->state, NETWORK_CONFIG_STATE_REMOVING),
+                                       "Forgetting removed");
+                else
                         log_address_debug(tmp, "Kernel removed unknown", link);
-
-                if (req)
-                        address_enter_removed(req->userdata);
 
                 goto finalize;
         }
 
+        bool is_new = false;
         if (!address) {
                 /* If we did not know the address, then save it. */
                 r = address_attach(link, tmp);
@@ -1876,6 +1932,8 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
         }
 
         /* Also update information that cannot be obtained through netlink notification. */
+        Request *req = NULL;
+        (void) address_get_request(link, tmp, &req);
         if (req && req->waiting_reply) {
                 Address *a = ASSERT_PTR(req->userdata);
 
@@ -1886,6 +1944,10 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 (void) nft_set_context_dup(&a->nft_set_context, &address->nft_set_context);
                 address->requested_as_null = a->requested_as_null;
                 address->callback = a->callback;
+
+                ipv6_token_ref(a->token);
+                ipv6_token_unref(address->token);
+                address->token = a->token;
         }
 
         /* Then, update miscellaneous info. */
@@ -1919,6 +1981,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
         } else if (r < 0)
                 log_link_debug_errno(link, r, "rtnl: failed to read IFA_FLAGS attribute, ignoring: %m");
 
+        struct ifa_cacheinfo cinfo;
         r = sd_netlink_message_read_cache_info(message, IFA_CACHEINFO, &cinfo);
         if (r >= 0)
                 address_set_lifetime(m, address, &cinfo);
@@ -1941,7 +2004,7 @@ int manager_rtnl_process_address(sd_netlink *rtnl, sd_netlink_message *message, 
                 link_enter_failed(link);
 
 finalize:
-        if (update_dhcp4) {
+        if (tmp->family == AF_INET6) {
                 r = dhcp4_update_ipv6_connectivity(link);
                 if (r < 0) {
                         log_link_warning_errno(link, r, "Failed to notify IPv6 connectivity to DHCPv4 client: %m");
@@ -1952,7 +2015,7 @@ finalize:
         return 1;
 }
 
-int config_parse_broadcast(
+static int config_parse_broadcast(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -1964,72 +2027,40 @@ int config_parse_broadcast(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        union in_addr_union u;
+        Address *address = ASSERT_PTR(userdata);
         int r;
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
-        }
+        /* Do not check or set address->family here. It will be checked later in
+         * address_section_verify() -> address_section_adjust_broadcast() . */
 
         if (isempty(rvalue)) {
                 /* The broadcast address will be calculated based on Address=, and set if the link is
-                 * not a wireguard interface. Here, we do not check or set n->family. */
-                n->broadcast = (struct in_addr) {};
-                n->set_broadcast = -1;
-                TAKE_PTR(n);
-                return 0;
+                 * not a wireguard interface. */
+                address->broadcast = (struct in_addr) {};
+                address->set_broadcast = -1;
+                return 1;
         }
 
         r = parse_boolean(rvalue);
         if (r >= 0) {
-                /* The broadcast address will be calculated based on Address=. Here, we do not check or
-                 * set n->family. */
-                n->broadcast = (struct in_addr) {};
-                n->set_broadcast = r;
-                TAKE_PTR(n);
-                return 0;
+                /* The broadcast address will be calculated based on Address=. */
+                address->broadcast = (struct in_addr) {};
+                address->set_broadcast = r;
+                return 1;
         }
 
-        if (n->family == AF_INET6) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Broadcast is not valid for IPv6 addresses, ignoring assignment: %s", rvalue);
-                return 0;
-        }
+        r = config_parse_in_addr_non_null(
+                        unit, filename, line, section, section_line,
+                        lvalue, /* ltype = */ AF_INET, rvalue,
+                        &address->broadcast, /* userdata = */ NULL);
+        if (r <= 0)
+                return r;
 
-        r = in_addr_from_string(AF_INET, rvalue, &u);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Broadcast is invalid, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-        if (in4_addr_is_null(&u.in)) {
-                log_syntax(unit, LOG_WARNING, filename, line, 0,
-                           "Broadcast cannot be ANY address, ignoring assignment: %s", rvalue);
-                return 0;
-        }
-
-        n->broadcast = u.in;
-        n->set_broadcast = true;
-        n->family = AF_INET;
-        TAKE_PTR(n);
-
-        return 0;
+        address->set_broadcast = true;
+        return 1;
 }
 
-int config_parse_address(
+static int config_parse_address(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2041,83 +2072,38 @@ int config_parse_address(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        union in_addr_union buffer;
-        unsigned char prefixlen;
-        int r, f;
+        Address *address = ASSERT_PTR(userdata);
+        union in_addr_union *a = ASSERT_PTR(data);
+        struct in_addr_prefix prefix;
+        int r;
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
         assert(rvalue);
-        assert(data);
 
-        if (streq(section, "Network")) {
-                if (isempty(rvalue)) {
-                        /* If an empty string specified in [Network] section, clear previously assigned addresses. */
-                        network->addresses_by_section = ordered_hashmap_free(network->addresses_by_section);
-                        return 0;
-                }
-
-                /* we are not in an Address section, so use line number instead. */
-                r = address_new_static(network, filename, line, &n);
-        } else
-                r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
+        if (isempty(rvalue)) {
+                /* When an empty string is assigned, clear both Address= and Peer=. */
+                address->family = AF_UNSPEC;
+                address->prefixlen = 0;
+                address->in_addr = IN_ADDR_NULL;
+                address->in_addr_peer = IN_ADDR_NULL;
+                return 1;
         }
 
-        /* Address=address/prefixlen */
-        r = in_addr_prefix_from_string_auto_internal(rvalue, PREFIXLEN_REFUSE, &f, &buffer, &prefixlen);
-        if (r == -ENOANO) {
-                r = in_addr_prefix_from_string_auto(rvalue, &f, &buffer, &prefixlen);
-                if (r >= 0)
-                        log_syntax(unit, LOG_WARNING, filename, line, r,
-                                   "Address '%s' is specified without prefix length. Assuming the prefix length is %u. "
-                                   "Please specify the prefix length explicitly.", rvalue, prefixlen);
-        }
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r, "Invalid address '%s', ignoring assignment: %m", rvalue);
-                return 0;
-        }
+        r = config_parse_in_addr_prefix(unit, filename, line, section, section_line, lvalue, /* ltype = */ true, rvalue, &prefix, /* userdata = */ NULL);
+        if (r <= 0)
+                return r;
 
-        if (n->family != AF_UNSPEC && f != n->family) {
+        if (address->family != AF_UNSPEC && prefix.family != address->family) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0, "Address is incompatible, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
-        if (in_addr_is_null(f, &buffer)) {
-                /* Will use address from address pool. Note that for ipv6 case, prefix of the address
-                 * pool is 8, but 40 bit is used by the global ID and 16 bit by the subnet ID. So,
-                 * let's limit the prefix length to 64 or larger. See RFC4193. */
-                if ((f == AF_INET && prefixlen < 8) ||
-                    (f == AF_INET6 && prefixlen < 64)) {
-                        log_syntax(unit, LOG_WARNING, filename, line, 0,
-                                   "Null address with invalid prefixlen='%u', ignoring assignment: %s",
-                                   prefixlen, rvalue);
-                        return 0;
-                }
-        }
-
-        n->family = f;
-        n->prefixlen = prefixlen;
-
-        if (streq(lvalue, "Address")) {
-                n->in_addr = buffer;
-                n->requested_as_null = !in_addr_is_set(n->family, &n->in_addr);
-        } else
-                n->in_addr_peer = buffer;
-
-        TAKE_PTR(n);
-        return 0;
+        address->family = prefix.family;
+        address->prefixlen = prefix.prefixlen;
+        *a = prefix.address;
+        return 1;
 }
 
-int config_parse_label(
+static int config_parse_address_label(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2129,46 +2115,23 @@ int config_parse_label(
                 void *data,
                 void *userdata) {
 
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        Network *network = userdata;
+        char **label = ASSERT_PTR(data);
         int r;
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
-        }
-
-        if (isempty(rvalue)) {
-                n->label = mfree(n->label);
-                TAKE_PTR(n);
-                return 0;
-        }
-
-        if (!address_label_valid(rvalue)) {
+        if (!isempty(rvalue) && !address_label_valid(rvalue)) {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Interface label is too long or invalid, ignoring assignment: %s", rvalue);
                 return 0;
         }
 
-        r = free_and_strdup(&n->label, rvalue);
+        r = free_and_strdup_warn(label, empty_to_null(rvalue));
         if (r < 0)
-                return log_oom();
+                return r;
 
-        TAKE_PTR(n);
-        return 0;
+        return 1;
 }
 
-int config_parse_lifetime(
+static int config_parse_address_lifetime(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2180,44 +2143,23 @@ int config_parse_lifetime(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        usec_t k;
-        int r;
-
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
-        }
+        usec_t *usec = ASSERT_PTR(data);
 
         /* We accept only "forever", "infinity", empty, or "0". */
-        if (STR_IN_SET(rvalue, "forever", "infinity", ""))
-                k = USEC_INFINITY;
+        if (isempty(rvalue) || STR_IN_SET(rvalue, "forever", "infinity"))
+                *usec = USEC_INFINITY;
         else if (streq(rvalue, "0"))
-                k = 0;
+                *usec = 0;
         else {
                 log_syntax(unit, LOG_WARNING, filename, line, 0,
                            "Invalid PreferredLifetime= value, ignoring: %s", rvalue);
                 return 0;
         }
 
-        n->lifetime_preferred_usec = k;
-        TAKE_PTR(n);
-
-        return 0;
+        return 1;
 }
 
-int config_parse_address_flags(
+static int config_parse_address_scope(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2229,86 +2171,25 @@ int config_parse_address_flags(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
+        Address *address = ASSERT_PTR(userdata);
         int r;
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
-        }
-
-        r = parse_boolean(rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse %s=, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        if (streq(lvalue, "AddPrefixRoute"))
-                r = !r;
-
-        SET_FLAG(n->flags, ltype, r);
-
-        TAKE_PTR(n);
-        return 0;
-}
-
-int config_parse_address_scope(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        int r;
-
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
+        if (isempty(rvalue)) {
+                address->scope = RT_SCOPE_UNIVERSE;
+                address->scope_set = false;
+                return 1;
         }
 
         r = route_scope_from_string(rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Could not parse address scope \"%s\", ignoring assignment: %m", rvalue);
-                return 0;
-        }
+        if (r < 0)
+                return log_syntax_parse_error(unit, filename, line, r, lvalue, rvalue);
 
-        n->scope = r;
-        n->scope_set = true;
-        TAKE_PTR(n);
-        return 0;
+        address->scope = r;
+        address->scope_set = true;
+        return 1;
 }
 
-int config_parse_address_route_metric(
+static int config_parse_address_dad(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2320,65 +2201,12 @@ int config_parse_address_route_metric(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
+        AddressFamily *p = ASSERT_PTR(data);
         int r;
 
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
-        }
-
-        r = safe_atou32(rvalue, &n->route_metric);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Could not parse %s=, ignoring assignment: %s", lvalue, rvalue);
-                return 0;
-        }
-
-        TAKE_PTR(n);
-        return 0;
-}
-
-int config_parse_duplicate_address_detection(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        int r;
-
-        assert(filename);
-        assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate new address, ignoring assignment: %m");
-                return 0;
+        if (isempty(rvalue)) {
+                *p = _ADDRESS_FAMILY_INVALID;
+                return 1;
         }
 
         r = parse_boolean(rvalue);
@@ -2387,24 +2215,19 @@ int config_parse_duplicate_address_detection(
                            "For historical reasons, %s=%s means %s=%s. "
                            "Please use 'both', 'ipv4', 'ipv6' or 'none' instead.",
                            lvalue, rvalue, lvalue, r ? "none" : "both");
-                n->duplicate_address_detection = r ? ADDRESS_FAMILY_NO : ADDRESS_FAMILY_YES;
-                n = NULL;
-                return 0;
+                *p = r ? ADDRESS_FAMILY_NO : ADDRESS_FAMILY_YES;
+                return 1;
         }
 
         AddressFamily a = duplicate_address_detection_address_family_from_string(rvalue);
-        if (a < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, a,
-                           "Failed to parse %s=, ignoring: %s", lvalue, rvalue);
-                return 0;
-        }
-        n->duplicate_address_detection = a;
+        if (a < 0)
+                return log_syntax_parse_error(unit, filename, line, a, lvalue, rvalue);
 
-        TAKE_PTR(n);
-        return 0;
+        *p = a;
+        return 1;
 }
 
-int config_parse_address_netlabel(
+int config_parse_address_section(
                 const char *unit,
                 const char *filename,
                 unsigned line,
@@ -2416,18 +2239,44 @@ int config_parse_address_netlabel(
                 void *data,
                 void *userdata) {
 
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
+        static const ConfigSectionParser table[_ADDRESS_CONF_PARSER_MAX] = {
+                [ADDRESS_ADDRESS]                  = { .parser = config_parse_address,            .ltype = 0,                        .offset = offsetof(Address, in_addr),                     },
+                [ADDRESS_PEER]                     = { .parser = config_parse_address,            .ltype = 0,                        .offset = offsetof(Address, in_addr_peer),                },
+                [ADDRESS_BROADCAST]                = { .parser = config_parse_broadcast,          .ltype = 0,                        .offset = 0,                                              },
+                [ADDRESS_LABEL]                    = { .parser = config_parse_address_label,      .ltype = 0,                        .offset = offsetof(Address, label),                       },
+                [ADDRESS_PREFERRED_LIFETIME]       = { .parser = config_parse_address_lifetime,   .ltype = 0,                        .offset = offsetof(Address, lifetime_preferred_usec),     },
+                [ADDRESS_HOME_ADDRESS]             = { .parser = config_parse_uint32_flag,        .ltype = IFA_F_HOMEADDRESS,        .offset = offsetof(Address, flags),                       },
+                [ADDRESS_MANAGE_TEMPORARY_ADDRESS] = { .parser = config_parse_uint32_flag,        .ltype = IFA_F_MANAGETEMPADDR,     .offset = offsetof(Address, flags),                       },
+                [ADDRESS_PREFIX_ROUTE]             = { .parser = config_parse_uint32_flag,        .ltype = IFA_F_NOPREFIXROUTE,      .offset = offsetof(Address, flags),                       },
+                [ADDRESS_ADD_PREFIX_ROUTE]         = { .parser = config_parse_uint32_invert_flag, .ltype = IFA_F_NOPREFIXROUTE,      .offset = offsetof(Address, flags),                       },
+                [ADDRESS_AUTO_JOIN]                = { .parser = config_parse_uint32_flag,        .ltype = IFA_F_MCAUTOJOIN,         .offset = offsetof(Address, flags),                       },
+                [ADDRESS_DAD]                      = { .parser = config_parse_address_dad,        .ltype = 0,                        .offset = offsetof(Address, duplicate_address_detection), },
+                [ADDRESS_SCOPE]                    = { .parser = config_parse_address_scope,      .ltype = 0,                        .offset = 0,                                              },
+                [ADDRESS_ROUTE_METRIC]             = { .parser = config_parse_uint32,             .ltype = 0,                        .offset = offsetof(Address, route_metric),                },
+                [ADDRESS_NET_LABEL]                = { .parser = config_parse_string,             .ltype = CONFIG_PARSE_STRING_SAFE, .offset = offsetof(Address, netlabel),                    },
+                [ADDRESS_NFT_SET]                  = { .parser = config_parse_nft_set,            .ltype = NFT_SET_PARSE_NETWORK,    .offset = offsetof(Address, nft_set_context),             },
+        };
+
+        _cleanup_(address_unref_or_set_invalidp) Address *address = NULL;
+        Network *network = ASSERT_PTR(userdata);
         int r;
 
         assert(filename);
         assert(section);
-        assert(lvalue);
-        assert(rvalue);
-        assert(data);
-        assert(network);
 
-        r = address_new_static(network, filename, section_line, &n);
+        if (streq(section, "Network")) {
+                assert(streq(lvalue, "Address"));
+
+                if (isempty(rvalue)) {
+                        /* If an empty string specified in [Network] section, clear previously assigned addresses. */
+                        network->addresses_by_section = ordered_hashmap_free(network->addresses_by_section);
+                        return 0;
+                }
+
+                /* we are not in an Address section, so use line number instead. */
+                r = address_new_static(network, filename, line, &address);
+        } else
+                r = address_new_static(network, filename, section_line, &address);
         if (r == -ENOMEM)
                 return log_oom();
         if (r < 0) {
@@ -2436,14 +2285,23 @@ int config_parse_address_netlabel(
                 return 0;
         }
 
-        r = config_parse_string(unit, filename, line, section, section_line,
-                                lvalue, CONFIG_PARSE_STRING_SAFE, rvalue, &n->netlabel, network);
-        if (r < 0)
+        r = config_section_parse(table, ELEMENTSOF(table),
+                                 unit, filename, line, section, section_line, lvalue, ltype, rvalue, address);
+        if (r <= 0)
                 return r;
 
-        TAKE_PTR(n);
+        TAKE_PTR(address);
         return 0;
 }
+
+#define log_broadcast(address, fmt, ...)                                \
+        ({                                                              \
+                const Address *_address = (address);                    \
+                log_section_warning(                                    \
+                                _address ? _address->section : NULL,    \
+                                fmt " Ignoring Broadcast= setting in the [Address] section.", \
+                                ##__VA_ARGS__);                         \
+        })
 
 static void address_section_adjust_broadcast(Address *address) {
         assert(address);
@@ -2453,21 +2311,13 @@ static void address_section_adjust_broadcast(Address *address) {
                 return;
 
         if (address->family == AF_INET6)
-                log_warning("%s: broadcast address is set for an IPv6 address. "
-                            "Ignoring Broadcast= setting in the [Address] section from line %u.",
-                            address->section->filename, address->section->line);
+                log_broadcast(address, "Broadcast address is set for an IPv6 address.");
         else if (address->prefixlen > 30)
-                log_warning("%s: broadcast address is set for an IPv4 address with prefix length larger than 30. "
-                            "Ignoring Broadcast= setting in the [Address] section from line %u.",
-                            address->section->filename, address->section->line);
+                log_broadcast(address, "Broadcast address is set for an IPv4 address with prefix length larger than 30.");
         else if (in4_addr_is_set(&address->in_addr_peer.in))
-                log_warning("%s: broadcast address is set for an IPv4 address with peer address. "
-                            "Ignoring Broadcast= setting in the [Address] section from line %u.",
-                            address->section->filename, address->section->line);
+                log_broadcast(address, "Broadcast address is set for an IPv4 address with peer address.");
         else if (!in4_addr_is_set(&address->in_addr.in))
-                log_warning("%s: broadcast address is set for an IPv4 address with null address. "
-                            "Ignoring Broadcast= setting in the [Address] section from line %u.",
-                            address->section->filename, address->section->line);
+                log_broadcast(address, "Broadcast address is set for an IPv4 address with null address.");
         else
                 /* Otherwise, keep the specified broadcast address. */
                 return;
@@ -2475,34 +2325,46 @@ static void address_section_adjust_broadcast(Address *address) {
         address->broadcast.s_addr = 0;
 }
 
+#define log_address_section(address, fmt, ...)                          \
+        ({                                                              \
+                const Address *_address = (address);                    \
+                log_section_warning_errno(                              \
+                                _address ? _address->section : NULL,    \
+                                SYNTHETIC_ERRNO(EINVAL),                \
+                                fmt " Ignoring [Address] section.",     \
+                                ##__VA_ARGS__);                         \
+        })
+
 int address_section_verify(Address *address) {
+        assert(address);
+        assert(address->section);
+
         if (section_is_invalid(address->section))
                 return -EINVAL;
 
-        if (address->family == AF_UNSPEC) {
-                assert(address->section);
-
-                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: Address section without Address= field was configured. "
-                                         "Ignoring [Address] section from line %u.",
-                                         address->section->filename, address->section->line);
-        }
+        if (address->family == AF_UNSPEC)
+                return log_address_section(address, "Address section without Address= field was configured.");
+        assert(IN_SET(address->family, AF_INET, AF_INET6));
 
         if (address->family == AF_INET6 && !socket_ipv6_is_supported())
-                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: an IPv6 address was configured, but the kernel does not support IPv6. "
-                                         "Ignoring [Address] section from line %u.",
-                                         address->section->filename, address->section->line);
+                return log_address_section(address, "An IPv6 address was configured, but the kernel does not support IPv6.");
 
-        assert(IN_SET(address->family, AF_INET, AF_INET6));
+        if (in_addr_is_null(address->family, &address->in_addr)) {
+                /* Will use address from address pool. Note that for ipv6 case, prefix of the address
+                 * pool is 8, but 40 bit is used by the global ID and 16 bit by the subnet ID. So,
+                 * let's limit the prefix length to 64 or larger. See RFC4193. */
+                unsigned min_prefixlen = address->family == AF_INET ? 8 : 64;
+                if (address->prefixlen < min_prefixlen)
+                        return log_address_section(address, "Prefix length for %s null address must be equal or larger than %u.",
+                                                   af_to_ipv4_ipv6(address->family), min_prefixlen);
+
+                address->requested_as_null = !in_addr_is_set(address->family, &address->in_addr);
+        }
 
         address_section_adjust_broadcast(address);
 
         if (address->family == AF_INET6 && address->label) {
-                log_warning("%s: address label is set for IPv6 address in the [Address] section from line %u. "
-                            "Ignoring Label= setting.",
-                            address->section->filename, address->section->line);
-
+                log_section_warning(address->section, "Address label is set for IPv6 address, ignoring Label= setting.");
                 address->label = mfree(address->label);
         }
 
@@ -2521,11 +2383,9 @@ int address_section_verify(Address *address) {
                 else
                         address->duplicate_address_detection = ADDRESS_FAMILY_NO;
         } else if (address->duplicate_address_detection == ADDRESS_FAMILY_IPV6 && address->family == AF_INET)
-                log_warning("%s: DuplicateAddressDetection=ipv6 is specified for IPv4 address, ignoring.",
-                            address->section->filename);
+                log_section_warning(address->section, "DuplicateAddressDetection=ipv6 is specified for IPv4 address, ignoring.");
         else if (address->duplicate_address_detection == ADDRESS_FAMILY_IPV4 && address->family == AF_INET6)
-                log_warning("%s: DuplicateAddressDetection=ipv4 is specified for IPv6 address, ignoring.",
-                            address->section->filename);
+                log_section_warning(address->section, "DuplicateAddressDetection=ipv4 is specified for IPv6 address, ignoring.");
 
         if (address->family == AF_INET6 &&
             !FLAGS_SET(address->duplicate_address_detection, ADDRESS_FAMILY_IPV6))
@@ -2538,10 +2398,7 @@ int address_section_verify(Address *address) {
                 _cleanup_free_ char *str = NULL;
 
                 (void) address_flags_to_string_alloc(address->flags ^ filtered_flags, address->family, &str);
-                return log_warning_errno(SYNTHETIC_ERRNO(EINVAL),
-                                         "%s: unexpected address flags \"%s\" were configured. "
-                                         "Ignoring [Address] section from line %u.",
-                                         address->section->filename, strna(str), address->section->line);
+                return log_address_section(address, "unexpected address flags \"%s\" were configured.", strna(str));
         }
 
         return 0;
@@ -2590,43 +2447,5 @@ int network_drop_invalid_addresses(Network *network) {
         if (r < 0)
                 return r;
 
-        return 0;
-}
-
-int config_parse_address_ip_nft_set(
-                const char *unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        _cleanup_(address_unref_or_set_invalidp) Address *n = NULL;
-        int r;
-
-        assert(filename);
-        assert(lvalue);
-        assert(rvalue);
-        assert(network);
-
-        r = address_new_static(network, filename, section_line, &n);
-        if (r == -ENOMEM)
-                return log_oom();
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to allocate a new address, ignoring assignment: %m");
-                return 0;
-        }
-
-        r = config_parse_nft_set(unit, filename, line, section, section_line, lvalue, ltype, rvalue, &n->nft_set_context, network);
-        if (r < 0)
-                return r;
-
-        TAKE_PTR(n);
         return 0;
 }

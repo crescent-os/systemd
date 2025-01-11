@@ -3,7 +3,9 @@
   "http://www.oasis-open.org/docbook/xml/4.2/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="capsule_.service">
+<refentry id="capsule_.service"
+          xmlns:xi="http://www.w3.org/2001/XInclude">
+
   <refentryinfo>
     <title>capsule@.service</title>
     <productname>systemd</productname>
@@ -39,7 +41,7 @@
       <listitem><para>The capsule service manager utilizes <varname>DynamicUser=</varname> (see
       <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>) to
       allocate a new UID dynamically on invocation. The user name is automatically generated from the capsule
-      name, by prefixng <literal>p_</literal>. The UID is released when the service is terminated. The user
+      name, by prefixing <literal>c-</literal>. The UID is released when the service is terminated. The user
       service manager on the other hand operates under a statically allocated user ID that must be
       pre-existing, before the user service manager is invoked.</para></listitem>
 
@@ -83,6 +85,8 @@
     (i.e. 255 characters max, and contain no <literal>/</literal>), and when prefixed with
     <literal>p-</literal> be suitable as a user name matching strict POSIX rules, see <ulink
     url="https://systemd.io/USER_NAMES">User/Group Name Syntax</ulink> for details.</para>
+
+    <xi:include href="version-info.xml" xpointer="v256"/>
   </refsect1>
 
   <refsect1>
@@ -102,17 +106,17 @@
 
   <refsect1>
     <title>See Also</title>
-    <para>
-      <citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>user@.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>systemd-run</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry><refentrytitle>busctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-      <citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    </para>
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>user@.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.service</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.slice</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.exec</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd.special</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>systemd-run</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>busctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
   </refsect1>
 </refentry>

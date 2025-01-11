@@ -319,7 +319,7 @@ static int link_update_default_route(Link *l) {
         if (r < 0)
                 goto clear;
 
-        l->default_route = r > 0;
+        link_set_default_route(l, r > 0);
         return 0;
 
 clear:
@@ -651,13 +651,16 @@ int link_update(Link *l) {
                 r = manager_llmnr_start(l->manager);
                 if (r < 0)
                         return r;
-        }
+        } else
+                manager_llmnr_stop(l->manager);
+
 
         if (link_get_mdns_support(l) != RESOLVE_SUPPORT_NO) {
                 r = manager_mdns_start(l->manager);
                 if (r < 0)
                         return r;
-        }
+        } else
+                manager_mdns_stop(l->manager);
 
         link_allocate_scopes(l);
         link_add_rrs(l, false);
@@ -764,6 +767,20 @@ void link_next_dns_server(Link *l, DnsServer *if_current) {
 
         /* Pick the first one again, after we reached the end */
         link_set_dns_server(l, l->dns_servers);
+}
+
+void link_set_default_route(Link *l, bool b) {
+        assert(l);
+
+        if (l->default_route == b)
+                return;
+
+        l->default_route = b;
+
+        /* If we are currently using the fallback servers, changing a link to be default-route means
+         * we should reconsider whether or not the fallback servers are necessary. */
+        if (b && dns_server_is_fallback(l->manager->current_dns_server))
+                manager_set_dns_server(l->manager, NULL);
 }
 
 DnsOverTlsMode link_get_dns_over_tls_mode(Link *l) {

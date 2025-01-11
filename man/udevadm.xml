@@ -167,6 +167,11 @@
             <para>Print all sysfs properties of the specified device that can be used
             in udev rules to match the specified device. It prints all devices
             along the chain, up to the root of sysfs that can be used in udev rules.</para>
+
+            <para>This switch supports JSON output mode (see <option>--json=</option> below). Note that
+            because this switch generates multiple JSON objects, JSON-SEQ mode is automatically enabled
+            (RFC7464). (Note: tools such as <ulink url="https://jqlang.github.io/jq/manual/">jq</ulink>
+            natively support JSON-SEQ via the <option>--seq</option> switch.)</para>
           </listitem>
         </varlistentry>
         <varlistentry>
@@ -337,8 +342,16 @@
               <entry>Device number in <filename>/sys/</filename> (i.e. the numeric suffix of the last component of <literal>P:</literal>)</entry>
             </row>
             <row>
+              <entry><literal>J:</literal></entry>
+              <entry>Device ID</entry>
+            </row>
+            <row>
               <entry><literal>U:</literal></entry>
               <entry>Kernel subsystem</entry>
+            </row>
+            <row>
+              <entry><literal>B:</literal></entry>
+              <entry>Driver subsystem</entry>
             </row>
             <row>
               <entry><literal>T:</literal></entry>
@@ -565,6 +578,17 @@
           </listitem>
         </varlistentry>
         <varlistentry>
+          <term><option>--include-parents</option></term>
+          <listitem>
+            <para>Trigger parent devices of found devices even if the parents
+            will not match the filter condition.
+            This is useful if we are interested to limit the coldplug activities to
+            some devices or subsystems.</para>
+
+            <xi:include href="version-info.xml" xpointer="v258"/>
+          </listitem>
+        </varlistentry>
+        <varlistentry>
           <term><option>-w</option></term>
           <term><option>--settle</option></term>
           <listitem>
@@ -653,7 +677,7 @@
             Note that <filename>systemd-udevd.service</filename> contains
             <option>Restart=always</option> and so as a result, this option restarts systemd-udevd.
             If you want to stop <filename>systemd-udevd.service</filename>, please use the following:
-            <programlisting>systemctl stop systemd-udevd-control.socket systemd-udevd-kernel.socket systemd-udevd.service</programlisting>
+            <programlisting>systemctl stop systemd-udevd-control.socket systemd-udevd-kernel.socket systemd-udevd-varlink.socket systemd-udevd.service</programlisting>
             </para>
           </listitem>
         </varlistentry>
@@ -704,7 +728,7 @@
         </varlistentry>
         <varlistentry>
           <term><option>-m</option></term>
-          <term><option>--children-max=</option><replaceable>value</replaceable></term>
+          <term><option>--children-max=<replaceable>value</replaceable></option></term>
           <listitem>
             <para>Set the maximum number of events, systemd-udevd will handle at the same time. When 0 is
             specified, then the maximum is determined based on the system resources.</para>
@@ -721,9 +745,50 @@
         </varlistentry>
         <varlistentry>
           <term><option>-t</option></term>
-          <term><option>--timeout=</option><replaceable>seconds</replaceable></term>
+          <term><option>--timeout=<replaceable>seconds</replaceable></option></term>
           <listitem>
             <para>The maximum number of seconds to wait for a reply from systemd-udevd.</para>
+          </listitem>
+        </varlistentry>
+
+        <varlistentry>
+          <term><option>--load-credentials</option></term>
+          <listitem>
+            <para>When specified, the following credentials are used when passed in:</para>
+
+            <variablelist>
+              <varlistentry>
+                <term><varname>udev.conf.*</varname></term>
+                <listitem>
+                  <para>These credentials should contain valid
+                  <citerefentry><refentrytitle>udev.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry>
+                  configuration data. From each matching credential a separate file is created. Example: a
+                  passed credential <filename>udev.conf.50-foobar</filename> will be copied into a
+                  configuration file <filename>/run/udev/udev.conf.d/50-foobar.conf</filename>.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v256"/>
+                </listitem>
+              </varlistentry>
+              <varlistentry>
+                <term><varname>udev.rules.*</varname></term>
+                <listitem>
+                  <para>These credentials should contain valid
+                  <citerefentry><refentrytitle>udev</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+                  rules. From each matching credential a separate file is created. Example: a passed credential
+                  <filename>udev.rules.50-foobar</filename> will be copied into a configuration file
+                  <filename>/run/udev/rules.d/50-foobar.rules</filename>.</para>
+
+                  <xi:include href="version-info.xml" xpointer="v256"/>
+                </listitem>
+              </varlistentry>
+            </variablelist>
+
+            <para>Note, this <emphasis>does not</emphasis> imply <option>--reload</option> option. So, if
+            <command>systemd-udevd</command> is already running, please consider to also specify
+            <option>-reload</option> to make the copied udev rules files used by
+            <command>systemd-udevd</command>.</para>
+
+            <xi:include href="version-info.xml" xpointer="v256"/>
           </listitem>
         </varlistentry>
 
@@ -1086,7 +1151,7 @@
       <title>Format a File System</title>
 
       <para>Take a lock on the backing block device while creating a file system, to ensure that
-      <command>systemd-udevd</command> doesn't probe or announce the new superblock before it is
+      <command>systemd-udevd</command> does not probe or announce the new superblock before it is
       comprehensively written:</para>
 
       <programlisting># udevadm lock --device=/dev/sda1 mkfs.ext4 /dev/sda1</programlisting>
@@ -1104,7 +1169,7 @@
       <title>Copy in a File System</title>
 
       <para>Take a lock on the backing block device while copying in a prepared file system image, to ensure
-      that <command>systemd-udevd</command> doesn't probe or announce the new superblock before it is fully
+      that <command>systemd-udevd</command> does not probe or announce the new superblock before it is fully
       written:</para>
 
       <programlisting># udevadm lock -d /dev/sda1 dd if=fs.raw of=/dev/sda1</programlisting>

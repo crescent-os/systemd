@@ -124,7 +124,8 @@ int parse_sleep_config(SleepConfig **ret) {
                 return log_oom();
 
         *sc = (SleepConfig) {
-                .hibernate_delay_usec = USEC_INFINITY,
+                .hibernate_delay_usec  = USEC_INFINITY,
+                .hibernate_on_ac_power = true,
         };
 
         const ConfigTableItem items[] = {
@@ -145,6 +146,7 @@ int parse_sleep_config(SleepConfig **ret) {
                 { "Sleep", "MemorySleepMode",           config_parse_sleep_mode,  0,               &sc->mem_modes               },
 
                 { "Sleep", "HibernateDelaySec",         config_parse_sec,         0,               &sc->hibernate_delay_usec    },
+                { "Sleep", "HibernateOnACPower",        config_parse_bool,        0,               &sc->hibernate_on_ac_power   },
                 { "Sleep", "SuspendEstimationSec",      config_parse_sec,         0,               &sc->suspend_estimation_usec },
                 {}
         };
@@ -294,7 +296,7 @@ static int s2h_supported(const SleepConfig *sleep_config, SleepSupport *ret_supp
                 return false;
         }
 
-        FOREACH_ARRAY(i, operations, ELEMENTSOF(operations)) {
+        FOREACH_ELEMENT(i, operations) {
                 r = sleep_supported_internal(sleep_config, *i, /* check_allowed = */ false, &support);
                 if (r < 0)
                         return r;
@@ -368,16 +370,28 @@ static int sleep_supported_internal(
                 }
 
                 r = hibernation_is_safe();
-                if (r == -ENOTRECOVERABLE) {
+                switch (r) {
+
+                case -ENOTRECOVERABLE:
                         *ret_support = SLEEP_RESUME_NOT_SUPPORTED;
                         return false;
-                }
-                if (r == -ENOSPC) {
+
+                case -ESTALE:
+                        *ret_support = SLEEP_RESUME_DEVICE_MISSING;
+                        return false;
+
+                case -ENOMEDIUM:
+                        *ret_support = SLEEP_RESUME_MISCONFIGURED;
+                        return false;
+
+                case -ENOSPC:
                         *ret_support = SLEEP_NOT_ENOUGH_SWAP_SPACE;
                         return false;
+
+                default:
+                        if (r < 0)
+                                return r;
                 }
-                if (r < 0)
-                        return r;
         } else
                 assert(!sleep_config->modes[operation]);
 

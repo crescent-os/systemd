@@ -16,20 +16,20 @@ static void test_dns_label_unescape_one(const char *what, const char *expect, si
         r = dns_label_unescape(&w, buffer, buffer_sz, 0);
         assert_se(r == ret);
         if (r >= 0)
-                assert_se(streq(buffer, expect));
+                ASSERT_STREQ(buffer, expect);
 
         w = what;
         r = dns_label_unescape(&w, buffer, buffer_sz, DNS_LABEL_LDH);
         assert_se(r == ret_ldh);
         if (r >= 0)
-                assert_se(streq(buffer, expect));
+                ASSERT_STREQ(buffer, expect);
 
         w = what;
         r = dns_label_unescape(&w, buffer, buffer_sz, DNS_LABEL_NO_ESCAPES);
         const int ret_noe = strchr(what, '\\') ? -EINVAL : ret;
         assert_se(r == ret_noe);
         if (r >= 0)
-                assert_se(streq(buffer, expect));
+                ASSERT_STREQ(buffer, expect);
 }
 
 TEST(dns_label_unescape) {
@@ -119,6 +119,95 @@ TEST(dns_name_to_wire_format) {
         test_dns_name_to_wire_format_one("a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12", out4, sizeof(out4), sizeof(out4));
 }
 
+static void test_dns_name_from_wire_format_one(const char *expect, const uint8_t *what, size_t len, int ret) {
+        _cleanup_free_ char *name = NULL;
+        int r;
+
+        log_info("%s, %s, %zu, →%d", what, strnull(expect), len, ret);
+
+        r = dns_name_from_wire_format(&what, &len, &name);
+        assert_se(r == ret);
+
+        if (r >= 0) {
+                assert(expect);  /* for gcc */
+                assert_se(memcmp(name, expect, r) == 0);
+        }
+}
+
+TEST(dns_name_from_wire_format) {
+        static const uint8_t in0[] = { 0 };
+        static const uint8_t in1[] = { 3, 'f', 'o', 'o', 0 };
+        static const uint8_t in2[] = { 5, 'h', 'a', 'l', 'l', 'o', 3, 'f', 'o', 'o', 3, 'b', 'a', 'r', 0 };
+        static const uint8_t in2_1[] = { 5, 'h', 'a', 'l', 'l', 'o', 3, 'f', 'o', 'o', 0, 'b', 'a', 'r', 0 };
+        static const uint8_t in3[] = { 4, ' ', 'f', 'o', 'o', 3, 'b', 'a', 'r', 0 };
+        static const uint8_t in4[] = { 9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     3, 'a', '1', '2', 0 }; /* 255 octets */
+        static const uint8_t in5[] = { 9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     9, 'a', '1', '2', '3', '4', '5', '6', '7', '8',
+                                     3, 'a', '1', '2', 0 }; /* 265 octets */
+
+        test_dns_name_from_wire_format_one("", in0, sizeof(in0), strlen(""));
+
+        test_dns_name_from_wire_format_one("foo", in1, sizeof(in1), strlen("foo"));
+        test_dns_name_from_wire_format_one("foo", in1, sizeof(in1) - 1, strlen("foo"));
+
+        test_dns_name_from_wire_format_one("hallo.foo.bar", in2, sizeof(in2), strlen("hallo.foo.bar"));
+        test_dns_name_from_wire_format_one("hallo.foo", in2_1, sizeof(in2_1), strlen("hallo.foo"));
+
+        test_dns_name_from_wire_format_one("\\032foo.bar", in3, sizeof(in3), strlen("\\032foo.bar"));
+
+        test_dns_name_from_wire_format_one(NULL, in5, sizeof(in5), -EMSGSIZE);
+        test_dns_name_from_wire_format_one("a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12345678.a12", in4, sizeof(in4), 253);
+}
+
 static void test_dns_label_unescape_suffix_one(const char *what, const char *expect1, const char *expect2, size_t buffer_sz, int ret1, int ret2) {
         char buffer[buffer_sz];
         const char *label;
@@ -131,12 +220,12 @@ static void test_dns_label_unescape_suffix_one(const char *what, const char *exp
         r = dns_label_unescape_suffix(what, &label, buffer, buffer_sz);
         assert_se(r == ret1);
         if (r >= 0)
-                assert_se(streq(buffer, expect1));
+                ASSERT_STREQ(buffer, expect1);
 
         r = dns_label_unescape_suffix(what, &label, buffer, buffer_sz);
         assert_se(r == ret2);
         if (r >= 0)
-                assert_se(streq(buffer, expect2));
+                ASSERT_STREQ(buffer, expect2);
 }
 
 TEST(dns_label_unescape_suffix) {
@@ -173,7 +262,7 @@ static void test_dns_label_escape_one(const char *what, size_t l, const char *ex
         if (r < 0)
                 return;
 
-        assert_se(streq_ptr(expect, t));
+        ASSERT_STREQ(expect, t);
 }
 
 TEST(dns_label_escape) {
@@ -193,7 +282,7 @@ static void test_dns_name_normalize_one(const char *what, const char *expect, in
         if (r < 0)
                 return;
 
-        assert_se(streq_ptr(expect, t));
+        ASSERT_STREQ(expect, t);
 }
 
 TEST(dns_name_normalize) {
@@ -332,7 +421,7 @@ static void test_dns_name_reverse_one(const char *address, const char *name) {
 
         assert_se(in_addr_from_string_auto(address, &familya, &a) >= 0);
         assert_se(dns_name_reverse(familya, &a, &p) >= 0);
-        assert_se(streq(p, name));
+        ASSERT_STREQ(p, name);
         assert_se(dns_name_address(p, &familyb, &b) > 0);
         assert_se(familya == familyb);
         assert_se(in_addr_equal(familya, &a, &b));
@@ -349,7 +438,7 @@ static void test_dns_name_concat_one(const char *a, const char *b, int r, const 
         _cleanup_free_ char *p = NULL;
 
         assert_se(dns_name_concat(a, b, 0, &p) == r);
-        assert_se(streq_ptr(p, result));
+        ASSERT_STREQ(p, result);
 }
 
 TEST(dns_name_concat) {
@@ -375,6 +464,9 @@ static void test_dns_name_is_valid_one(const char *s, int ret, int ret_ldh) {
 }
 
 TEST(dns_name_is_valid) {
+        test_dns_name_is_valid_one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[._qotd._tcp.local", 1, 0);
+        test_dns_name_is_valid_one("[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]._qotd._tcp.local", 0, 0);
+
         test_dns_name_is_valid_one("foo",               1, 1);
         test_dns_name_is_valid_one("foo.",              1, 1);
         test_dns_name_is_valid_one("foo..",             0, 0);
@@ -486,14 +578,14 @@ static void test_dns_service_join_one(const char *a, const char *b, const char *
         log_info("%s, %s, %s, →%d, %s", strnull(a), strnull(b), strnull(c), r, strnull(d));
 
         assert_se(dns_service_join(a, b, c, &t) == r);
-        assert_se(streq_ptr(t, d));
+        ASSERT_STREQ(t, d);
 
         if (r < 0)
                 return;
 
         assert_se(dns_service_split(t, &x, &y, &z) >= 0);
-        assert_se(streq_ptr(a, x));
-        assert_se(streq_ptr(b, y));
+        ASSERT_STREQ(a, x);
+        ASSERT_STREQ(b, y);
         assert_se(dns_name_equal(c, z) > 0);
 }
 
@@ -518,9 +610,9 @@ static void test_dns_service_split_one(const char *joined, const char *a, const 
         log_info("%s, %s, %s, %s, →%d", joined, strnull(a), strnull(b), strnull(c), r);
 
         assert_se(dns_service_split(joined, &x, &y, &z) == r);
-        assert_se(streq_ptr(x, a));
-        assert_se(streq_ptr(y, b));
-        assert_se(streq_ptr(z, c));
+        ASSERT_STREQ(x, a);
+        ASSERT_STREQ(y, b);
+        ASSERT_STREQ(z, c);
 
         if (r < 0)
                 return;
@@ -549,7 +641,7 @@ static void test_dns_name_change_suffix_one(const char *name, const char *old_su
         log_info("%s, %s, %s, →%s", name, old_suffix, new_suffix, strnull(result));
 
         assert_se(dns_name_change_suffix(name, old_suffix, new_suffix, &s) == r);
-        assert_se(streq_ptr(s, result));
+        ASSERT_STREQ(s, result);
 }
 
 TEST(dns_name_change_suffix) {
@@ -570,7 +662,7 @@ static void test_dns_name_suffix_one(const char *name, unsigned n_labels, const 
         log_info("%s, %u, → %s, %d", name, n_labels, strnull(result), ret);
 
         assert_se(ret == dns_name_suffix(name, n_labels, &p));
-        assert_se(streq_ptr(p, result));
+        ASSERT_STREQ(p, result);
 }
 
 TEST(dns_name_suffix) {
@@ -660,7 +752,7 @@ static void test_dns_name_common_suffix_one(const char *a, const char *b, const 
         log_info("%s, %s, →%s", a, b, result);
 
         assert_se(dns_name_common_suffix(a, b, &c) >= 0);
-        assert_se(streq(c, result));
+        ASSERT_STREQ(c, result);
 }
 
 TEST(dns_name_common_suffix) {

@@ -11,6 +11,7 @@
 #include "extract-word.h"
 #include "fd-util.h"
 #include "log.h"
+#include "macro-fundamental.h"
 #include "memory-util.h"
 #include "socket-util.h"
 #include "string-table.h"
@@ -23,7 +24,7 @@ static const char* const duplex_table[_DUP_MAX] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(duplex, Duplex);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_duplex, duplex, Duplex, "Failed to parse duplex setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_duplex, duplex, Duplex);
 
 static const struct {
         uint32_t opt;
@@ -48,9 +49,9 @@ int wol_options_to_string_alloc(uint32_t opts, char **ret) {
                 return 0;
         }
 
-        for (size_t i = 0; i < ELEMENTSOF(wol_option_map); i++)
-                if (opts & wol_option_map[i].opt &&
-                    !strextend_with_separator(&str, ",", wol_option_map[i].name))
+        FOREACH_ELEMENT(option, wol_option_map)
+                if (opts & option->opt &&
+                    !strextend_with_separator(&str, ",", option->name))
                         return -ENOMEM;
 
         if (!str) {
@@ -72,7 +73,7 @@ static const char* const port_table[] = {
 };
 
 DEFINE_STRING_TABLE_LOOKUP(port, NetDevPort);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_port, port, NetDevPort, "Failed to parse Port setting");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_port, port, NetDevPort);
 
 static const char* const mdi_table[] = {
         [ETH_TP_MDI_INVALID]  = "unknown",
@@ -452,12 +453,9 @@ static int get_stringset(int ethtool_fd, const char *ifname, enum ethtool_string
         if (buffer.info.sset_mask == 0)
                 return -EOPNOTSUPP;
 
-#pragma GCC diagnostic push
-#if HAVE_ZERO_LENGTH_BOUNDS
-#  pragma GCC diagnostic ignored "-Wzero-length-bounds"
-#endif
+        DISABLE_WARNING_ZERO_LENGTH_BOUNDS;
         len = buffer.info.data[0];
-#pragma GCC diagnostic pop
+        REENABLE_WARNING;
         if (len == 0)
                 return -EOPNOTSUPP;
 
@@ -1317,9 +1315,9 @@ int config_parse_wol(
                 if (r == 0)
                         break;
 
-                for (size_t i = 0; i < ELEMENTSOF(wol_option_map); i++)
-                        if (streq(w, wol_option_map[i].name)) {
-                                new_opts |= wol_option_map[i].opt;
+                FOREACH_ELEMENT(option, wol_option_map)
+                        if (streq(w, option->name)) {
+                                new_opts |= option->opt;
                                 found = true;
                                 break;
                         }

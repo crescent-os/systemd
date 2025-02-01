@@ -9,11 +9,28 @@
 #include "journal-internal.h"
 #include "journalctl.h"
 #include "journalctl-filter.h"
+#include "journalctl-util.h"
 #include "logs-show.h"
 #include "missing_sched.h"
-#include "nulstr-util.h"
 #include "path-util.h"
 #include "unit-name.h"
+
+static int add_invocation(sd_journal *j) {
+        int r;
+
+        assert(j);
+
+        if (!arg_invocation)
+                return 0;
+
+        assert(!sd_id128_is_null(arg_invocation_id));
+
+        r = add_matches_for_invocation_id(j, arg_invocation_id);
+        if (r < 0)
+                return r;
+
+        return sd_journal_add_conjunction(j);
+}
 
 static int add_boot(sd_journal *j) {
         int r;
@@ -23,42 +40,13 @@ static int add_boot(sd_journal *j) {
         if (!arg_boot)
                 return 0;
 
-        /* Take a shortcut and use the current boot_id, which we can do very quickly.
-         * We can do this only when we logs are coming from the current machine,
-         * so take the slow path if log location is specified. */
-        if (arg_boot_offset == 0 && sd_id128_is_null(arg_boot_id) &&
-            !arg_directory && !arg_file && !arg_root)
-                return add_match_this_boot(j, arg_machine);
-
-        if (sd_id128_is_null(arg_boot_id)) {
-                r = journal_find_boot_by_offset(j, arg_boot_offset, &arg_boot_id);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to find journal entry from the specified boot offset (%+i): %m",
-                                               arg_boot_offset);
-                if (r == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(ENODATA),
-                                               "No journal boot entry found from the specified boot offset (%+i).",
-                                               arg_boot_offset);
-        } else {
-                r = journal_find_boot_by_id(j, arg_boot_id);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to find journal entry from the specified boot ID (%s): %m",
-                                               SD_ID128_TO_STRING(arg_boot_id));
-                if (r == 0)
-                        return log_error_errno(SYNTHETIC_ERRNO(ENODATA),
-                                               "No journal boot entry found from the specified boot ID (%s).",
-                                               SD_ID128_TO_STRING(arg_boot_id));
-        }
+        assert(!sd_id128_is_null(arg_boot_id));
 
         r = add_match_boot_id(j, arg_boot_id);
         if (r < 0)
-                return log_error_errno(r, "Failed to add match: %m");
+                return r;
 
-        r = sd_journal_add_conjunction(j);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add conjunction: %m");
-
-        return 0;
+        return sd_journal_add_conjunction(j);
 }
 
 static int add_dmesg(sd_journal *j) {
@@ -69,89 +57,29 @@ static int add_dmesg(sd_journal *j) {
         if (!arg_dmesg)
                 return 0;
 
-        r = sd_journal_add_match(j, "_TRANSPORT=kernel", 0);
+        r = sd_journal_add_match(j, "_TRANSPORT=kernel", SIZE_MAX);
         if (r < 0)
                 return r;
 
         return sd_journal_add_conjunction(j);
 }
 
-static int get_possible_units(
-                sd_journal *j,
-                const char *fields,
-                char **patterns,
-                Set **ret) {
-
-        _cleanup_set_free_ Set *found = NULL;
-        int r;
-
-        assert(j);
-        assert(fields);
-        assert(ret);
-
-        NULSTR_FOREACH(field, fields) {
-                const void *data;
-                size_t size;
-
-                r = sd_journal_query_unique(j, field);
-                if (r < 0)
-                        return r;
-
-                SD_JOURNAL_FOREACH_UNIQUE(j, data, size) {
-                        _cleanup_free_ char *u = NULL;
-                        char *eq;
-
-                        eq = memchr(data, '=', size);
-                        if (eq) {
-                                size -= eq - (char*) data + 1;
-                                data = ++eq;
-                        }
-
-                        u = strndup(data, size);
-                        if (!u)
-                                return -ENOMEM;
-
-                        size_t i;
-                        if (!strv_fnmatch_full(patterns, u, FNM_NOESCAPE, &i))
-                                continue;
-
-                        log_debug("Matched %s with pattern %s=%s", u, field, patterns[i]);
-                        r = set_ensure_consume(&found, &string_hash_ops_free, TAKE_PTR(u));
-                        if (r < 0)
-                                return r;
-                }
-        }
-
-        *ret = TAKE_PTR(found);
-        return 0;
-}
-
-/* This list is supposed to return the superset of unit names
- * possibly matched by rules added with add_matches_for_unit... */
-#define SYSTEM_UNITS                 \
-        "_SYSTEMD_UNIT\0"            \
-        "COREDUMP_UNIT\0"            \
-        "UNIT\0"                     \
-        "OBJECT_SYSTEMD_UNIT\0"      \
-        "_SYSTEMD_SLICE\0"
-
-/* ... and add_matches_for_user_unit */
-#define USER_UNITS                   \
-        "_SYSTEMD_USER_UNIT\0"       \
-        "USER_UNIT\0"                \
-        "COREDUMP_USER_UNIT\0"       \
-        "OBJECT_SYSTEMD_USER_UNIT\0" \
-        "_SYSTEMD_USER_SLICE\0"
-
 static int add_units(sd_journal *j) {
         _cleanup_strv_free_ char **patterns = NULL;
         bool added = false;
+        MatchUnitFlag flags = MATCH_UNIT_ALL;
         int r;
 
         assert(j);
 
         if (strv_isempty(arg_system_units) && strv_isempty(arg_user_units))
                 return 0;
+
+        /* When --directory/-D, --root, --file/-i, or --machine/-M is specified, the opened journal file may
+         * be external, and the uid of the systemd-coredump user that generates the coredump entries may be
+         * different from the one in the current host. Let's relax the filter condition in such cases. */
+        if (arg_directory || arg_root || arg_file_stdin || arg_file || arg_machine)
+                flags &= ~MATCH_UNIT_COREDUMP_UID;
 
         STRV_FOREACH(i, arg_system_units) {
                 _cleanup_free_ char *u = NULL;
@@ -165,7 +93,7 @@ static int add_units(sd_journal *j) {
                         if (r < 0)
                                 return r;
                 } else {
-                        r = add_matches_for_unit(j, u);
+                        r = add_matches_for_unit_full(j, flags, u);
                         if (r < 0)
                                 return r;
                         r = sd_journal_add_disjunction(j);
@@ -179,12 +107,12 @@ static int add_units(sd_journal *j) {
                 _cleanup_set_free_ Set *units = NULL;
                 char *u;
 
-                r = get_possible_units(j, SYSTEM_UNITS, patterns, &units);
+                r = get_possible_units(j, SYSTEM_UNITS_FULL, patterns, &units);
                 if (r < 0)
                         return r;
 
                 SET_FOREACH(u, units) {
-                        r = add_matches_for_unit(j, u);
+                        r = add_matches_for_unit_full(j, flags, u);
                         if (r < 0)
                                 return r;
                         r = sd_journal_add_disjunction(j);
@@ -208,7 +136,7 @@ static int add_units(sd_journal *j) {
                         if (r < 0)
                                 return r;
                 } else {
-                        r = add_matches_for_user_unit(j, u, getuid());
+                        r = add_matches_for_user_unit_full(j, flags, u);
                         if (r < 0)
                                 return r;
                         r = sd_journal_add_disjunction(j);
@@ -222,12 +150,12 @@ static int add_units(sd_journal *j) {
                 _cleanup_set_free_ Set *units = NULL;
                 char *u;
 
-                r = get_possible_units(j, USER_UNITS, patterns, &units);
+                r = get_possible_units(j, USER_UNITS_FULL, patterns, &units);
                 if (r < 0)
                         return r;
 
                 SET_FOREACH(u, units) {
-                        r = add_matches_for_user_unit(j, u, getuid());
+                        r = add_matches_for_user_unit_full(j, flags, u);
                         if (r < 0)
                                 return r;
                         r = sd_journal_add_disjunction(j);
@@ -321,7 +249,7 @@ static int add_matches_for_executable(sd_journal *j, const char *path) {
         assert(j);
         assert(path);
 
-        if (executable_is_script(path, &interpreter) > 0) {
+        if (script_get_shebang_interpreter(path, &interpreter) >= 0) {
                 _cleanup_free_ char *comm = NULL;
 
                 r = path_extract_filename(path, &comm);
@@ -333,14 +261,15 @@ static int add_matches_for_executable(sd_journal *j, const char *path) {
                         return log_error_errno(r, "Failed to add match: %m");
 
                 /* Append _EXE only if the interpreter is not a link. Otherwise, it might be outdated often. */
-                path = is_symlink(interpreter) > 0 ? interpreter : NULL;
+                if (is_symlink(interpreter) > 0)
+                        return 0;
+
+                path = interpreter;
         }
 
-        if (path) {
-                r = journal_add_match_pair(j, "_EXE", path);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to add match: %m");
-        }
+        r = journal_add_match_pair(j, "_EXE", path);
+        if (r < 0)
+                return log_error_errno(r, "Failed to add match: %m");
 
         return 0;
 }
@@ -440,7 +369,7 @@ static int add_matches(sd_journal *j, char **args) {
                         have_term = true;
 
                 } else {
-                        r = sd_journal_add_match(j, *i, 0);
+                        r = sd_journal_add_match(j, *i, SIZE_MAX);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to add match '%s': %m", *i);
                         have_term = true;
@@ -457,19 +386,37 @@ int add_filters(sd_journal *j, char **matches) {
 
         assert(j);
 
-        /* add_boot() must be called first!
-         * It may need to seek the journal to find parent boot IDs. */
-        r = add_boot(j);
+        /* First, search boot or invocation ID, as that may set and flush matches and seek journal. */
+        r = journal_acquire_boot(j);
         if (r < 0)
                 return r;
+
+        r = journal_acquire_invocation(j);
+        if (r < 0)
+                return r;
+
+        /* Clear unexpected matches for safety. */
+        sd_journal_flush_matches(j);
+
+        /* Then, add filters in the below. */
+        if (arg_invocation) {
+                /* If an invocation ID is found, then it is not necessary to add matches for boot and units. */
+                r = add_invocation(j);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add filter for invocation: %m");
+        } else {
+                r = add_boot(j);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add filter for boot: %m");
+
+                r = add_units(j);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add filter for units: %m");
+        }
 
         r = add_dmesg(j);
         if (r < 0)
                 return log_error_errno(r, "Failed to add filter for dmesg: %m");
-
-        r = add_units(j);
-        if (r < 0)
-                return log_error_errno(r, "Failed to add filter for units: %m");
 
         r = add_syslog_identifier(j);
         if (r < 0)

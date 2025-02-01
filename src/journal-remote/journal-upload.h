@@ -24,8 +24,7 @@ typedef enum {
 } entry_state;
 
 typedef struct Uploader {
-        sd_event *events;
-        sd_event_source *sigint_event, *sigterm_event;
+        sd_event *event;
 
         char *url;
         CURL *easy;
@@ -41,7 +40,7 @@ typedef struct Uploader {
         int input;
 
         /* journal stuff */
-        sd_journal* journal;
+        sd_journal *journal;
 
         entry_state entry_state;
         const void *field_data;

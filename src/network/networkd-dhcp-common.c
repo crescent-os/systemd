@@ -53,8 +53,10 @@ bool link_dhcp_enabled(Link *link, int family) {
         assert(link);
         assert(IN_SET(family, AF_INET, AF_INET6));
 
-        /* Currently, sd-dhcp-client supports only ethernet and infiniband. */
-        if (family == AF_INET && !IN_SET(link->iftype, ARPHRD_ETHER, ARPHRD_INFINIBAND))
+        /* Currently, sd-dhcp-client supports only ethernet and infiniband.
+         * (ARMHRD_RAWIP and ARMHRD_NONE are typically wwan modems and will be
+         * treated as ethernet devices.) */
+        if (family == AF_INET && !IN_SET(link->iftype, ARPHRD_ETHER, ARPHRD_INFINIBAND, ARPHRD_RAWIP, ARPHRD_NONE))
                 return false;
 
         if (family == AF_INET6 && !socket_ipv6_is_supported())
@@ -69,7 +71,7 @@ bool link_dhcp_enabled(Link *link, int family) {
         if (!link->network)
                 return false;
 
-        return link->network->dhcp & (family == AF_INET ? ADDRESS_FAMILY_IPV4 : ADDRESS_FAMILY_IPV6);
+        return link->network->dhcp & AF_TO_ADDRESS_FAMILY(family);
 }
 
 void network_adjust_dhcp(Network *network) {
@@ -523,158 +525,6 @@ int config_parse_dhcp_send_hostname(
                         network->dhcp_send_hostname = r;
                 if (!network->dhcp6_send_hostname_set)
                         network->dhcp6_send_hostname = r;
-                break;
-        default:
-                assert_not_reached();
-        }
-
-        return 0;
-}
-int config_parse_dhcp_use_dns(
-                const char* unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        int r;
-
-        assert(filename);
-        assert(lvalue);
-        assert(IN_SET(ltype, AF_UNSPEC, AF_INET, AF_INET6));
-        assert(rvalue);
-        assert(data);
-
-        r = parse_boolean(rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse UseDNS=%s, ignoring assignment: %m", rvalue);
-                return 0;
-        }
-
-        switch (ltype) {
-        case AF_INET:
-                network->dhcp_use_dns = r;
-                network->dhcp_use_dns_set = true;
-                break;
-        case AF_INET6:
-                network->dhcp6_use_dns = r;
-                network->dhcp6_use_dns_set = true;
-                break;
-        case AF_UNSPEC:
-                /* For backward compatibility. */
-                if (!network->dhcp_use_dns_set)
-                        network->dhcp_use_dns = r;
-                if (!network->dhcp6_use_dns_set)
-                        network->dhcp6_use_dns = r;
-                break;
-        default:
-                assert_not_reached();
-        }
-
-        return 0;
-}
-
-int config_parse_dhcp_use_domains(
-                const char* unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        DHCPUseDomains d;
-
-        assert(filename);
-        assert(lvalue);
-        assert(IN_SET(ltype, AF_UNSPEC, AF_INET, AF_INET6));
-        assert(rvalue);
-        assert(data);
-
-        d = dhcp_use_domains_from_string(rvalue);
-        if (d < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, d,
-                           "Failed to parse %s=%s, ignoring assignment: %m", lvalue, rvalue);
-                return 0;
-        }
-
-        switch (ltype) {
-        case AF_INET:
-                network->dhcp_use_domains = d;
-                network->dhcp_use_domains_set = true;
-                break;
-        case AF_INET6:
-                network->dhcp6_use_domains = d;
-                network->dhcp6_use_domains_set = true;
-                break;
-        case AF_UNSPEC:
-                /* For backward compatibility. */
-                if (!network->dhcp_use_domains_set)
-                        network->dhcp_use_domains = d;
-                if (!network->dhcp6_use_domains_set)
-                        network->dhcp6_use_domains = d;
-                break;
-        default:
-                assert_not_reached();
-        }
-
-        return 0;
-}
-
-int config_parse_dhcp_use_ntp(
-                const char* unit,
-                const char *filename,
-                unsigned line,
-                const char *section,
-                unsigned section_line,
-                const char *lvalue,
-                int ltype,
-                const char *rvalue,
-                void *data,
-                void *userdata) {
-
-        Network *network = userdata;
-        int r;
-
-        assert(filename);
-        assert(lvalue);
-        assert(IN_SET(ltype, AF_UNSPEC, AF_INET, AF_INET6));
-        assert(rvalue);
-        assert(data);
-
-        r = parse_boolean(rvalue);
-        if (r < 0) {
-                log_syntax(unit, LOG_WARNING, filename, line, r,
-                           "Failed to parse UseNTP=%s, ignoring assignment: %m", rvalue);
-                return 0;
-        }
-
-        switch (ltype) {
-        case AF_INET:
-                network->dhcp_use_ntp = r;
-                network->dhcp_use_ntp_set = true;
-                break;
-        case AF_INET6:
-                network->dhcp6_use_ntp = r;
-                network->dhcp6_use_ntp_set = true;
-                break;
-        case AF_UNSPEC:
-                /* For backward compatibility. */
-                if (!network->dhcp_use_ntp_set)
-                        network->dhcp_use_ntp = r;
-                if (!network->dhcp6_use_ntp_set)
-                        network->dhcp6_use_ntp = r;
                 break;
         default:
                 assert_not_reached();
@@ -1136,14 +986,6 @@ int config_parse_dhcp_request_options(
                                    "Failed to store DHCP request option '%s', ignoring assignment: %m", n);
         }
 }
-
-static const char* const dhcp_use_domains_table[_DHCP_USE_DOMAINS_MAX] = {
-        [DHCP_USE_DOMAINS_NO] = "no",
-        [DHCP_USE_DOMAINS_ROUTE] = "route",
-        [DHCP_USE_DOMAINS_YES] = "yes",
-};
-
-DEFINE_STRING_TABLE_LOOKUP_WITH_BOOLEAN(dhcp_use_domains, DHCPUseDomains, DHCP_USE_DOMAINS_YES);
 
 static const char * const dhcp_option_data_type_table[_DHCP_OPTION_DATA_MAX] = {
         [DHCP_OPTION_DATA_UINT8]       = "uint8",

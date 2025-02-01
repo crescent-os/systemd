@@ -54,6 +54,18 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   }
   ```
 
+- Function return types should be seen/written as whole, i.e. write this:
+
+  ```c
+  const char* foo(const char *input);
+  ```
+
+  instead of this:
+
+  ```c
+  const char *foo(const char *input);
+  ```
+
 - Single-line `if` blocks should not be enclosed in `{}`. Write this:
 
   ```c
@@ -139,16 +151,16 @@ SPDX-License-Identifier: LGPL-2.1-or-later
 
 ## Code Organization and Semantics
 
-- For our codebase we intend to use ISO C11 *with* GNU extensions (aka
-  "gnu11"). Public APIs (i.e. those we expose via `libsystemd.so`
+- For our codebase we intend to use ISO C17 *with* GNU extensions (aka
+  "gnu17"). Public APIs (i.e. those we expose via `libsystemd.so`
   i.e. `systemd/sd-*.h`) should only use ISO C89 however (with a very limited
   set of conservative and common extensions, such as fixed size integer types
-  from `<inttypes.h>`), so that we don't force consuming programs into C11
+  from `<inttypes.h>`), so that we don't force consuming programs into C17
   mode. (This discrepancy in particular means one thing: internally we use C99
   `bool` booleans, externally C89-compatible `int` booleans which generally
   have different size in memory and slightly different semantics, also see
   below.)  Both for internal and external code it's OK to use even newer
-  features and GCC extension than "gnu11", as long as there's reasonable
+  features and GCC extension than "gnu17", as long as there's reasonable
   fallback #ifdeffery in place to ensure compatibility is retained with older
   compilers.
 
@@ -164,28 +176,62 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   thread. Use `is_main_thread()` to detect whether the calling thread is the
   main thread.
 
-- Do not write functions that clobber call-by-reference variables on
-  failure. Use temporary variables for these cases and change the passed in
-  variables only on success. The rule is: never clobber return parameters on
-  failure, always initialize return parameters on success.
+- Typically, function parameters fit into four categories: input parameters,
+  mutable objects, call-by-reference return parameters that are initialized on
+  success, and call-by-reference return parameters that are initialized on
+  failure. Input parameters should always carry suitable `const` declarators if
+  they are pointers, to indicate they are input-only and not changed by the
+  function. The name of return parameters that are initialized on success
+  should be prefixed with `ret_`, to clarify they are return parameters. The
+  name of return parameters that are initialized on failure should be prefixed
+  with `reterr_`. (Examples of such parameters: those which carry additional
+  error information, such as the row/column of parse errors or so). –
+  Conversely, please do not prefix parameters that aren't output-only with
+  `ret_` or `reterr_`, in particular not mutable parameters that are both input
+  as well as output.
 
-- Typically, function parameters fit into three categories: input parameters,
-  mutable objects, and call-by-reference return parameters. Input parameters
-  should always carry suitable "const" declarators if they are pointers, to
-  indicate they are input-only and not changed by the function. Return
-  parameters are best prefixed with "ret_", to clarify they are return
-  parameters. (Conversely, please do not prefix parameters that aren't
-  output-only with "ret_", in particular not mutable parameters that are both
-  input as well as output). Example:
+  Example:
 
   ```c
   static int foobar_frobnicate(
-                  Foobar* object,            /* the associated mutable object */
+                  Foobar *object,            /* the associated mutable object */
                   const char *input,         /* immutable input parameter */
-                  char **ret_frobnicated) {  /* return parameter */
+                  char **ret_frobnicated,    /* return parameter on success */
+                  unsigned *reterr_line,     /* return parameter on failure */
+                  unsigned *reterr_column) { /* ditto */
           …
           return 0;
   }
+  ```
+
+- Do not write functions that clobber call-by-reference success return
+  parameters on failure (i.e. `ret_xyz`, see above), or that clobber
+  call-by-reference failure return parameters on success
+  (i.e. `reterr_xyz`). Use temporary variables for these cases and change the
+  passed in variables only in the right condition. The rule is: never clobber
+  success return parameters on failure, always initialize success return
+  parameters on success (and the reverse for failure return parameters, of
+  course).
+
+- Please put `reterr_` return parameters in the function parameter list last,
+  and `ret_` return parameters immediately before that.
+
+  Good:
+
+  ```c
+  static int do_something(
+                  const char *input,
+                  const char *ret_on_success,
+                  const char *reterr_on_failure);
+  ```
+
+  Not good:
+
+  ```c
+  static int do_something(
+                  const char *reterr_on_failure,
+                  const char *ret_on_success,
+                  const char *input);
   ```
 
 - The order in which header files are included doesn't matter too
@@ -297,7 +343,7 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   t.bar = "bazz";
   ```
 
-- To implement an endless loop, use `for (;;)` rather than `while (1)`.  The
+- To implement an endless loop, use `for (;;)` rather than `while (1)`. The
   latter is a bit ugly anyway, since you probably really meant `while
   (true)`. To avoid the discussion what the right always-true expression for an
   infinite while loop is, our recommendation is to simply write it without any
@@ -545,6 +591,14 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   important for objects that unprivileged users may allocate, but also matters
   for everything else any user may allocate.
 
+- Please use `secure_getenv()` for all environment variable accesses, unless
+  it's clear that `getenv()` would be the better choice. This matters in
+  particular in `src/basic/` and `src/shared/` (i.e. library code that might
+  end up in unexpected processes), but should be followed everywhere else too
+  (in order to make it unproblematic to move code around). To say this clearly:
+  the default should be `secure_getenv()`, the exception should be regular
+  `getenv()`.
+
 ## Types
 
 - Think about the types you use. If a value cannot sensibly be negative, do not
@@ -780,3 +834,13 @@ SPDX-License-Identifier: LGPL-2.1-or-later
   good idea where it might end up running inside of libsystemd.so or
   similar. Hence, use TLS (i.e. `thread_local`) where appropriate, and maybe
   the occasional `pthread_once()`.
+
+## Tests
+
+- Use the assertion macros from `tests.h` (`ASSERT_GE()`, `ASSERT_OK()`, ...) to
+  make sure a descriptive error is logged when an assertion fails. If no assertion
+  macro exists for your specific use case, please add a new assertion macro in a
+  separate commit.
+
+- When modifying existing tests, please convert the test to use the new assertion
+  macros from `tests.h` if it is not already using those.

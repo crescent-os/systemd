@@ -27,7 +27,7 @@ from shutil import which
 from pathlib import Path
 from typing import Optional
 
-__version__ = '{{PROJECT_VERSION_FULL}} ({{VERSION_TAG}})'
+__version__ = '{{PROJECT_VERSION}} ({{VERSION_TAG}})'
 
 try:
     VERBOSE = int(os.environ['KERNEL_INSTALL_VERBOSE']) > 0
@@ -150,7 +150,11 @@ def input_file_location(
 
 
 def uki_conf_location() -> Optional[Path]:
-    return input_file_location('uki.conf')
+    return input_file_location('uki.conf',
+                               '/etc/kernel',
+                               '/run/kernel',
+                               '/usr/local/lib/kernel',
+                               '/usr/lib/kernel')
 
 
 def devicetree_config_location() -> Optional[Path]:

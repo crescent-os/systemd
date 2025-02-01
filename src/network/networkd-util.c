@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "bitfield.h"
 #include "condition.h"
 #include "conf-parser.h"
 #include "escape.h"
@@ -23,7 +24,7 @@ static const char * const network_config_source_table[_NETWORK_CONFIG_SOURCE_MAX
         [NETWORK_CONFIG_SOURCE_RUNTIME] = "runtime",
 };
 
-DEFINE_STRING_TABLE_LOOKUP_TO_STRING(network_config_source, NetworkConfigSource);
+DEFINE_STRING_TABLE_LOOKUP(network_config_source, NetworkConfigSource);
 
 int network_config_state_to_string_alloc(NetworkConfigState s, char **ret) {
         static const char* states[] = {
@@ -38,12 +39,9 @@ int network_config_state_to_string_alloc(NetworkConfigState s, char **ret) {
         assert(ret);
 
         for (size_t i = 0; i < ELEMENTSOF(states); i++)
-                if (FLAGS_SET(s, 1 << i)) {
-                        assert(states[i]);
-
-                        if (!strextend_with_separator(&buf, ",", states[i]))
+                if (BIT_SET(s, i))
+                        if (!strextend_with_separator(&buf, ",", ASSERT_PTR(states[i])))
                                 return -ENOMEM;
-                }
 
         *ret = TAKE_PTR(buf);
         return 0;
@@ -110,8 +108,7 @@ AddressFamily link_local_address_family_from_string(const char *s) {
 DEFINE_STRING_TABLE_LOOKUP(routing_policy_rule_address_family, AddressFamily);
 DEFINE_STRING_TABLE_LOOKUP(nexthop_address_family, AddressFamily);
 DEFINE_STRING_TABLE_LOOKUP(duplicate_address_detection_address_family, AddressFamily);
-DEFINE_CONFIG_PARSE_ENUM(config_parse_link_local_address_family, link_local_address_family,
-                         AddressFamily, "Failed to parse option");
+DEFINE_CONFIG_PARSE_ENUM(config_parse_link_local_address_family, link_local_address_family, AddressFamily);
 DEFINE_STRING_TABLE_LOOKUP_FROM_STRING(dhcp_deprecated_address_family, AddressFamily);
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP_FROM_STRING(ip_masquerade_address_family, AddressFamily);
 DEFINE_STRING_TABLE_LOOKUP(dhcp_lease_server_type, sd_dhcp_lease_server_type_t);

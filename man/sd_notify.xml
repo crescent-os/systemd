@@ -104,8 +104,8 @@
     <para>If the <parameter>unset_environment</parameter> parameter is non-zero,
     <function>sd_notify()</function> will unset the <varname>$NOTIFY_SOCKET</varname> environment variable
     before returning (regardless of whether the function call itself succeeded or not). Further calls to
-    <function>sd_notify()</function> will then fail, and the variable is no longer inherited by child
-    processes.</para>
+    <function>sd_notify()</function> will then silently do nothing, and the variable is no longer inherited
+    by child processes.</para>
 
     <para>The <parameter>state</parameter> parameter should contain a newline-separated list of variable
     assignments, similar in style to an environment block. A trailing newline is implied if none is
@@ -140,9 +140,12 @@
     <para><function>sd_pid_notify()</function> and <function>sd_pid_notifyf()</function> are similar to
     <function>sd_notify()</function> and <function>sd_notifyf()</function> but take a process ID (PID) to use
     as originating PID for the message as first argument. This is useful to send notification messages on
-    behalf of other processes, provided the appropriate privileges are available. If the PID argument is
-    specified as 0, the process ID of the calling process is used, in which case the calls are fully
-    equivalent to <function>sd_notify()</function> and <function>sd_notifyf()</function>.</para>
+    behalf of other processes, provided the appropriate privileges are available. Effectively, this means
+    that a privileged invocation of <command>sd_pid_notify()</command> may circumvent
+    <varname>NotifyAccess=main</varname> or <varname>NotifyAccess=exec</varname> restrictions enforced for a
+    service. If the PID argument is specified as 0, the process ID of the calling process is used, in which
+    case the calls are fully equivalent to <function>sd_notify()</function> and
+    <function>sd_notifyf()</function>.</para>
 
     <para><function>sd_pid_notify_with_fds()</function> is similar to <function>sd_pid_notify()</function>
     but takes an additional array of file descriptors. These file descriptors are sent along the notification
@@ -258,10 +261,18 @@
         <term>BUSERROR=…</term>
 
         <listitem><para>If a service fails, the D-Bus error-style error code. Example:
-        <literal>BUSERROR=org.freedesktop.DBus.Error.TimedOut</literal>. Note that this assignment is
-        currently not used by <command>systemd</command>.</para>
+        <literal>BUSERROR=org.freedesktop.DBus.Error.TimedOut</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>VARLINKERROR=…</term>
+
+        <listitem><para>If a service fails, the Varlink error-style error code. Example:
+        <literal>VARLINKERROR=org.varlink.service.InvalidParameter</literal>.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -270,7 +281,7 @@
         <listitem><para>The exit status of a service or the manager itself. Note that
         <command>systemd</command> currently does not consume this value when sent by services, so this
         assignment is only informational. The manager will send this notification to <emphasis>its</emphasis>
-        notification socket, which may be used to to collect an exit status from the system (a container or
+        notification socket, which may be used to collect an exit status from the system (a container or
         VM) as it shuts down. For example,
         <citerefentry project='debian'><refentrytitle>mkosi</refentrytitle><manvolnum>1</manvolnum></citerefentry>
         makes use of this. The value to return may be set via the
@@ -283,10 +294,34 @@
       <varlistentry>
         <term>MAINPID=…</term>
 
-        <listitem><para>The main process ID (PID) of the service, in case the service manager did not fork
-        off the process itself. Example: <literal>MAINPID=4711</literal>.</para>
+        <listitem><para>Change the main process ID (PID) of the service. This is especially useful in the case
+        where the real main process is not directly forked off by the service manager.
+        Example: <literal>MAINPID=4711</literal>.</para>
 
         <xi:include href="version-info.xml" xpointer="v233"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>MAINPIDFDID=…</term>
+
+        <listitem><para>The pidfd inode number of the new main process (specified through <varname>MAINPID=</varname>).
+        This information can be acquired through
+        <citerefentry project='man-pages'><refentrytitle>name_to_handle_at</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        or <citerefentry project='man-pages'><refentrytitle>fstat</refentrytitle><manvolnum>2</manvolnum></citerefentry>
+        on the pidfd and is used to identify the process in a race-free fashion. Alternatively,
+        a pidfd can be sent directly to the service manager (see <varname>MAINPIDFD=1</varname> below).</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term>MAINPIDFD=1</term>
+
+        <listitem><para>Similar to <varname>MAINPID=</varname> with <varname>MAINPIDFDID=</varname>, but
+        the process is referenced directly by the pidfd passed to the service manager. This is useful
+        if pidfd id is not supported on the system. Exactly one fd is expected for this notification.</para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -331,7 +366,7 @@
 
         <listitem><para>Tells the service manager to extend the startup, runtime or shutdown service timeout
         corresponding the current state. The value specified is a time in microseconds during which the
-        service must send a new message. A service timeout will occur if the message isn't received, but only
+        service must send a new message. A service timeout will occur if the message is not received, but only
         if the runtime of the current state is beyond the original maximum times of
         <varname>TimeoutStartSec=</varname>, <varname>RuntimeMaxSec=</varname>, and
         <varname>TimeoutStopSec=</varname>.  See
@@ -446,7 +481,7 @@
     </variablelist>
 
     <para>The notification messages sent by services are interpreted by the service manager. Unknown
-    assignments are ignored. Thus, it is is safe (but often without effect) to send assignments which are not
+    assignments are ignored. Thus, it is safe (but often without effect) to send assignments which are not
     in this list. The protocol is extensible, but care should be taken to ensure private extensions are
     recognizable as such. Specifically, it is recommend to prefix them with <literal>X_</literal> followed by
     some namespace identifier. The service manager also sends some messages to <emphasis>its</emphasis>
@@ -468,6 +503,26 @@
     successfully. Specifically, no error is returned when a file descriptor is attempted to be stored using
     <varname>FDSTORE=1</varname> but the service is not actually configured to permit storing of file
     descriptors (see above).</para>
+
+    <refsect2 id='errors'>
+      <title>Errors</title>
+
+      <para>Returned errors may indicate the following problems:</para>
+
+      <variablelist>
+        <varlistentry>
+          <term><constant>-E2BIG</constant></term>
+
+          <listitem><para>More file descriptors passed at once than the system allows. On Linux the number of
+          file descriptors that may be passed across <constant>AF_UNIX</constant> sockets at once is 253, see
+          <citerefentry
+          project='man-pages'><refentrytitle>unix</refentrytitle><manvolnum>7</manvolnum></citerefentry> for
+          details.</para>
+
+          <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+        </varlistentry>
+      </variablelist>
+    </refsect2>
   </refsect1>
 
   <refsect1>
@@ -494,10 +549,20 @@
     the guest might try to send malicious notifications to the host, driving it to make destructive decisions
     based on them.</para>
 
-    <para>Note that, while using this library should be preferred in order to avoid code duplication, it is
-    also possible to reimplement the simple readiness notification protocol without external dependencies,
-    as demonstrated in the following self-contained example:
-    <programlisting><xi:include href="notify-selfcontained-example.c" parse="text"/></programlisting></para>
+    <refsect2>
+      <title>Standalone Implementations</title>
+      <para>Note that, while using this library should be preferred in order to avoid code duplication, it is
+      also possible to reimplement the simple readiness notification protocol without external dependencies,
+      as demonstrated in the following self-contained examples from several languages:</para>
+      <refsect3>
+        <title>C</title>
+        <programlisting><xi:include href="notify-selfcontained-example.c" parse="text"/></programlisting>
+      </refsect3>
+      <refsect3>
+        <title>Python</title>
+        <programlisting><xi:include href="notify-selfcontained-example.py" parse="text"/></programlisting>
+      </refsect3>
+    </refsect2>
   </refsect1>
 
   <refsect1>
@@ -571,7 +636,7 @@ sd_notifyf(0, "STATUS=Failed to start up: %s\n"
 sd_notify(0, "READY=1");
 /* set timeout to 5 seconds */
 sd_notify_barrier(0, 5 * 1000000);
-      </programlisting>
+</programlisting>
     </example>
   </refsect1>
 

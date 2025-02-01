@@ -16,24 +16,24 @@ static void _test_one(int line, const char *input, const char *output) {
         r = calendar_spec_from_string(input, &c);
         if (r < 0)
                 log_error_errno(r, "Failed to parse \"%s\": %m", input);
-        assert_se(r >= 0);
+        ASSERT_OK(r);
 
-        assert_se(calendar_spec_to_string(c, &p) >= 0);
+        ASSERT_OK(calendar_spec_to_string(c, &p));
         log_info("line %d: \"%s\" → \"%s\"%s%s", line, input, p,
                  !streq(p, output) ? " expected:" : "",
                  !streq(p, output) ? output : "");
 
-        assert_se(streq(p, output));
+        ASSERT_STREQ(p, output);
 
         u = now(CLOCK_REALTIME);
         r = calendar_spec_next_usec(c, u, &u);
         log_info("Next: %s", r < 0 ? STRERROR(r) : FORMAT_TIMESTAMP(u));
         c = calendar_spec_free(c);
 
-        assert_se(calendar_spec_from_string(p, &c) >= 0);
-        assert_se(calendar_spec_to_string(c, &q) >= 0);
+        ASSERT_OK(calendar_spec_from_string(p, &c));
+        ASSERT_OK(calendar_spec_to_string(c, &q));
 
-        assert_se(streq(q, p));
+        ASSERT_STREQ(q, p);
 }
 #define test_one(input, output) _test_one(__LINE__, input, output)
 
@@ -53,7 +53,7 @@ static void _test_next(int line, const char *input, const char *new_tz, usec_t a
         assert_se(set_unset_env("TZ", new_tz, true) == 0);
         tzset();
 
-        assert_se(calendar_spec_from_string(input, &c) >= 0);
+        ASSERT_OK(calendar_spec_from_string(input, &c));
 
         log_info("line %d: \"%s\" new_tz=%s", line, input, strnull(new_tz));
 
@@ -82,11 +82,11 @@ TEST(timestamp) {
 
         assert_se(format_timestamp_style(buf, sizeof buf, x, TIMESTAMP_US));
         log_info("%s", buf);
-        assert_se(calendar_spec_from_string(buf, &c) >= 0);
-        assert_se(calendar_spec_to_string(c, &t) >= 0);
+        ASSERT_OK(calendar_spec_from_string(buf, &c));
+        ASSERT_OK(calendar_spec_to_string(c, &t));
         log_info("%s", t);
 
-        assert_se(parse_timestamp(t, &y) >= 0);
+        ASSERT_OK(parse_timestamp(t, &y));
         assert_se(y == x);
 }
 
@@ -95,9 +95,9 @@ TEST(hourly_bug_4031) {
         usec_t n, u, w;
         int r;
 
-        assert_se(calendar_spec_from_string("hourly", &c) >= 0);
+        ASSERT_OK(calendar_spec_from_string("hourly", &c));
         n = now(CLOCK_REALTIME);
-        assert_se((r = calendar_spec_next_usec(c, n, &u)) >= 0);
+        ASSERT_OK((r = calendar_spec_next_usec(c, n, &u)));
 
         log_info("Now: %s (%"PRIu64")", FORMAT_TIMESTAMP_STYLE(n, TIMESTAMP_US), n);
         log_info("Next hourly: %s (%"PRIu64")", r < 0 ? STRERROR(r) : FORMAT_TIMESTAMP_STYLE(u, TIMESTAMP_US), u);
@@ -185,18 +185,18 @@ TEST(calendar_spec_one) {
 
 TEST(calendar_spec_next) {
         test_next("2016-03-27 03:17:00", "", 12345, 1459048620000000);
-        test_next("2016-03-27 03:17:00", "CET", 12345, 1459041420000000);
-        test_next("2016-03-27 03:17:00", "EET", 12345, -1);
+        test_next("2016-03-27 03:17:00", "Europe/Berlin", 12345, 1459041420000000);
+        test_next("2016-03-27 03:17:00", "Europe/Kyiv", 12345, -1);
         test_next("2016-03-27 03:17:00 UTC", NULL, 12345, 1459048620000000);
         test_next("2016-03-27 03:17:00 UTC", "", 12345, 1459048620000000);
-        test_next("2016-03-27 03:17:00 UTC", "CET", 12345, 1459048620000000);
-        test_next("2016-03-27 03:17:00 UTC", "EET", 12345, 1459048620000000);
-        test_next("2016-03-27 03:17:00.420000001 UTC", "EET", 12345, 1459048620420000);
-        test_next("2016-03-27 03:17:00.4200005 UTC", "EET", 12345, 1459048620420001);
-        test_next("2015-11-13 09:11:23.42", "EET", 12345, 1447398683420000);
-        test_next("2015-11-13 09:11:23.42/1.77", "EET", 1447398683420000, 1447398685190000);
-        test_next("2015-11-13 09:11:23.42/1.77", "EET", 1447398683419999, 1447398683420000);
-        test_next("Sun 16:00:00", "CET", 1456041600123456, 1456066800000000);
+        test_next("2016-03-27 03:17:00 UTC", "Europe/Berlin", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00 UTC", "Europe/Kyiv", 12345, 1459048620000000);
+        test_next("2016-03-27 03:17:00.420000001 UTC", "Europe/Kyiv", 12345, 1459048620420000);
+        test_next("2016-03-27 03:17:00.4200005 UTC", "Europe/Kyiv", 12345, 1459048620420001);
+        test_next("2015-11-13 09:11:23.42", "Europe/Kyiv", 12345, 1447398683420000);
+        test_next("2015-11-13 09:11:23.42/1.77", "Europe/Kyiv", 1447398683420000, 1447398685190000);
+        test_next("2015-11-13 09:11:23.42/1.77", "Europe/Kyiv", 1447398683419999, 1447398683420000);
+        test_next("Sun 16:00:00", "Europe/Berlin", 1456041600123456, 1456066800000000);
         test_next("*-04-31", "", 12345, -1);
         test_next("2016-02~01 UTC", "", 12345, 1456704000000000);
         test_next("Mon 2017-05~01..07 UTC", "", 12345, 1496016000000000);
@@ -215,7 +215,7 @@ TEST(calendar_spec_next) {
         test_next("2017-04-02 03:30:00 Pacific/Auckland", "", 12345, 1491060600000000);
         /* Confirm that timezones in the Spec work regardless of current timezone */
         test_next("2017-09-09 20:42:00 Pacific/Auckland", "", 12345, 1504946520000000);
-        test_next("2017-09-09 20:42:00 Pacific/Auckland", "EET", 12345, 1504946520000000);
+        test_next("2017-09-09 20:42:00 Pacific/Auckland", "Europe/Kyiv", 12345, 1504946520000000);
         /* Check that we don't start looping if mktime() moves us backwards */
         test_next("Sun *-*-* 01:00:00 Europe/Dublin", "", 1616412478000000, 1617494400000000);
         test_next("Sun *-*-* 01:00:00 Europe/Dublin", "IST", 1616412478000000, 1617494400000000);
@@ -256,7 +256,7 @@ TEST(calendar_spec_from_string) {
 
 static int intro(void) {
         /* Tests have hard-coded results that do not expect a specific timezone to be set by the caller */
-        assert_se(unsetenv("TZ") >= 0);
+        ASSERT_OK_ERRNO(unsetenv("TZ"));
 
         return EXIT_SUCCESS;
 }

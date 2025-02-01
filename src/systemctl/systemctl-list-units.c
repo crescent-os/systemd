@@ -2,8 +2,10 @@
 
 #include "sd-login.h"
 
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-locator.h"
+#include "bus-message-util.h"
 #include "format-table.h"
 #include "locale-util.h"
 #include "path-util.h"
@@ -148,7 +150,7 @@ static int output_units_list(const UnitInfo *unit_infos, size_t c) {
                         /* Here override any load_state highlighting */
                         on_circle = ansi_highlight_red();
                         circle = true;
-                } else if (STR_IN_SET(u->active_state, "reloading", "activating", "maintenance", "deactivating")) {
+                } else if (STR_IN_SET(u->active_state, "reloading", "activating", "maintenance", "refreshing", "deactivating")) {
                         on_sub = on_active = ansi_highlight();
 
                         if (!circle) { /* Here we let load_state highlighting win */

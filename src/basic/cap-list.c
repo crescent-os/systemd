@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "alloc-util.h"
+#include "bitfield.h"
 #include "capability-util.h"
 #include "cap-list.h"
 #include "extract-word.h"
@@ -18,7 +19,7 @@ static const struct capability_name* lookup_capability(register const char *str,
 #include "cap-from-name.h"
 #include "cap-to-name.h"
 
-const char *capability_to_name(int id) {
+const char* capability_to_name(int id) {
         if (id < 0)
                 return NULL;
         if (id >= capability_list_length())
@@ -27,7 +28,7 @@ const char *capability_to_name(int id) {
         return capability_names[id];
 }
 
-const char *capability_to_string(int id, char buf[static CAPABILITY_TO_STRING_MAX]) {
+const char* capability_to_string(int id, char buf[static CAPABILITY_TO_STRING_MAX]) {
         const char *p;
 
         if (id < 0)
@@ -83,7 +84,7 @@ int capability_set_to_string(uint64_t set, char **ret) {
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
                 const char *p;
 
-                if (!FLAGS_SET(set, UINT64_C(1) << i))
+                if (!BIT_SET(set, i))
                         continue;
 
                 p = CAPABILITY_TO_STRING(i);
@@ -143,7 +144,7 @@ int capability_set_to_strv(uint64_t set, char ***ret) {
         for (unsigned i = 0; i <= cap_last_cap(); i++) {
                 const char *p;
 
-                if (!FLAGS_SET(set, UINT64_C(1) << i))
+                if (!BIT_SET(set, i))
                         continue;
 
                 p = CAPABILITY_TO_STRING(i);

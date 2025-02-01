@@ -22,6 +22,7 @@
 #include "macro.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "pidfd-util.h"
 #include "process-util.h"
 #include "socket-util.h"
 #include "stdio-util.h"
@@ -334,46 +335,46 @@ _public_ int sd_pidfd_get_cgroup(int pidfd, char **ret_cgroup) {
         return 0;
 }
 
-_public_ int sd_peer_get_session(int fd, char **session) {
-        struct ucred ucred = UCRED_INVALID;
+_public_ int sd_peer_get_session(int fd, char **ret) {
         int r;
 
         assert_return(fd >= 0, -EBADF);
-        assert_return(session, -EINVAL);
+        assert_return(ret, -EINVAL);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_session(ucred.pid, session);
+        return cg_pidref_get_session(&pidref, ret);
 }
 
-_public_ int sd_peer_get_owner_uid(int fd, uid_t *uid) {
-        struct ucred ucred;
+_public_ int sd_peer_get_owner_uid(int fd, uid_t *ret) {
         int r;
 
         assert_return(fd >= 0, -EBADF);
-        assert_return(uid, -EINVAL);
+        assert_return(ret, -EINVAL);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_owner_uid(ucred.pid, uid);
+        return cg_pidref_get_owner_uid(&pidref, ret);
 }
 
-_public_ int sd_peer_get_unit(int fd, char **unit) {
-        struct ucred ucred;
+_public_ int sd_peer_get_unit(int fd, char **ret) {
         int r;
 
         assert_return(fd >= 0, -EBADF);
-        assert_return(unit, -EINVAL);
+        assert_return(ret, -EINVAL);
 
-        r = getpeercred(fd, &ucred);
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        r = getpeerpidref(fd, &pidref);
         if (r < 0)
                 return r;
 
-        return cg_pid_get_unit(ucred.pid, unit);
+        return cg_pidref_get_unit(&pidref, ret);
 }
 
 _public_ int sd_peer_get_user_unit(int fd, char **unit) {
@@ -1048,9 +1049,8 @@ _public_ int sd_get_sessions(char ***sessions) {
 
 _public_ int sd_get_uids(uid_t **users) {
         _cleanup_closedir_ DIR *d = NULL;
-        int r = 0;
-        unsigned n = 0;
         _cleanup_free_ uid_t *l = NULL;
+        size_t n = 0;
 
         d = opendir("/run/systemd/users/");
         if (!d) {
@@ -1063,38 +1063,31 @@ _public_ int sd_get_uids(uid_t **users) {
         }
 
         FOREACH_DIRENT_ALL(de, d, return -errno) {
-                int k;
                 uid_t uid;
 
                 if (!dirent_is_file(de))
                         continue;
 
-                k = parse_uid(de->d_name, &uid);
-                if (k < 0)
+                if (parse_uid(de->d_name, &uid) < 0)
                         continue;
 
                 if (users) {
-                        if ((unsigned) r >= n) {
-                                uid_t *t;
+                        if (!GREEDY_REALLOC(l, n + 1))
+                                return -ENOMEM;
 
-                                n = MAX(16, 2*r);
-                                t = reallocarray(l, n, sizeof(uid_t));
-                                if (!t)
-                                        return -ENOMEM;
+                        l[n] = uid;
+                }
 
-                                l = t;
-                        }
-
-                        assert((unsigned) r < n);
-                        l[r++] = uid;
-                } else
-                        r++;
+                n++;
         }
+
+        if (n > INT_MAX)
+                return -EOVERFLOW;
 
         if (users)
                 *users = TAKE_PTR(l);
 
-        return r;
+        return (int) n;
 }
 
 _public_ int sd_get_machine_names(char ***machines) {

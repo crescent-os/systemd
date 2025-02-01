@@ -14,6 +14,14 @@
 #include "stdio-util.h"
 #include "string-util.h"
 
+void pam_log_setup(void) {
+        /* Make sure we don't leak the syslog fd we open by opening/closing the fd each time. */
+        log_set_open_when_needed(true);
+
+        /* pam logs to syslog so let's make our generic logging functions do the same thing. */
+        log_set_target(LOG_TARGET_SYSLOG);
+}
+
 int pam_syslog_errno(pam_handle_t *handle, int level, int error, const char *format, ...) {
         va_list ap;
 
@@ -140,6 +148,7 @@ void pam_bus_data_disconnectp(PamBusData **_d) {
 int pam_acquire_bus_connection(
                 pam_handle_t *handle,
                 const char *module_name,
+                bool debug,
                 sd_bus **ret_bus,
                 PamBusData **ret_pam_bus_data) {
 
@@ -179,7 +188,7 @@ int pam_acquire_bus_connection(
         if (r != PAM_SUCCESS)
                 return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to set PAM bus data: @PAMERR@");
 
-        pam_syslog(handle, LOG_DEBUG, "New sd-bus connection (%s) opened.", d->cache_id);
+        pam_debug_syslog(handle, debug, "New sd-bus connection (%s) opened.", d->cache_id);
 
 success:
         *ret_bus = sd_bus_ref(d->bus);
@@ -244,19 +253,43 @@ int pam_get_item_many_internal(pam_handle_t *handle, ...) {
         va_list ap;
         int r;
 
+        assert(handle);
+
         va_start(ap, handle);
         for (;;) {
                 int item_type = va_arg(ap, int);
-
                 if (item_type <= 0) {
                         r = PAM_SUCCESS;
                         break;
                 }
 
                 const void **value = ASSERT_PTR(va_arg(ap, const void **));
-
                 r = pam_get_item(handle, item_type, value);
                 if (!IN_SET(r, PAM_BAD_ITEM, PAM_SUCCESS))
+                        break;
+        }
+        va_end(ap);
+
+        return r;
+}
+
+int pam_get_data_many_internal(pam_handle_t *handle, ...) {
+        va_list ap;
+        int r;
+
+        assert(handle);
+
+        va_start(ap, handle);
+        for (;;) {
+                const char *data_name = va_arg(ap, const char *);
+                if (!data_name) {
+                        r = PAM_SUCCESS;
+                        break;
+                }
+
+                const void **value = ASSERT_PTR(va_arg(ap, const void **));
+                r = pam_get_data(handle, data_name, value);
+                if (!IN_SET(r, PAM_NO_MODULE_DATA, PAM_SUCCESS))
                         break;
         }
         va_end(ap);

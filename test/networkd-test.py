@@ -63,6 +63,13 @@ def setUpModule():
         else:
             stopped_units.append(u)
 
+    # Generate debugging logs.
+    os.makedirs('/run/systemd/system/systemd-networkd.service.d', exist_ok=True)
+    with open(f'/run/systemd/system/systemd-networkd.service.d/00-debug.conf', mode='w', encoding='utf-8') as f:
+        f.write('[Service]\nEnvironment=SYSTEMD_LOG_LEVEL=debug\n')
+
+    subprocess.call(['systemctl', 'daemon-reload'])
+
     # create static systemd-network user for networkd-test-router.service (it
     # needs to do some stuff as root and can't start as user; but networkd
     # still insists on the user)
@@ -193,6 +200,27 @@ class NetworkdTestingUtilities:
 class BridgeTest(NetworkdTestingUtilities, unittest.TestCase):
     """Provide common methods for testing networkd against servers."""
 
+    def wait_online(self):
+        try:
+            subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface', 'port1', '--interface', 'port2', '--timeout=10'])
+        except (AssertionError, subprocess.CalledProcessError):
+            # show networkd status, journal, and DHCP server log on failure
+            print('---- interface status ----')
+            sys.stdout.flush()
+            subprocess.call(['ip', 'a', 'show', 'dev', 'mybridge'])
+            subprocess.call(['ip', 'a', 'show', 'dev', 'port1'])
+            subprocess.call(['ip', 'a', 'show', 'dev', 'port2'])
+            print('---- networkctl status ----')
+            sys.stdout.flush()
+            rc = subprocess.call(['networkctl', '-n', '0', 'status', 'mybridge', 'port1', 'port2'])
+            if rc != 0:
+                print(f"'networkctl status' exited with an unexpected code {rc}")
+            print('---- journal ----')
+            subprocess.check_output(['journalctl', '--sync'])
+            sys.stdout.flush()
+            subprocess.call(['journalctl', '-b', '--no-pager', '--quiet', '-I', '-u', 'systemd-networkd.service'])
+            raise
+
     def setUp(self):
         self.write_network('50-port1.netdev', '''\
 [NetDev]
@@ -227,12 +255,14 @@ Bridge=mybridge
 [Match]
 Name=mybridge
 [Network]
+IPv6AcceptRA=no
 DNS=192.168.250.1
 Address=192.168.250.33/24
 Gateway=192.168.250.1
 ''')
         subprocess.call(['systemctl', 'reset-failed', 'systemd-networkd', 'systemd-resolved'])
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
+        self.wait_online()
 
     def tearDown(self):
         subprocess.check_call(['systemctl', 'stop', 'systemd-networkd.socket'])
@@ -255,8 +285,7 @@ Priority=28
 ''')
         subprocess.check_call(['ip', 'link', 'set', 'dev', 'port1', 'down'])
         subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
-        subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface',
-                               'port1', '--timeout=5'])
+        self.wait_online()
         self.assertEqual(self.read_attr('port1', 'brport/priority'), '28')
 
     def test_bridge_port_priority_set_zero(self):
@@ -268,8 +297,7 @@ Priority=0
 ''')
         subprocess.check_call(['ip', 'link', 'set', 'dev', 'port2', 'down'])
         subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
-        subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface',
-                               'port2', '--timeout=5'])
+        self.wait_online()
         self.assertEqual(self.read_attr('port2', 'brport/priority'), '0')
 
     def test_bridge_port_property(self):
@@ -288,8 +316,7 @@ Priority=23
 ''')
         subprocess.check_call(['ip', 'link', 'set', 'dev', 'port2', 'down'])
         subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
-        subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface',
-                               'port2', '--timeout=5'])
+        self.wait_online()
 
         self.assertEqual(self.read_attr('port2', 'brport/priority'), '23')
         self.assertEqual(self.read_attr('port2', 'brport/hairpin_mode'), '1')
@@ -378,7 +405,8 @@ class ClientTestBase(NetworkdTestingUtilities):
 
     def start_unit(self, unit):
         try:
-            subprocess.check_call(['systemctl', 'start', unit])
+            # The service may be already started. Hence, restart it.
+            subprocess.check_call(['systemctl', 'restart', unit])
         except subprocess.CalledProcessError:
             self.show_journal(unit)
             raise
@@ -521,6 +549,7 @@ MACAddress=12:34:56:78:9a:bc
 [Match]
 Name=dummy0
 [Network]
+IPv6AcceptRA=no
 Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= ~company
@@ -531,7 +560,7 @@ Domains= ~company
                          extra_opts='IPv6AcceptRA=no')
         except subprocess.CalledProcessError as e:
             # networkd often fails to start in LXC: https://github.com/systemd/systemd/issues/11848
-            if IS_CONTAINER and e.cmd == ['systemctl', 'start', 'systemd-networkd']:
+            if IS_CONTAINER and e.cmd == ['systemctl', 'restart', 'systemd-networkd']:
                 raise unittest.SkipTest('https://github.com/systemd/systemd/issues/11848')
             else:
                 raise
@@ -554,6 +583,7 @@ MACAddress=12:34:56:78:9a:bc
         self.write_network('50-myvpn.network', '''[Match]
 Name=dummy0
 [Network]
+IPv6AcceptRA=no
 Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= ~company ~.
@@ -564,7 +594,7 @@ Domains= ~company ~.
                          extra_opts='IPv6AcceptRA=no')
         except subprocess.CalledProcessError as e:
             # networkd often fails to start in LXC: https://github.com/systemd/systemd/issues/11848
-            if IS_CONTAINER and e.cmd == ['systemctl', 'start', 'systemd-networkd']:
+            if IS_CONTAINER and e.cmd == ['systemctl', 'restart', 'systemd-networkd']:
                 raise unittest.SkipTest('https://github.com/systemd/systemd/issues/11848')
             else:
                 raise
@@ -908,6 +938,7 @@ cat <<EOF >/run/systemd/network/50-test.network
 Name={ifr}
 
 [Network]
+IPv6AcceptRA=no
 Address=192.168.5.1/24
 {addr6}
 DHCPServer=yes
@@ -922,6 +953,9 @@ EOF
 # For the networkd instance invoked below cannot support varlink connection.
 # Hence, 'networkctl persistent-storage yes' cannot be used.
 export SYSTEMD_NETWORK_PERSISTENT_STORAGE_READY=1
+
+# Generate debugging logs.
+export SYSTEMD_LOG_LEVEL=debug
 
 # run networkd as in systemd-networkd.service
 exec $(systemctl cat systemd-networkd.service | sed -n '/^ExecStart=/ {{ s/^.*=//; s/^[@+-]//; s/^!*//; p}}')
@@ -941,10 +975,13 @@ exec $(systemctl cat systemd-networkd.service | sed -n '/^ExecStart=/ {{ s/^.*=/
 
         # wait until devices got created
         for _ in range(50):
-            out = subprocess.check_output(['ip', 'a', 'show', 'dev', self.if_router])
-            if b'state UP' in out and b'scope global' in out:
+            if subprocess.run(['ip', 'link', 'show', 'dev', self.if_router],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
                 break
             time.sleep(0.1)
+        else:
+            subprocess.call(['ip', 'link', 'show', 'dev', self.if_router])
+            self.fail('Timed out waiting for {ifr} created.'.format(ifr=self.if_router))
 
     def shutdown_iface(self):
         '''Remove test interface and stop DHCP server'''
@@ -984,6 +1021,7 @@ MACAddress=12:34:56:78:9a:bc
 [Match]
 Name=dummy0
 [Network]
+IPv6AcceptRA=no
 Address=192.168.42.100/24
 DNS=192.168.42.1
 Domains= one two three four five six seven eight nine ten
@@ -1013,6 +1051,7 @@ MACAddress=12:34:56:78:9a:bc
 [Match]
 Name=dummy0
 [Network]
+IPv6AcceptRA=no
 Address=192.168.42.100/24
 DNS=192.168.42.1
 ''')
@@ -1024,17 +1063,20 @@ DNS=127.0.0.1
         self.start_unit('systemd-resolved')
         self.start_unit('systemd-networkd')
 
-        for timeout in range(50):
-            with open(RESOLV_CONF) as f:
-                contents = f.read()
-            if ' 127.0.0.1' in contents and '192.168.42.1' in contents:
-                break
-            time.sleep(0.1)
-        self.assertIn('nameserver 192.168.42.1\n', contents)
-        self.assertIn('nameserver 127.0.0.1\n', contents)
+        subprocess.check_call([NETWORKD_WAIT_ONLINE, '--interface', 'dummy0', '--timeout=10'])
 
         out = subprocess.check_output(['networkctl', 'status', 'dummy0'])
+        self.assertIn(b'50-test.netdev', out)
         self.assertIn(b'50-test.network.d/dns.conf', out)
+
+        for _ in range(50):
+            with open(RESOLV_CONF) as f:
+                contents = f.read()
+            if 'nameserver 127.0.0.1\n' in contents and 'nameserver 192.168.42.1\n' in contents:
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f'Expected DNS servers not found in resolv.conf: {contents}')
 
     def test_dhcp_timezone(self):
         '''networkd sets time zone from DHCP'''
@@ -1053,13 +1095,16 @@ DNS=127.0.0.1
         self.create_iface(dhcpserver_opts='EmitTimezone=yes\nTimezone=Pacific/Honolulu')
         self.do_test(coldplug=None, extra_opts='IPv6AcceptRA=false\n[DHCP]\nUseTimezone=true', dhcp_mode='ipv4')
 
-        # should have applied the received timezone
-        try:
-            self.assertEqual(get_tz(), 'Pacific/Honolulu')
-        except AssertionError:
+        # Should have applied the received timezone. This is asynchronous, so we need to wait for a while:
+        for _ in range(20):
+            tz = get_tz()
+            if tz == 'Pacific/Honolulu':
+                break
+            time.sleep(0.5)
+        else:
             self.show_journal('systemd-networkd.service')
-            self.show_journal('systemd-hostnamed.service')
-            raise
+            self.show_journal('systemd-timedated.service')
+            self.fail(f'Timezone: {tz}, expected: Pacific/Honolulu')
 
 
 class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
@@ -1079,8 +1124,13 @@ class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
     def test_basic_matching(self):
         """Verify the Name= line works throughout this class."""
         self.add_veth_pair('test_if1', 'fake_if2')
-        self.write_network('50-test.network', "[Match]\nName=test_*\n[Network]")
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        self.write_network('50-test.network', '''\
+[Match]
+Name=test_*
+[Network]
+IPv6AcceptRA=no
+''')
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.assert_link_states(test_if1='managed', fake_if2='unmanaged')
 
     def test_inverted_matching(self):
@@ -1090,12 +1140,14 @@ class MatchClientTest(unittest.TestCase, NetworkdTestingUtilities):
         mac = '00:01:02:03:98:99'
         self.add_veth_pair('test_veth', 'test_peer',
                            ['addr', mac], ['addr', mac])
-        self.write_network('50-no-veth.network', """\
+        self.write_network('50-no-veth.network', '''\
 [Match]
 MACAddress={}
 Name=!nonexistent *peer*
-[Network]""".format(mac))
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+[Network]
+IPv6AcceptRA=no
+'''.format(mac))
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.assert_link_states(test_veth='managed', test_peer='unmanaged')
 
 
@@ -1134,7 +1186,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
 
     def test_unmanaged_setting(self):
         """Verify link states with Unmanaged= settings, hot-plug."""
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.create_iface()
         self.assert_link_states(m1def='managed',
                                 m1man='managed',
@@ -1144,7 +1196,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
     def test_unmanaged_setting_coldplug(self):
         """Verify link states with Unmanaged= settings, cold-plug."""
         self.create_iface()
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.assert_link_states(m1def='managed',
                                 m1man='managed',
                                 m1unm='unmanaged',
@@ -1154,7 +1206,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
         """Verify link states with a catch-all config, hot-plug."""
         # Don't actually catch ALL interfaces.  It messes up the host.
         self.write_network('50-all.network', "[Match]\nName=m[01]???\n")
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.create_iface()
         self.assert_link_states(m1def='managed',
                                 m1man='managed',
@@ -1166,7 +1218,7 @@ class UnmanagedClientTest(unittest.TestCase, NetworkdTestingUtilities):
         # Don't actually catch ALL interfaces.  It messes up the host.
         self.write_network('50-all.network', "[Match]\nName=m[01]???\n")
         self.create_iface()
-        subprocess.check_call(['systemctl', 'start', 'systemd-networkd'])
+        subprocess.check_call(['systemctl', 'restart', 'systemd-networkd'])
         self.assert_link_states(m1def='managed',
                                 m1man='managed',
                                 m1unm='unmanaged',

@@ -40,7 +40,7 @@
 #include "unit-name.h"
 #include "user-util.h"
 
-#define STDOUT_STREAMS_MAX 4096
+#define STDOUT_STREAMS_MAX (64*1024)
 
 /* During the "setup" protocol phase of the stream logic let's define a different maximum line length than
  * during the actual operational phase. We want to allow users to specify very short line lengths after all,
@@ -310,7 +310,7 @@ static int stdout_stream_log(
         syslog_priority[STRLEN("PRIORITY=")] = '0' + LOG_PRI(priority);
         iovec[n++] = IOVEC_MAKE_STRING(syslog_priority);
 
-        if (priority & LOG_FACMASK) {
+        if (LOG_FAC(priority) != 0) {
                 xsprintf(syslog_facility, "SYSLOG_FACILITY=%i", LOG_FAC(priority));
                 iovec[n++] = IOVEC_MAKE_STRING(syslog_facility);
         }
@@ -507,7 +507,6 @@ static int stdout_stream_scan(
 
         assert(s);
         assert(p);
-
 
         for (;;) {
                 LineBreak line_break;
@@ -1000,5 +999,4 @@ void stdout_stream_send_notify(StdoutStream *s) {
 
         LIST_REMOVE(stdout_stream_notify_queue, s->server->stdout_streams_notify_queue, s);
         s->in_notify_queue = false;
-
 }

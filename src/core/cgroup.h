@@ -60,7 +60,6 @@ typedef enum FreezerAction {
         FREEZER_PARENT_FREEZE,
         FREEZER_THAW,
         FREEZER_PARENT_THAW,
-
         _FREEZER_ACTION_MAX,
         _FREEZER_ACTION_INVALID = -EINVAL,
 } FreezerAction;
@@ -127,9 +126,9 @@ struct CGroupSocketBindItem {
 };
 
 typedef enum CGroupPressureWatch {
-        CGROUP_PRESSURE_WATCH_OFF,      /* → tells the service payload explicitly not to watch for memory pressure */
+        CGROUP_PRESSURE_WATCH_NO,       /* → tells the service payload explicitly not to watch for memory pressure */
+        CGROUP_PRESSURE_WATCH_YES,
         CGROUP_PRESSURE_WATCH_AUTO,     /* → on if memory account is on anyway for the unit, otherwise off */
-        CGROUP_PRESSURE_WATCH_ON,
         CGROUP_PRESSURE_WATCH_SKIP,     /* → doesn't set up memory pressure watch, but also doesn't explicitly tell payload to avoid it */
         _CGROUP_PRESSURE_WATCH_MAX,
         _CGROUP_PRESSURE_WATCH_INVALID = -EINVAL,
@@ -237,6 +236,7 @@ struct CGroupContext {
         ManagedOOMMode moom_swap;
         ManagedOOMMode moom_mem_pressure;
         uint32_t moom_mem_pressure_limit; /* Normalized to 2^32-1 == 100% */
+        usec_t moom_mem_pressure_duration_usec;
         ManagedOOMPreference moom_preference;
 
         /* Memory pressure logic */
@@ -403,7 +403,7 @@ void cgroup_context_remove_socket_bind(CGroupSocketBindItem **head);
 static inline bool cgroup_context_want_memory_pressure(const CGroupContext *c) {
         assert(c);
 
-        return c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_ON ||
+        return c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_YES ||
                 (c->memory_pressure_watch == CGROUP_PRESSURE_WATCH_AUTO && c->memory_accounting);
 }
 
@@ -437,7 +437,7 @@ void unit_invalidate_cgroup_members_masks(Unit *u);
 
 void unit_add_family_to_cgroup_realize_queue(Unit *u);
 
-const char *unit_get_realized_cgroup_path(Unit *u, CGroupMask mask);
+const char* unit_get_realized_cgroup_path(Unit *u, CGroupMask mask);
 int unit_default_cgroup_path(const Unit *u, char **ret);
 int unit_set_cgroup_path(Unit *u, const char *path);
 int unit_pick_cgroup_path(Unit *u);
@@ -449,16 +449,14 @@ int unit_watch_cgroup_memory(Unit *u);
 void unit_add_to_cgroup_realize_queue(Unit *u);
 
 int unit_cgroup_is_empty(Unit *u);
-void unit_release_cgroup(Unit *u);
-/* Releases the cgroup only if it is recursively empty.
- * Returns true if the cgroup was released, false otherwise. */
-bool unit_maybe_release_cgroup(Unit *u);
+void unit_release_cgroup(Unit *u, bool drop_cgroup_runtime);
 
 void unit_add_to_cgroup_empty_queue(Unit *u);
 int unit_check_oomd_kill(Unit *u);
 int unit_check_oom(Unit *u);
 
 int unit_attach_pids_to_cgroup(Unit *u, Set *pids, const char *suffix_path);
+int unit_remove_subcgroup(Unit *u, const char *suffix_path);
 
 int manager_setup_cgroup(Manager *m);
 void manager_shutdown_cgroup(Manager *m, bool delete);
@@ -468,7 +466,7 @@ unsigned manager_dispatch_cgroup_realize_queue(Manager *m);
 Unit *manager_get_unit_by_cgroup(Manager *m, const char *cgroup);
 Unit *manager_get_unit_by_pidref_cgroup(Manager *m, const PidRef *pid);
 Unit *manager_get_unit_by_pidref_watching(Manager *m, const PidRef *pid);
-Unit* manager_get_unit_by_pidref(Manager *m, const PidRef *pid);
+Unit* manager_get_unit_by_pidref(Manager *m, PidRef *pid);
 Unit* manager_get_unit_by_pid(Manager *m, pid_t pid);
 
 uint64_t unit_get_ancestor_memory_min(Unit *u);
@@ -485,25 +483,20 @@ int unit_get_memory_current(Unit *u, uint64_t *ret);
 int unit_get_memory_accounting(Unit *u, CGroupMemoryAccountingMetric metric, uint64_t *ret);
 int unit_get_tasks_current(Unit *u, uint64_t *ret);
 int unit_get_cpu_usage(Unit *u, nsec_t *ret);
-int unit_get_io_accounting(Unit *u, CGroupIOAccountingMetric metric, bool allow_cache, uint64_t *ret);
+int unit_get_io_accounting(Unit *u, CGroupIOAccountingMetric metric, uint64_t *ret);
 int unit_get_ip_accounting(Unit *u, CGroupIPAccountingMetric metric, uint64_t *ret);
 int unit_get_effective_limit(Unit *u, CGroupLimitType type, uint64_t *ret);
 
-int unit_reset_cpu_accounting(Unit *u);
-void unit_reset_memory_accounting_last(Unit *u);
-int unit_reset_ip_accounting(Unit *u);
-void unit_reset_io_accounting_last(Unit *u);
-int unit_reset_io_accounting(Unit *u);
 int unit_reset_accounting(Unit *u);
 
-#define UNIT_CGROUP_BOOL(u, name)                       \
-        ({                                              \
-        CGroupContext *cc = unit_get_cgroup_context(u); \
-        cc ? cc->name : false;                          \
+#define UNIT_CGROUP_BOOL(u, name)                               \
+        ({                                                      \
+                CGroupContext *cc = unit_get_cgroup_context(u); \
+                cc ? cc->name : false;                          \
         })
 
 bool manager_owns_host_root_cgroup(Manager *m);
-bool unit_has_host_root_cgroup(Unit *u);
+bool unit_has_host_root_cgroup(const Unit *u);
 
 bool unit_has_startup_cgroup_constraints(Unit *u);
 
@@ -522,13 +515,14 @@ void unit_cgroup_catchup(Unit *u);
 bool unit_cgroup_delegate(Unit *u);
 
 int unit_get_cpuset(Unit *u, CPUSet *cpus, const char *name);
+
 int unit_cgroup_freezer_action(Unit *u, FreezerAction action);
 
 const char* freezer_action_to_string(FreezerAction a) _const_;
 FreezerAction freezer_action_from_string(const char *s) _pure_;
 
-CGroupRuntime *cgroup_runtime_new(void);
-CGroupRuntime *cgroup_runtime_free(CGroupRuntime *crt);
+CGroupRuntime* cgroup_runtime_new(void);
+CGroupRuntime* cgroup_runtime_free(CGroupRuntime *crt);
 DEFINE_TRIVIAL_CLEANUP_FUNC(CGroupRuntime*, cgroup_runtime_free);
 
 int cgroup_runtime_serialize(Unit *u, FILE *f, FDSet *fds);
@@ -537,7 +531,7 @@ int cgroup_runtime_deserialize_one(Unit *u, const char *key, const char *value, 
 const char* cgroup_pressure_watch_to_string(CGroupPressureWatch a) _const_;
 CGroupPressureWatch cgroup_pressure_watch_from_string(const char *s) _pure_;
 
-const char *cgroup_device_permissions_to_string(CGroupDevicePermissions p) _const_;
+const char* cgroup_device_permissions_to_string(CGroupDevicePermissions p) _const_;
 CGroupDevicePermissions cgroup_device_permissions_from_string(const char *s) _pure_;
 
 const char* cgroup_ip_accounting_metric_to_string(CGroupIPAccountingMetric m) _const_;

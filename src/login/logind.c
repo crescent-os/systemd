@@ -24,11 +24,12 @@
 #include "fd-util.h"
 #include "format-util.h"
 #include "fs-util.h"
+#include "logind.h"
 #include "logind-dbus.h"
 #include "logind-seat-dbus.h"
 #include "logind-session-dbus.h"
 #include "logind-user-dbus.h"
-#include "logind.h"
+#include "logind-varlink.h"
 #include "main-func.h"
 #include "mkdir-label.h"
 #include "parse-util.h"
@@ -64,7 +65,6 @@ static int manager_new(Manager **ret) {
         *m = (Manager) {
                 .console_active_fd = -EBADF,
                 .reserve_vt_fd = -EBADF,
-                .enable_wall_messages = true,
                 .idle_action_not_before_usec = now(CLOCK_MONOTONIC),
                 .scheduled_shutdown_action = _HANDLE_ACTION_INVALID,
 
@@ -86,15 +86,11 @@ static int manager_new(Manager **ret) {
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGINT, NULL, NULL);
+        r = sd_event_set_signal_exit(m->event, true);
         if (r < 0)
                 return r;
 
-        r = sd_event_add_signal(m->event, NULL, SIGTERM, NULL, NULL);
-        if (r < 0)
-                return r;
-
-        r = sd_event_add_signal(m->event, NULL, SIGRTMIN+18, sigrtmin18_handler, NULL);
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, (SIGRTMIN+18)|SD_EVENT_SIGNAL_PROCMASK, sigrtmin18_handler, /* userdata= */ NULL);
         if (r < 0)
                 return r;
 
@@ -103,6 +99,8 @@ static int manager_new(Manager **ret) {
                 log_debug_errno(r, "Failed allocate memory pressure event source, ignoring: %m");
 
         (void) sd_event_set_watchdog(m->event, true);
+
+        dual_timestamp_now(&m->init_ts);
 
         manager_reset_config(m);
 
@@ -156,6 +154,8 @@ static Manager* manager_free(Manager *m) {
                 (void) unlink_or_warn("/run/nologin");
 
         hashmap_free(m->polkit_registry);
+
+        manager_varlink_done(m);
 
         sd_bus_flush_close_unref(m->bus);
         sd_event_unref(m->event);
@@ -826,7 +826,7 @@ static int manager_connect_console(Manager *m) {
                 return log_error_errno(r, "Failed to watch foreground console: %m");
 
         /*
-         * SIGRTMIN is used as global VT-release signal, SIGRTMIN + 1 is used
+         * SIGRTMIN + 0 is used as global VT-release signal, SIGRTMIN + 1 is used
          * as VT-acquire signal. We ignore any acquire-events (yes, we still
          * have to provide a valid signal-number for it!) and acknowledge all
          * release events immediately.
@@ -838,11 +838,10 @@ static int manager_connect_console(Manager *m) {
                                        SIGRTMIN, SIGRTMAX);
 
         assert_se(ignore_signals(SIGRTMIN + 1) >= 0);
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGRTMIN) >= 0);
 
-        r = sd_event_add_signal(m->event, NULL, SIGRTMIN, manager_vt_switch, m);
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, (SIGRTMIN + 0) | SD_EVENT_SIGNAL_PROCMASK, manager_vt_switch, m);
         if (r < 0)
-                return log_error_errno(r, "Failed to subscribe to signal: %m");
+                return log_error_errno(r, "Failed to subscribe to SIGRTMIN+0 signal: %m");
 
         return 0;
 }
@@ -1036,7 +1035,7 @@ static int manager_dispatch_idle_action(sd_event_source *s, uint64_t t, void *us
                         else
                                 log_info("System idle. Will %s now.", handle_action_verb_to_string(m->idle_action));
 
-                        manager_handle_action(m, 0, m->idle_action, false, is_edge);
+                        manager_handle_action(m, /* inhibit_key= */ 0, m->idle_action, /* ignore_inhibited= */ false, is_edge, /* action_seat= */ NULL);
                         m->idle_action_not_before_usec = n;
                 }
 
@@ -1097,7 +1096,7 @@ static int manager_startup(Manager *m) {
 
         assert(m);
 
-        r = sd_event_add_signal(m->event, NULL, SIGHUP, manager_dispatch_reload_signal, m);
+        r = sd_event_add_signal(m->event, /* ret_event_source= */ NULL, SIGHUP|SD_EVENT_SIGNAL_PROCMASK, manager_dispatch_reload_signal, m);
         if (r < 0)
                 return log_error_errno(r, "Failed to register SIGHUP handler: %m");
 
@@ -1116,6 +1115,10 @@ static int manager_startup(Manager *m) {
 
         /* Connect to the bus */
         r = manager_connect_bus(m);
+        if (r < 0)
+                return r;
+
+        r = manager_varlink_init(m);
         if (r < 0)
                 return r;
 
@@ -1247,7 +1250,7 @@ static int run(int argc, char *argv[]) {
         (void) mkdir_label("/run/systemd/users", 0755);
         (void) mkdir_label("/run/systemd/sessions", 0755);
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGHUP, SIGTERM, SIGINT, SIGCHLD, SIGRTMIN+18) >= 0);
+        assert_se(sigprocmask_many(SIG_BLOCK, /* ret_old_mask= */ NULL, SIGCHLD) >= 0);
 
         r = manager_new(&m);
         if (r < 0)

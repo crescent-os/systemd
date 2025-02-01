@@ -28,6 +28,7 @@
     <para><simplelist>
       <member><filename>/etc/tmpfiles.d/*.conf</filename></member>
       <member><filename>/run/tmpfiles.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/tmpfiles.d/*.conf</filename></member>
       <member><filename>/usr/lib/tmpfiles.d/*.conf</filename></member>
     </simplelist></para>
 
@@ -36,6 +37,7 @@
       <member><filename>$XDG_RUNTIME_DIR/user-tmpfiles.d/*.conf</filename></member>
       <member><filename>~/.local/share/user-tmpfiles.d/*.conf</filename></member>
       <member><filename index='false'>…</filename></member>
+      <member><filename>/usr/local/share/user-tmpfiles.d/*.conf</filename></member>
       <member><filename>/usr/share/user-tmpfiles.d/*.conf</filename></member>
     </simplelist></para>
 
@@ -297,15 +299,13 @@ L     /tmp/foobar -    -    -     -   /dev/null</programlisting>
         <varlistentry>
           <term><varname>L</varname></term>
           <term><varname>L+</varname></term>
-          <listitem><para>Create a symlink if it does not exist
-          yet. If suffixed with <varname>+</varname> and a file or
-          directory already exists where the symlink is to be created,
-          it will be removed and be replaced by the symlink. If the
-          argument is omitted, symlinks to files with the same name
-          residing in the directory
-          <filename>/usr/share/factory/</filename> are created. Note
-          that permissions and ownership on symlinks are ignored.
-          </para></listitem>
+          <term><varname>L?</varname></term>
+          <listitem><para>Create a symlink if it does not exist yet. If suffixed with <varname>+</varname>
+          and a file or directory already exists where the symlink is to be created, it will be removed and
+          be replaced by the symlink. If suffixed with <varname>?</varname> and the source path does not
+          exist, the symlink is not created. If the argument is omitted, symlinks to files with the same name
+          residing in the directory <filename>/usr/share/factory/</filename> are created. Note that
+          permissions on symlinks are ignored.</para></listitem>
         </varlistentry>
 
         <varlistentry>
@@ -512,7 +512,7 @@ r! /tmp/.X[0-9]*-lock</programlisting>
       an error.</para>
 
       <para>For example:
-      <programlisting># Modify sysfs but don't fail if we are in a container with a read-only /proc
+      <programlisting># Modify sysfs but do not fail if we are in a container with a read-only /proc
 w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
 
       <para>If the equals sign (<literal>=</literal>) is used, the file types of existing objects in the specified path
@@ -536,6 +536,10 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       managers further up. If the specified credential is not set for the <command>systemd-tmpfiles</command>
       service, the line is silently skipped. If <literal>^</literal> and <literal>~</literal> are combined
       Base64 decoding is applied to the credential contents.</para>
+
+      <para>If the dollar sign (<literal>$</literal>) is used, the file becomes subject to removal when
+      <command>systemd-tmpfiles</command> is invoked with the <option>--purge</option> switch. Lines without
+      this character are unaffected by that switch.</para>
 
       <para>Note that for all line types that result in creation of any kind of file node
       (i.e. <varname>f</varname>,
@@ -571,7 +575,7 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       removed unless applied to a directory. This functionality is particularly useful in conjunction with
       <varname>Z</varname>.</para>
 
-      <para>By default the access mode of listed inodes is set to the specified mode regardless if it is
+      <para>By default, the access mode of listed inodes is set to the specified mode regardless of whether it is
       created anew, or already existed. Optionally, if prefixed with <literal>:</literal>, the configured
       access mode is only applied when creating new inodes, and if the inode the line refers to
       already exists, its access mode is left in place unmodified.</para>
@@ -586,8 +590,8 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       <citerefentry><refentrytitle>systemd-tmpfiles</refentrytitle><manvolnum>8</manvolnum></citerefentry> is
       used. For <varname>z</varname> and <varname>Z</varname> lines, when omitted or when set to
       <literal>-</literal>, the file ownership will not be modified. These parameters are ignored for
-      <varname>x</varname>, <varname>r</varname>, <varname>R</varname>, <varname>L</varname>,
-      <varname>t</varname>, and <varname>a</varname> lines.</para>
+      <varname>x</varname>, <varname>r</varname>, <varname>R</varname>, <varname>t</varname>,
+      and <varname>a</varname> lines.</para>
 
       <para>This field should generally only reference system users/groups, i.e. users/groups that are
       guaranteed to be resolvable during early boot. If this field references users/groups that only become
@@ -597,7 +601,7 @@ w- /proc/sys/vm/swappiness - - - - 10</programlisting></para>
       Resolvability of User and Group Names</ulink> for more information on requirements on system user/group
       definitions.</para>
 
-      <para>By default the ownership of listed inodes is set to the specified user/group regardless if it is
+      <para>By default, the ownership of listed inodes is set to the specified user/group regardless of whether it is
       created anew, or already existed. Optionally, if prefixed with <literal>:</literal>, the configured
       user/group information is only applied when creating new inodes, and if the inode the line refers to
       already exists, its user/group is left in place unmodified.</para>
@@ -762,6 +766,7 @@ d /tmp/foo/bar - - - bmA:1h -</programlisting></para>
             <xi:include href="standard-specifiers.xml" xpointer="m"/>
             <xi:include href="standard-specifiers.xml" xpointer="M"/>
             <xi:include href="standard-specifiers.xml" xpointer="o"/>
+            <xi:include href="standard-specifiers.xml" xpointer="q"/>
             <row>
               <entry><literal>%S</literal></entry>
               <entry>System or user state directory</entry>
@@ -814,7 +819,7 @@ d /run/uscreens 0755 root screen 10d12h
       <title>Create a directory with a SMACK attribute</title>
       <programlisting>D /run/cups - - - -
 t /run/cups - - - - security.SMACK64=printing user.attr-with-spaces="foo bar"
-      </programlisting>
+</programlisting>
 
       <para>The directory will be owned by root and have default mode. Its contents are
       not subject to time-based cleanup, but will be obliterated when
@@ -868,7 +873,7 @@ e! /var/cache/krb5rcache - - - 0
     <example>
       <title>Provision SSH public key access for root user via Credentials in QEMU</title>
 
-      <programlisting>-smbios type=11,value=io.systemd.credential.binary:tmpfiles.extra=$(echo "f~ /root/.ssh/authorized_keys 700 root root - $(ssh-add -L | base64 -w 0)" | base64 -w 0)
+      <programlisting>-smbios type=11,value=io.systemd.credential.binary:tmpfiles.extra=$(echo -e "d /root/.ssh 0750 root root -\nf~ /root/.ssh/authorized_keys 0600 root root - $(ssh-add -L | base64 -w 0)" | base64 -w 0)
 </programlisting>
 
       <para>By passing this line to QEMU, the public key of the current user will be encoded in base64, added

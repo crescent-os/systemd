@@ -31,56 +31,56 @@ TEST(mount_option_mangle) {
 
         assert_se(mount_option_mangle(NULL, MS_RDONLY|MS_NOSUID, &f, &opts) == 0);
         assert_se(f == (MS_RDONLY|MS_NOSUID));
-        assert_se(opts == NULL);
+        ASSERT_NULL(opts);
 
         assert_se(mount_option_mangle("", MS_RDONLY|MS_NOSUID, &f, &opts) == 0);
         assert_se(f == (MS_RDONLY|MS_NOSUID));
-        assert_se(opts == NULL);
+        ASSERT_NULL(opts);
 
         assert_se(mount_option_mangle("ro,nosuid,nodev,noexec", 0, &f, &opts) == 0);
         assert_se(f == (MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC));
-        assert_se(opts == NULL);
+        ASSERT_NULL(opts);
 
         assert_se(mount_option_mangle("ro,nosuid,nodev,noexec,mode=0755", 0, &f, &opts) == 0);
         assert_se(f == (MS_RDONLY|MS_NOSUID|MS_NODEV|MS_NOEXEC));
-        assert_se(streq(opts, "mode=0755"));
+        ASSERT_STREQ(opts, "mode=0755");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,nosuid,foo,hogehoge,nodev,mode=0755", 0, &f, &opts) == 0);
         assert_se(f == (MS_NOSUID|MS_NODEV));
-        assert_se(streq(opts, "foo,hogehoge,mode=0755"));
+        ASSERT_STREQ(opts, "foo,hogehoge,mode=0755");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,nosuid,nodev,noexec,relatime,net_cls,net_prio", MS_RDONLY, &f, &opts) == 0);
         assert_se(f == (MS_NOSUID|MS_NODEV|MS_NOEXEC|MS_RELATIME));
-        assert_se(streq(opts, "net_cls,net_prio"));
+        ASSERT_STREQ(opts, "net_cls,net_prio");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,nosuid,nodev,relatime,size=1630748k,mode=0700,uid=1000,gid=1000", MS_RDONLY, &f, &opts) == 0);
         assert_se(f == (MS_NOSUID|MS_NODEV|MS_RELATIME));
-        assert_se(streq(opts, "size=1630748k,mode=0700,uid=1000,gid=1000"));
+        ASSERT_STREQ(opts, "size=1630748k,mode=0700,uid=1000,gid=1000");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("size=1630748k,rw,gid=1000,,,nodev,relatime,,mode=0700,nosuid,uid=1000", MS_RDONLY, &f, &opts) == 0);
         assert_se(f == (MS_NOSUID|MS_NODEV|MS_RELATIME));
-        assert_se(streq(opts, "size=1630748k,gid=1000,mode=0700,uid=1000"));
+        ASSERT_STREQ(opts, "size=1630748k,gid=1000,mode=0700,uid=1000");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,exec,size=8143984k,nr_inodes=2035996,mode=0755", MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV, &f, &opts) == 0);
         assert_se(f == (MS_NOSUID|MS_NODEV));
-        assert_se(streq(opts, "size=8143984k,nr_inodes=2035996,mode=0755"));
+        ASSERT_STREQ(opts, "size=8143984k,nr_inodes=2035996,mode=0755");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,relatime,fmask=0022,,,dmask=0022", MS_RDONLY, &f, &opts) == 0);
         assert_se(f == MS_RELATIME);
-        assert_se(streq(opts, "fmask=0022,dmask=0022"));
+        ASSERT_STREQ(opts, "fmask=0022,dmask=0022");
         opts = mfree(opts);
 
         assert_se(mount_option_mangle("rw,relatime,fmask=0022,dmask=0022,\"hogehoge", MS_RDONLY, &f, &opts) < 0);
 
         assert_se(mount_option_mangle("mode=01777,size=10%,nr_inodes=400k,uid=496107520,gid=496107520,context=\"system_u:object_r:svirt_sandbox_file_t:s0:c0,c1\"", 0, &f, &opts) == 0);
         assert_se(f == 0);
-        assert_se(streq(opts, "mode=01777,size=10%,nr_inodes=400k,uid=496107520,gid=496107520,context=\"system_u:object_r:svirt_sandbox_file_t:s0:c0,c1\""));
+        ASSERT_STREQ(opts, "mode=01777,size=10%,nr_inodes=400k,uid=496107520,gid=496107520,context=\"system_u:object_r:svirt_sandbox_file_t:s0:c0,c1\"");
         opts = mfree(opts);
 }
 
@@ -91,7 +91,7 @@ static void test_mount_flags_to_string_one(unsigned long flags, const char *expe
         r = mount_flags_to_string(flags, &x);
         log_info("flags: %#lX → %d/\"%s\"", flags, r, strnull(x));
         assert_se(r >= 0);
-        assert_se(streq(x, expected));
+        ASSERT_STREQ(x, expected);
 }
 
 TEST(mount_flags_to_string) {
@@ -305,7 +305,7 @@ TEST(make_mount_switch_root) {
                 { "/", true  },
         };
 
-        FOREACH_ARRAY(i, table, ELEMENTSOF(table)) {
+        FOREACH_ELEMENT(i, table) {
                 r = safe_fork("(switch-root)",
                               FORK_RESET_SIGNALS |
                               FORK_CLOSE_ALL_FDS |
@@ -358,7 +358,7 @@ TEST(umount_recursive) {
 
         int r;
 
-        FOREACH_ARRAY(t, test_table, ELEMENTSOF(test_table)) {
+        FOREACH_ELEMENT(t, test_table) {
 
                 r = safe_fork("(umount-rec)",
                               FORK_RESET_SIGNALS |
@@ -393,7 +393,7 @@ TEST(umount_recursive) {
 
                         assert_se(umount_recursive_full(t->prefix, MNT_DETACH, (char**) t->keep) >= 0);
 
-                        r = libmount_parse("/proc/self/mountinfo", f, &table, &iter);
+                        r = libmount_parse_mountinfo(f, &table, &iter);
                         if (r < 0) {
                                 log_error_errno(r, "Failed to parse /proc/self/mountinfo: %m");
                                 _exit(EXIT_FAILURE);
@@ -452,14 +452,14 @@ TEST(fd_make_mount_point) {
                 fd = open(s, O_PATH|O_CLOEXEC);
                 assert_se(fd >= 0);
 
-                assert_se(fd_is_mount_point(fd, NULL, AT_SYMLINK_FOLLOW) == 0);
+                assert_se(is_mount_point_at(fd, NULL, AT_SYMLINK_FOLLOW) == 0);
 
                 assert_se(fd_make_mount_point(fd) > 0);
 
                 /* Reopen the inode so that we end up on the new mount */
                 fd2 = open(s, O_PATH|O_CLOEXEC);
 
-                assert_se(fd_is_mount_point(fd2, NULL, AT_SYMLINK_FOLLOW) > 0);
+                assert_se(is_mount_point_at(fd2, NULL, AT_SYMLINK_FOLLOW) > 0);
 
                 assert_se(fd_make_mount_point(fd2) == 0);
 
@@ -535,6 +535,76 @@ TEST(bind_mount_submounts) {
 
         assert_se(umount_recursive(a, 0) >= 0);
         assert_se(umount_recursive(b, 0) >= 0);
+}
+
+TEST(path_is_network_fs_harder) {
+        _cleanup_close_ int dir_fd = -EBADF;
+        int r;
+
+        ASSERT_OK(dir_fd = open("/", O_PATH | O_CLOEXEC));
+        FOREACH_STRING(s,
+                       "/", "/dev/", "/proc/", "/run/", "/sys/", "/tmp/", "/usr/", "/var/tmp/",
+                       "", ".", "../../../", "/this/path/should/not/exist/for/test-mount-util/") {
+
+                r = path_is_network_fs_harder(s);
+                log_debug("path_is_network_fs_harder(%s) → %i: %s", s, r, r < 0 ? STRERROR(r) : yes_no(r));
+
+                const char *q = path_startswith(s, "/") ?: s;
+                r = path_is_network_fs_harder_at(dir_fd, q);
+                log_debug("path_is_network_fs_harder_at(root, %s) → %i: %s", q, r, r < 0 ? STRERROR(r) : yes_no(r));
+        }
+
+        if (geteuid() != 0 || have_effective_cap(CAP_SYS_ADMIN) <= 0) {
+                (void) log_tests_skipped("not running privileged");
+                return;
+        }
+
+        _cleanup_(rm_rf_physical_and_freep) char *t = NULL;
+        assert_se(mkdtemp_malloc("/tmp/test-mount-util.path_is_network_fs_harder.XXXXXXX", &t) >= 0);
+
+        r = safe_fork("(make_mount-point)",
+                      FORK_RESET_SIGNALS |
+                      FORK_CLOSE_ALL_FDS |
+                      FORK_DEATHSIG_SIGTERM |
+                      FORK_WAIT |
+                      FORK_REOPEN_LOG |
+                      FORK_LOG |
+                      FORK_NEW_MOUNTNS |
+                      FORK_MOUNTNS_SLAVE,
+                      NULL);
+        ASSERT_OK(r);
+
+        if (r == 0) {
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", t, "tmpfs", 0, NULL));
+                ASSERT_OK_ZERO(path_is_network_fs_harder(t));
+                ASSERT_OK_ERRNO(umount(t));
+
+                ASSERT_OK(mount_nofollow_verbose(LOG_INFO, "tmpfs", t, "tmpfs", 0, "x-systemd-growfs,x-systemd-automount"));
+                ASSERT_OK_ZERO(path_is_network_fs_harder(t));
+                ASSERT_OK_ERRNO(umount(t));
+
+                _exit(EXIT_SUCCESS);
+        }
+}
+
+TEST(umountat) {
+        int r;
+
+        _cleanup_(rm_rf_physical_and_freep) char *p = NULL;
+        _cleanup_close_ int dfd = mkdtemp_open(NULL, O_CLOEXEC, &p);
+        ASSERT_OK(dfd);
+
+        ASSERT_OK(mkdirat(dfd, "foo", 0777));
+
+        _cleanup_free_ char *q = ASSERT_PTR(path_join(p, "foo"));
+
+        r = mount_nofollow_verbose(LOG_ERR, "tmpfs", q, "tmpfs", 0, NULL);
+        if (ERRNO_IS_NEG_PRIVILEGE(r))
+                return (void) log_tests_skipped("not running privileged");
+
+        ASSERT_OK(r);
+        ASSERT_OK(umountat_detach_verbose(LOG_ERR, dfd, "foo"));
+        ASSERT_ERROR(umountat_detach_verbose(LOG_ERR, dfd, "foo"), EINVAL);
 }
 
 DEFINE_TEST_MAIN(LOG_DEBUG);

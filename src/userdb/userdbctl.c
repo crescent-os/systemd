@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <getopt.h>
-#include <utmp.h>
 
+#include "bitfield.h"
 #include "build.h"
 #include "dirent-util.h"
 #include "errno-list.h"
@@ -18,11 +18,13 @@
 #include "socket-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "uid-classification.h"
 #include "uid-range.h"
 #include "user-record-show.h"
 #include "user-util.h"
 #include "userdb.h"
 #include "verbs.h"
+#include "virt.h"
 
 static enum {
         OUTPUT_CLASSIC,
@@ -36,8 +38,13 @@ static PagerFlags arg_pager_flags = 0;
 static bool arg_legend = true;
 static char** arg_services = NULL;
 static UserDBFlags arg_userdb_flags = 0;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static bool arg_chain = false;
+static uint64_t arg_disposition_mask = UINT64_MAX;
+static uid_t arg_uid_min = 0;
+static uid_t arg_uid_max = UID_INVALID-1;
+static bool arg_fuzzy = false;
+static bool arg_boundaries = true;
 
 STATIC_DESTRUCTOR_REGISTER(arg_services, strv_freep);
 
@@ -54,6 +61,7 @@ static const char *user_disposition_to_color(UserDisposition d) {
                 return ansi_green();
 
         case USER_CONTAINER:
+        case USER_FOREIGN:
                 return ansi_cyan();
 
         case USER_RESERVED:
@@ -62,6 +70,10 @@ static const char *user_disposition_to_color(UserDisposition d) {
         default:
                 return NULL;
         }
+}
+
+static const char* shell_to_color(const char *shell) {
+        return !shell || is_nologin_shell(shell) ? ansi_grey() : NULL;
 }
 
 static int show_user(UserRecord *ur, Table *table) {
@@ -86,7 +98,7 @@ static int show_user(UserRecord *ur, Table *table) {
                 break;
 
         case OUTPUT_JSON:
-                json_variant_dump(ur->json, arg_json_format_flags, NULL, 0);
+                sd_json_variant_dump(ur->json, arg_json_format_flags, NULL, NULL);
                 break;
 
         case OUTPUT_FRIENDLY:
@@ -100,10 +112,9 @@ static int show_user(UserRecord *ur, Table *table) {
                 break;
 
         case OUTPUT_TABLE: {
-                UserDisposition d;
-
                 assert(table);
-                d = user_record_disposition(ur);
+                UserDisposition d = user_record_disposition(ur);
+                const char *sh = user_record_shell(ur);
 
                 r = table_add_many(
                                 table,
@@ -114,8 +125,9 @@ static int show_user(UserRecord *ur, Table *table) {
                                 TABLE_UID, ur->uid,
                                 TABLE_GID, user_record_gid(ur),
                                 TABLE_STRING, empty_to_null(ur->real_name),
-                                TABLE_STRING, user_record_home_directory(ur),
-                                TABLE_STRING, user_record_shell(ur),
+                                TABLE_PATH, user_record_home_directory(ur),
+                                TABLE_PATH, sh,
+                                TABLE_SET_COLOR, shell_to_color(sh),
                                 TABLE_INT, 0);
                 if (r < 0)
                         return table_log_add_error(r);
@@ -130,10 +142,16 @@ static int show_user(UserRecord *ur, Table *table) {
         return 0;
 }
 
+static bool test_show_mapped(void) {
+        /* Show mapped user range only in environments where user mapping is a thing. */
+        return running_in_userns() > 0;
+}
+
 static const struct {
         uid_t first, last;
         const char *name;
         UserDisposition disposition;
+        bool (*test)(void);
 } uid_range_table[] = {
         {
                 .first = 1,
@@ -148,10 +166,16 @@ static const struct {
                 .disposition = USER_DYNAMIC,
         },
         {
-                .first = CONTAINER_UID_BASE_MIN,
-                .last = CONTAINER_UID_BASE_MAX,
+                .first = CONTAINER_UID_MIN,
+                .last = CONTAINER_UID_MAX,
                 .name = "container",
                 .disposition = USER_CONTAINER,
+        },
+        {
+                .first = FOREIGN_UID_MIN,
+                .last = FOREIGN_UID_MAX,
+                .name = "foreign",
+                .disposition = USER_FOREIGN,
         },
 #if ENABLE_HOMED
         {
@@ -166,27 +190,34 @@ static const struct {
                 .last = MAP_UID_MAX,
                 .name = "mapped",
                 .disposition = USER_REGULAR,
+                .test = test_show_mapped,
         },
 };
 
 static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
-        int r;
+        int r, n_added = 0;
 
         assert(table);
 
-        for (size_t i = 0; i < ELEMENTSOF(uid_range_table); i++) {
+        FOREACH_ELEMENT(i, uid_range_table) {
                 _cleanup_free_ char *name = NULL, *comment = NULL;
 
-                if (!uid_range_covers(p, uid_range_table[i].first, uid_range_table[i].last - uid_range_table[i].first + 1))
+                if (!BIT_SET(arg_disposition_mask, i->disposition))
+                        continue;
+
+                if (!uid_range_covers(p, i->first, i->last - i->first + 1))
+                        continue;
+
+                if (i->test && !i->test())
                         continue;
 
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_DOWN),
-                               " begin ", uid_range_table[i].name, " users ",
+                               " begin ", i->name, " users ",
                                special_glyph(SPECIAL_GLYPH_ARROW_DOWN));
                 if (!name)
                         return log_oom();
 
-                comment = strjoin("First ", uid_range_table[i].name, " user");
+                comment = strjoin("First ", i->name, " user");
                 if (!comment)
                         return log_oom();
 
@@ -195,9 +226,9 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_STRING, special_glyph(SPECIAL_GLYPH_TREE_TOP),
                                 TABLE_STRING, name,
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_STRING, user_disposition_to_string(uid_range_table[i].disposition),
+                                TABLE_STRING, user_disposition_to_string(i->disposition),
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_UID, uid_range_table[i].first,
+                                TABLE_UID, i->first,
                                 TABLE_SET_COLOR, ansi_grey(),
                                 TABLE_EMPTY,
                                 TABLE_STRING, comment,
@@ -210,13 +241,13 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
 
                 free(name);
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_UP),
-                               " end ", uid_range_table[i].name, " users ",
+                               " end ", i->name, " users ",
                                special_glyph(SPECIAL_GLYPH_ARROW_UP));
                 if (!name)
                         return log_oom();
 
                 free(comment);
-                comment = strjoin("Last ", uid_range_table[i].name, " user");
+                comment = strjoin("Last ", i->name, " user");
                 if (!comment)
                         return log_oom();
 
@@ -225,9 +256,9 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_STRING, special_glyph(SPECIAL_GLYPH_TREE_RIGHT),
                                 TABLE_STRING, name,
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_STRING, user_disposition_to_string(uid_range_table[i].disposition),
+                                TABLE_STRING, user_disposition_to_string(i->disposition),
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_UID, uid_range_table[i].last,
+                                TABLE_UID, i->last,
                                 TABLE_SET_COLOR, ansi_grey(),
                                 TABLE_EMPTY,
                                 TABLE_STRING, comment,
@@ -237,9 +268,11 @@ static int table_add_uid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_INT, 1); /* sort after any other entry with the same UID */
                 if (r < 0)
                         return table_log_add_error(r);
+
+                n_added += 2;
         }
 
-        return ELEMENTSOF(uid_range_table) * 2;
+        return n_added;
 }
 
 static int add_unavailable_uid(Table *table, uid_t start, uid_t end) {
@@ -310,9 +343,10 @@ static int table_add_uid_map(
         assert(table);
         assert(add_unavailable);
 
-        for (size_t i = 0; p && i < p->n_entries; i++) {
-                UIDRangeEntry *x = p->entries + i;
+        if (!p)
+                return 0;
 
+        FOREACH_ARRAY(x, p->entries, p->n_entries) {
                 if (focus < x->start) {
                         r = add_unavailable(table, focus, x->start-1);
                         if (r < 0)
@@ -346,7 +380,7 @@ static int display_user(int argc, char *argv[], void *userdata) {
         int ret = 0, r;
 
         if (arg_output < 0)
-                arg_output = argc > 1 ? OUTPUT_FRIENDLY : OUTPUT_TABLE;
+                arg_output = argc > 1 && !arg_fuzzy ? OUTPUT_FRIENDLY : OUTPUT_TABLE;
 
         if (arg_output == OUTPUT_TABLE) {
                 table = table_new(" ", "name", "disposition", "uid", "gid", "realname", "home", "shell", "order");
@@ -357,28 +391,33 @@ static int display_user(int argc, char *argv[], void *userdata) {
                 (void) table_set_align_percent(table, table_get_cell(table, 0, 4), 100);
                 table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
                 (void) table_set_sort(table, (size_t) 3, (size_t) 8);
-                (void) table_set_display(table, (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 3, (size_t) 4, (size_t) 5, (size_t) 6, (size_t) 7);
+                (void) table_hide_column_from_display(table, (size_t) 8);
+                if (!arg_boundaries)
+                        (void) table_hide_column_from_display(table, (size_t) 0);
         }
 
-        if (argc > 1)
+        _cleanup_(userdb_match_done) UserDBMatch match = {
+                .disposition_mask = arg_disposition_mask,
+                .uid_min = arg_uid_min,
+                .uid_max = arg_uid_max,
+        };
+
+        if (argc > 1 && !arg_fuzzy)
                 STRV_FOREACH(i, argv + 1) {
                         _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
-                        uid_t uid;
 
-                        if (parse_uid(*i, &uid) >= 0)
-                                r = userdb_by_uid(uid, arg_userdb_flags, &ur);
-                        else
-                                r = userdb_by_name(*i, arg_userdb_flags, &ur);
+                        r = userdb_by_name(*i, &match, arg_userdb_flags|USERDB_PARSE_NUMERIC, &ur);
                         if (r < 0) {
                                 if (r == -ESRCH)
                                         log_error_errno(r, "User %s does not exist.", *i);
                                 else if (r == -EHOSTDOWN)
                                         log_error_errno(r, "Selected user database service is not available for this request.");
+                                else if (r == -ENOEXEC)
+                                        log_error_errno(r, "User '%s' exists but does not match specified filter.", *i);
                                 else
                                         log_error_errno(r, "Failed to find user %s: %m", *i);
 
-                                if (ret >= 0)
-                                        ret = r;
+                                RET_GATHER(ret, r);
                         } else {
                                 if (draw_separator && arg_output == OUTPUT_FRIENDLY)
                                         putchar('\n');
@@ -391,9 +430,15 @@ static int display_user(int argc, char *argv[], void *userdata) {
                         }
                 }
         else {
-                _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
+                if (argc > 1) {
+                        /* If there are further arguments, they are the fuzzy match strings. */
+                        match.fuzzy_names = strv_copy(strv_skip(argv, 1));
+                        if (!match.fuzzy_names)
+                                return log_oom();
+                }
 
-                r = userdb_all(arg_userdb_flags, &iterator);
+                _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
+                r = userdb_all(&match, arg_userdb_flags, &iterator);
                 if (r == -ENOLINK) /* ENOLINK → Didn't find answer without Varlink, and didn't try Varlink because was configured to off. */
                         log_debug_errno(r, "No entries found. (Didn't check via Varlink.)");
                 else if (r == -ESRCH) /* ESRCH → Couldn't find any suitable entry, but we checked all sources */
@@ -404,7 +449,7 @@ static int display_user(int argc, char *argv[], void *userdata) {
                         for (;;) {
                                 _cleanup_(user_record_unrefp) UserRecord *ur = NULL;
 
-                                r = userdb_iterator_get(iterator, &ur);
+                                r = userdb_iterator_get(iterator, &match, &ur);
                                 if (r == -ESRCH)
                                         break;
                                 if (r == -EHOSTDOWN)
@@ -425,20 +470,23 @@ static int display_user(int argc, char *argv[], void *userdata) {
         }
 
         if (table) {
-                _cleanup_(uid_range_freep) UIDRange *uid_range = NULL;
-                int boundary_lines, uid_map_lines;
+                int boundary_lines = 0, uid_map_lines = 0;
 
-                r = uid_range_load_userns(&uid_range, "/proc/self/uid_map");
-                if (r < 0)
-                        log_debug_errno(r, "Failed to load /proc/self/uid_map, ignoring: %m");
+                if (arg_boundaries) {
+                        _cleanup_(uid_range_freep) UIDRange *uid_range = NULL;
 
-                boundary_lines = table_add_uid_boundaries(table, uid_range);
-                if (boundary_lines < 0)
-                        return boundary_lines;
+                        r = uid_range_load_userns(/* path = */ NULL, UID_RANGE_USERNS_INSIDE, &uid_range);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to load /proc/self/uid_map, ignoring: %m");
 
-                uid_map_lines = table_add_uid_map(table, uid_range, add_unavailable_uid);
-                if (uid_map_lines < 0)
-                        return uid_map_lines;
+                        boundary_lines = table_add_uid_boundaries(table, uid_range);
+                        if (boundary_lines < 0)
+                                return boundary_lines;
+
+                        uid_map_lines = table_add_uid_map(table, uid_range, add_unavailable_uid);
+                        if (uid_map_lines < 0)
+                                return uid_map_lines;
+                }
 
                 if (!table_isempty(table)) {
                         r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
@@ -485,7 +533,7 @@ static int show_group(GroupRecord *gr, Table *table) {
         }
 
         case OUTPUT_JSON:
-                json_variant_dump(gr->json, arg_json_format_flags, NULL, 0);
+                sd_json_variant_dump(gr->json, arg_json_format_flags, NULL, NULL);
                 break;
 
         case OUTPUT_FRIENDLY:
@@ -527,23 +575,29 @@ static int show_group(GroupRecord *gr, Table *table) {
 }
 
 static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
-        int r;
+        int r, n_added = 0;
 
         assert(table);
 
-        for (size_t i = 0; i < ELEMENTSOF(uid_range_table); i++) {
+        FOREACH_ELEMENT(i, uid_range_table) {
                 _cleanup_free_ char *name = NULL, *comment = NULL;
 
-                if (!uid_range_covers(p, uid_range_table[i].first, uid_range_table[i].last))
+                if (!BIT_SET(arg_disposition_mask, i->disposition))
+                        continue;
+
+                if (!uid_range_covers(p, i->first, i->last - i->first + 1))
+                        continue;
+
+                if (i->test && !i->test())
                         continue;
 
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_DOWN),
-                               " begin ", uid_range_table[i].name, " groups ",
+                               " begin ", i->name, " groups ",
                                special_glyph(SPECIAL_GLYPH_ARROW_DOWN));
                 if (!name)
                         return log_oom();
 
-                comment = strjoin("First ", uid_range_table[i].name, " group");
+                comment = strjoin("First ", i->name, " group");
                 if (!comment)
                         return log_oom();
 
@@ -552,9 +606,9 @@ static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_STRING, special_glyph(SPECIAL_GLYPH_TREE_TOP),
                                 TABLE_STRING, name,
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_STRING, user_disposition_to_string(uid_range_table[i].disposition),
+                                TABLE_STRING, user_disposition_to_string(i->disposition),
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_GID, uid_range_table[i].first,
+                                TABLE_GID, i->first,
                                 TABLE_SET_COLOR, ansi_grey(),
                                 TABLE_STRING, comment,
                                 TABLE_SET_COLOR, ansi_grey(),
@@ -564,13 +618,13 @@ static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
 
                 free(name);
                 name = strjoin(special_glyph(SPECIAL_GLYPH_ARROW_UP),
-                               " end ", uid_range_table[i].name, " groups ",
+                               " end ", i->name, " groups ",
                                special_glyph(SPECIAL_GLYPH_ARROW_UP));
                 if (!name)
                         return log_oom();
 
                 free(comment);
-                comment = strjoin("Last ", uid_range_table[i].name, " group");
+                comment = strjoin("Last ", i->name, " group");
                 if (!comment)
                         return log_oom();
 
@@ -579,18 +633,20 @@ static int table_add_gid_boundaries(Table *table, const UIDRange *p) {
                                 TABLE_STRING, special_glyph(SPECIAL_GLYPH_TREE_RIGHT),
                                 TABLE_STRING, name,
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_STRING, user_disposition_to_string(uid_range_table[i].disposition),
+                                TABLE_STRING, user_disposition_to_string(i->disposition),
                                 TABLE_SET_COLOR, ansi_grey(),
-                                TABLE_GID, uid_range_table[i].last,
+                                TABLE_GID, i->last,
                                 TABLE_SET_COLOR, ansi_grey(),
                                 TABLE_STRING, comment,
                                 TABLE_SET_COLOR, ansi_grey(),
                                 TABLE_INT, 1); /* sort after any other entry with the same GID */
                 if (r < 0)
                         return table_log_add_error(r);
+
+                n_added += 2;
         }
 
-        return ELEMENTSOF(uid_range_table) * 2;
+        return n_added;
 }
 
 static int add_unavailable_gid(Table *table, uid_t start, uid_t end) {
@@ -650,7 +706,7 @@ static int display_group(int argc, char *argv[], void *userdata) {
         int ret = 0, r;
 
         if (arg_output < 0)
-                arg_output = argc > 1 ? OUTPUT_FRIENDLY : OUTPUT_TABLE;
+                arg_output = argc > 1 && !arg_fuzzy ? OUTPUT_FRIENDLY : OUTPUT_TABLE;
 
         if (arg_output == OUTPUT_TABLE) {
                 table = table_new(" ", "name", "disposition", "gid", "description", "order");
@@ -660,28 +716,33 @@ static int display_group(int argc, char *argv[], void *userdata) {
                 (void) table_set_align_percent(table, table_get_cell(table, 0, 3), 100);
                 table_set_ersatz_string(table, TABLE_ERSATZ_DASH);
                 (void) table_set_sort(table, (size_t) 3, (size_t) 5);
-                (void) table_set_display(table, (size_t) 0, (size_t) 1, (size_t) 2, (size_t) 3, (size_t) 4);
+                (void) table_hide_column_from_display(table, (size_t) 5);
+                if (!arg_boundaries)
+                        (void) table_hide_column_from_display(table, (size_t) 0);
         }
 
-        if (argc > 1)
+        _cleanup_(userdb_match_done) UserDBMatch match = {
+                .disposition_mask = arg_disposition_mask,
+                .gid_min = arg_uid_min,
+                .gid_max = arg_uid_max,
+        };
+
+        if (argc > 1 && !arg_fuzzy)
                 STRV_FOREACH(i, argv + 1) {
                         _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
-                        gid_t gid;
 
-                        if (parse_gid(*i, &gid) >= 0)
-                                r = groupdb_by_gid(gid, arg_userdb_flags, &gr);
-                        else
-                                r = groupdb_by_name(*i, arg_userdb_flags, &gr);
+                        r = groupdb_by_name(*i, &match, arg_userdb_flags|USERDB_PARSE_NUMERIC, &gr);
                         if (r < 0) {
                                 if (r == -ESRCH)
                                         log_error_errno(r, "Group %s does not exist.", *i);
                                 else if (r == -EHOSTDOWN)
                                         log_error_errno(r, "Selected group database service is not available for this request.");
+                                else if (r == -ENOEXEC)
+                                        log_error_errno(r, "Group '%s' exists but does not match specified filter.", *i);
                                 else
                                         log_error_errno(r, "Failed to find group %s: %m", *i);
 
-                                if (ret >= 0)
-                                        ret = r;
+                                RET_GATHER(ret, r);
                         } else {
                                 if (draw_separator && arg_output == OUTPUT_FRIENDLY)
                                         putchar('\n');
@@ -694,9 +755,14 @@ static int display_group(int argc, char *argv[], void *userdata) {
                         }
                 }
         else {
-                _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
+                if (argc > 1) {
+                        match.fuzzy_names = strv_copy(strv_skip(argv, 1));
+                        if (!match.fuzzy_names)
+                                return log_oom();
+                }
 
-                r = groupdb_all(arg_userdb_flags, &iterator);
+                _cleanup_(userdb_iterator_freep) UserDBIterator *iterator = NULL;
+                r = groupdb_all(&match, arg_userdb_flags, &iterator);
                 if (r == -ENOLINK)
                         log_debug_errno(r, "No entries found. (Didn't check via Varlink.)");
                 else if (r == -ESRCH)
@@ -707,7 +773,7 @@ static int display_group(int argc, char *argv[], void *userdata) {
                         for (;;) {
                                 _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
 
-                                r = groupdb_iterator_get(iterator, &gr);
+                                r = groupdb_iterator_get(iterator, &match, &gr);
                                 if (r == -ESRCH)
                                         break;
                                 if (r == -EHOSTDOWN)
@@ -728,20 +794,22 @@ static int display_group(int argc, char *argv[], void *userdata) {
         }
 
         if (table) {
-                _cleanup_(uid_range_freep) UIDRange *gid_range = NULL;
-                int boundary_lines, gid_map_lines;
+                int boundary_lines = 0, gid_map_lines = 0;
 
-                r = uid_range_load_userns(&gid_range, "/proc/self/gid_map");
-                if (r < 0)
-                        log_debug_errno(r, "Failed to load /proc/self/gid_map, ignoring: %m");
+                if (arg_boundaries) {
+                        _cleanup_(uid_range_freep) UIDRange *gid_range = NULL;
+                        r = uid_range_load_userns(/* path = */ NULL, GID_RANGE_USERNS_INSIDE, &gid_range);
+                        if (r < 0)
+                                log_debug_errno(r, "Failed to load /proc/self/gid_map, ignoring: %m");
 
-                boundary_lines = table_add_gid_boundaries(table, gid_range);
-                if (boundary_lines < 0)
-                        return boundary_lines;
+                        boundary_lines = table_add_gid_boundaries(table, gid_range);
+                        if (boundary_lines < 0)
+                                return boundary_lines;
 
-                gid_map_lines = table_add_uid_map(table, gid_range, add_unavailable_gid);
-                if (gid_map_lines < 0)
-                        return gid_map_lines;
+                        gid_map_lines = table_add_uid_map(table, gid_range, add_unavailable_gid);
+                        if (gid_map_lines < 0)
+                                return gid_map_lines;
+                }
 
                 if (!table_isempty(table)) {
                         r = table_print_with_pager(table, arg_json_format_flags, arg_pager_flags, arg_legend);
@@ -779,15 +847,16 @@ static int show_membership(const char *user, const char *group, Table *table) {
                 break;
 
         case OUTPUT_JSON: {
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
 
-                r = json_build(&v, JSON_BUILD_OBJECT(
-                                               JSON_BUILD_PAIR("user", JSON_BUILD_STRING(user)),
-                                               JSON_BUILD_PAIR("group", JSON_BUILD_STRING(group))));
+                r = sd_json_buildo(
+                                &v,
+                                SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(user)),
+                                SD_JSON_BUILD_PAIR("group", SD_JSON_BUILD_STRING(group)));
                 if (r < 0)
                         return log_error_errno(r, "Failed to build JSON object: %m");
 
-                json_variant_dump(v, arg_json_format_flags, NULL, NULL);
+                sd_json_variant_dump(v, arg_json_format_flags, NULL, NULL);
                 break;
         }
 
@@ -951,7 +1020,7 @@ static int display_services(int argc, char *argv[], void *userdata) {
                 r = table_add_many(t,
                                    TABLE_STRING, de->d_name,
                                    TABLE_STRING, no ?: "yes",
-                                   TABLE_SET_COLOR, no ? ansi_highlight_red() : ansi_highlight_green());
+                                   TABLE_SET_COLOR, ansi_highlight_green_red(!no));
                 if (r < 0)
                         return table_log_add_error(r);
         }
@@ -1005,7 +1074,7 @@ static int ssh_authorized_keys(int argc, char *argv[], void *userdata) {
                 chain_invocation = NULL;
         }
 
-        r = userdb_by_name(argv[1], arg_userdb_flags, &ur);
+        r = userdb_by_name(argv[1], /* match= */ NULL, arg_userdb_flags, &ur);
         if (r == -ESRCH)
                 log_error_errno(r, "User %s does not exist.", argv[1]);
         else if (r == -EHOSTDOWN)
@@ -1089,6 +1158,15 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --multiplexer=BOOL      Control whether to use the multiplexer\n"
                "     --json=pretty|short     JSON output mode\n"
                "     --chain                 Chain another command\n"
+               "     --uid-min=ID            Filter by minimum UID/GID (default 0)\n"
+               "     --uid-max=ID            Filter by maximum UID/GID (default 4294967294)\n"
+               "  -z --fuzzy                 Do a fuzzy name search\n"
+               "     --disposition=VALUE     Filter by disposition\n"
+               "  -I                         Equivalent to --disposition=intrinsic\n"
+               "  -S                         Equivalent to --disposition=system\n"
+               "  -R                         Equivalent to --disposition=regular\n"
+               "     --boundaries=BOOL       Show/hide UID/GID range boundaries in output\n"
+               "  -B                         Equivalent to --boundaries=no\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -1112,6 +1190,10 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_MULTIPLEXER,
                 ARG_JSON,
                 ARG_CHAIN,
+                ARG_UID_MIN,
+                ARG_UID_MAX,
+                ARG_DISPOSITION,
+                ARG_BOUNDARIES,
         };
 
         static const struct option options[] = {
@@ -1128,6 +1210,11 @@ static int parse_argv(int argc, char *argv[]) {
                 { "multiplexer",  required_argument, NULL, ARG_MULTIPLEXER  },
                 { "json",         required_argument, NULL, ARG_JSON         },
                 { "chain",        no_argument,       NULL, ARG_CHAIN        },
+                { "uid-min",      required_argument, NULL, ARG_UID_MIN      },
+                { "uid-max",      required_argument, NULL, ARG_UID_MAX      },
+                { "fuzzy",        no_argument,       NULL, 'z'              },
+                { "disposition",  required_argument, NULL, ARG_DISPOSITION  },
+                { "boundaries",   required_argument, NULL, ARG_BOUNDARIES   },
                 {}
         };
 
@@ -1158,7 +1245,7 @@ static int parse_argv(int argc, char *argv[]) {
                 int c;
 
                 c = getopt_long(argc, argv,
-                                arg_chain ? "+hjs:N" : "hjs:N", /* When --chain was used disable parsing of further switches */
+                                arg_chain ? "+hjs:NISRzB" : "hjs:NISRzB", /* When --chain was used disable parsing of further switches */
                                 options, NULL);
                 if (c < 0)
                         break;
@@ -1199,7 +1286,7 @@ static int parse_argv(int argc, char *argv[]) {
                         } else
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid --output= mode: %s", optarg);
 
-                        arg_json_format_flags = arg_output == OUTPUT_JSON ? JSON_FORMAT_PRETTY|JSON_FORMAT_COLOR_AUTO : JSON_FORMAT_OFF;
+                        arg_json_format_flags = arg_output == OUTPUT_JSON ? SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR_AUTO : SD_JSON_FORMAT_OFF;
                         break;
 
                 case ARG_JSON:
@@ -1207,11 +1294,11 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r <= 0)
                                 return r;
 
-                        arg_output = FLAGS_SET(arg_json_format_flags, JSON_FORMAT_OFF) ? _OUTPUT_INVALID : OUTPUT_JSON;
+                        arg_output = sd_json_format_enabled(arg_json_format_flags) ? OUTPUT_JSON : _OUTPUT_INVALID;
                         break;
 
                 case 'j':
-                        arg_json_format_flags = JSON_FORMAT_PRETTY|JSON_FORMAT_COLOR_AUTO;
+                        arg_json_format_flags = SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR_AUTO;
                         arg_output = OUTPUT_JSON;
                         break;
 
@@ -1219,21 +1306,15 @@ static int parse_argv(int argc, char *argv[]) {
                         if (isempty(optarg))
                                 arg_services = strv_free(arg_services);
                         else {
-                                _cleanup_strv_free_ char **l = NULL;
-
-                                l = strv_split(optarg, ":");
-                                if (!l)
-                                        return log_oom();
-
-                                r = strv_extend_strv(&arg_services, l, true);
+                                r = strv_split_and_extend(&arg_services, optarg, ":", /* filter_duplicates = */ true);
                                 if (r < 0)
-                                        return log_oom();
+                                        return log_error_errno(r, "Failed to parse -s/--service= argument: %m");
                         }
 
                         break;
 
                 case 'N':
-                        arg_userdb_flags |= USERDB_EXCLUDE_NSS|USERDB_DONT_SYNTHESIZE;
+                        arg_userdb_flags |= USERDB_EXCLUDE_NSS|USERDB_DONT_SYNTHESIZE_INTRINSIC|USERDB_DONT_SYNTHESIZE_FOREIGN;
                         break;
 
                 case ARG_WITH_NSS:
@@ -1265,7 +1346,7 @@ static int parse_argv(int argc, char *argv[]) {
                         if (r < 0)
                                 return r;
 
-                        SET_FLAG(arg_userdb_flags, USERDB_DONT_SYNTHESIZE, !r);
+                        SET_FLAG(arg_userdb_flags, USERDB_DONT_SYNTHESIZE_INTRINSIC|USERDB_DONT_SYNTHESIZE_FOREIGN, !r);
                         break;
 
                 case ARG_MULTIPLEXER:
@@ -1280,6 +1361,65 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_chain = true;
                         break;
 
+                case ARG_DISPOSITION: {
+                        UserDisposition d = user_disposition_from_string(optarg);
+                        if (d < 0)
+                                return log_error_errno(d, "Unknown user disposition: %s", optarg);
+
+                        if (arg_disposition_mask == UINT64_MAX)
+                                arg_disposition_mask = 0;
+
+                        arg_disposition_mask |= UINT64_C(1) << d;
+                        break;
+                }
+
+                case 'I':
+                        if (arg_disposition_mask == UINT64_MAX)
+                                arg_disposition_mask = 0;
+
+                        arg_disposition_mask |= UINT64_C(1) << USER_INTRINSIC;
+                        break;
+
+                case 'S':
+                        if (arg_disposition_mask == UINT64_MAX)
+                                arg_disposition_mask = 0;
+
+                        arg_disposition_mask |= UINT64_C(1) << USER_SYSTEM;
+                        break;
+
+                case 'R':
+                        if (arg_disposition_mask == UINT64_MAX)
+                                arg_disposition_mask = 0;
+
+                        arg_disposition_mask |= UINT64_C(1) << USER_REGULAR;
+                        break;
+
+                case ARG_UID_MIN:
+                        r = parse_uid(optarg, &arg_uid_min);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --uid-min= value: %s", optarg);
+                        break;
+
+                case ARG_UID_MAX:
+                        r = parse_uid(optarg, &arg_uid_max);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to parse --uid-max= value: %s", optarg);
+                        break;
+
+                case 'z':
+                        arg_fuzzy = true;
+                        break;
+
+                case ARG_BOUNDARIES:
+                        r = parse_boolean_argument("boundaries", optarg, &arg_boundaries);
+                        if (r < 0)
+                                return r;
+                        break;
+
+                case 'B':
+                        arg_boundaries = false;
+                        break;
+
                 case '?':
                         return -EINVAL;
 
@@ -1287,6 +1427,13 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached();
                 }
         }
+
+        if (arg_uid_min > arg_uid_max)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Minimum UID/GID " UID_FMT " is above maximum UID/GID " UID_FMT ", refusing.", arg_uid_min, arg_uid_max);
+
+        /* If not mask was specified, use the all bits on mask */
+        if (arg_disposition_mask == UINT64_MAX)
+                arg_disposition_mask = USER_DISPOSITION_MASK_ALL;
 
         return 1;
 }

@@ -539,9 +539,9 @@
     <function>sd_bus_creds_get_selinux_context()</function>,
     <function>sd_bus_creds_get_audit_session_id()</function>,
     <function>sd_bus_creds_get_audit_login_uid()</function>,
-    <function>sd_bus_creds_get_unique_name()</function>, and
-    <function>sd_bus_creds_get_well_known_names()</function> were added in version 209.</para>
-    <para><function>sd_bus_creds_get_ppid()</function>,
+    <function>sd_bus_creds_get_unique_name()</function>,
+    <function>sd_bus_creds_get_well_known_names()</function>,
+    <function>sd_bus_creds_get_ppid()</function>,
     <function>sd_bus_creds_get_uid()</function>,
     <function>sd_bus_creds_get_euid()</function>,
     <function>sd_bus_creds_get_suid()</function>,
@@ -550,9 +550,9 @@
     <function>sd_bus_creds_get_sgid()</function>,
     <function>sd_bus_creds_get_fsgid()</function>,
     <function>sd_bus_creds_get_supplementary_gids()</function>,
-    <function>sd_bus_creds_get_tty()</function>, and
-    <function>sd_bus_creds_get_description()</function> were added in version 220.</para>
-    <para><function>sd_bus_creds_get_user_slice()</function> was added in version 223.</para>
+    <function>sd_bus_creds_get_tty()</function>,
+    <function>sd_bus_creds_get_description()</function>, and
+    <function>sd_bus_creds_get_user_slice()</function> were added in version 221.</para>
     <para><function>sd_bus_creds_get_pidfd_dup()</function> was added in version 256.</para>
   </refsect1>
 
@@ -562,7 +562,7 @@
     <para><simplelist type="inline">
       <member><citerefentry><refentrytitle>systemd</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>sd-bus</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
-      <member><citerefentry><refentrytitle>sd_bus_creds_new_from_pid</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>sd_bus_creds_new_from_pid</refentrytitle><manvolnum>3</manvolnum></citerefentry></member>
       <member><citerefentry project='man-pages'><refentrytitle>fork</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
       <member><citerefentry project='man-pages'><refentrytitle>execve</refentrytitle><manvolnum>2</manvolnum></citerefentry></member>
       <member><citerefentry project='man-pages'><refentrytitle>credentials</refentrytitle><manvolnum>7</manvolnum></citerefentry></member>

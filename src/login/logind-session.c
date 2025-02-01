@@ -29,6 +29,7 @@
 #include "logind-session-dbus.h"
 #include "logind-session.h"
 #include "logind-user-dbus.h"
+#include "logind-varlink.h"
 #include "mkdir-label.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -101,6 +102,7 @@ static int session_watch_pidfd(Session *s) {
         assert(s);
         assert(s->manager);
         assert(pidref_is_set(&s->leader));
+        assert(!s->leader_pidfd_event_source);
 
         if (s->leader.fd < 0)
                 return 0;
@@ -146,8 +148,10 @@ Session* session_free(Session *s) {
 
         sd_event_source_unref(s->stop_on_idle_event_source);
 
-        if (s->in_gc_queue)
+        if (s->in_gc_queue) {
+                assert(s->manager);
                 LIST_REMOVE(gc_queue, s->manager->session_gc_queue, s);
+        }
 
         sd_event_source_unref(s->timer_event_source);
 
@@ -188,6 +192,8 @@ Session* session_free(Session *s) {
 
         sd_bus_message_unref(s->create_message);
         sd_bus_message_unref(s->upgrade_message);
+
+        sd_varlink_unref(s->create_link);
 
         free(s->tty);
         free(s->display);
@@ -251,7 +257,7 @@ int session_set_leader_consume(Session *s, PidRef _leader) {
                         s->leader_fd_saved = true;
         }
 
-        (void) audit_session_from_pid(s->leader.pid, &s->audit_id);
+        (void) audit_session_from_pid(&s->leader, &s->audit_id);
 
         return 1;
 }
@@ -746,15 +752,15 @@ static int session_start_scope(Session *s, sd_bus_message *properties, sd_bus_er
                         s->user->slice,
                         description,
                         /* These should have been pulled in explicitly in user_start(). Just to be sure. */
-                        STRV_MAKE_CONST(s->user->runtime_dir_unit,
-                                        SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) ? s->user->service_manager_unit : NULL),
+                        /* requires = */ STRV_MAKE_CONST(s->user->runtime_dir_unit),
+                        /* wants = */ STRV_MAKE_CONST(SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) ? s->user->service_manager_unit : NULL),
                         /* We usually want to order session scopes after systemd-user-sessions.service
                          * since the unit is used as login session barrier for unprivileged users. However
                          * the barrier doesn't apply for root as sysadmin should always be able to log in
                          * (and without waiting for any timeout to expire) in case something goes wrong
                          * during the boot process. */
-                        STRV_MAKE_CONST("systemd-logind.service",
-                                        SESSION_CLASS_IS_EARLY(s->class) ? NULL : "systemd-user-sessions.service"),
+                        /* extra_after = */ STRV_MAKE_CONST("systemd-logind.service",
+                                                            SESSION_CLASS_IS_EARLY(s->class) ? NULL : "systemd-user-sessions.service"),
                         user_record_home_directory(s->user->user_record),
                         properties,
                         error,
@@ -853,7 +859,13 @@ int session_start(Session *s, sd_bus_message *properties, sd_bus_error *error) {
                    "SESSION_ID=%s", s->id,
                    "USER_ID=%s", s->user->user_record->user_name,
                    "LEADER="PID_FMT, s->leader.pid,
-                   LOG_MESSAGE("New session %s of user %s.", s->id, s->user->user_record->user_name));
+                   "CLASS=%s", session_class_to_string(s->class),
+                   "TYPE=%s", session_type_to_string(s->type),
+                   LOG_MESSAGE("New session '%s' of user '%s' with class '%s' and type '%s'.",
+                               s->id,
+                               s->user->user_record->user_name,
+                               session_class_to_string(s->class),
+                               session_type_to_string(s->type)));
 
         if (!dual_timestamp_is_set(&s->timestamp))
                 dual_timestamp_now(&s->timestamp);
@@ -1094,6 +1106,9 @@ int session_get_idle_hint(Session *s, dual_timestamp *t) {
         int r;
 
         assert(s);
+
+        if (!SESSION_CLASS_CAN_IDLE(s->class))
+                return false;
 
         /* Graphical sessions have an explicit idle hint */
         if (SESSION_TYPE_IS_GRAPHICAL(s->type)) {
@@ -1381,13 +1396,27 @@ SessionState session_get_state(Session *s) {
         return SESSION_ONLINE;
 }
 
-int session_kill(Session *s, KillWho who, int signo) {
+int session_kill(Session *s, KillWhom whom, int signo, sd_bus_error *error) {
         assert(s);
 
-        if (!s->scope)
-                return -ESRCH;
+        switch (whom) {
 
-        return manager_kill_unit(s->manager, s->scope, who, signo, NULL);
+        case KILL_ALL:
+                if (!SESSION_CLASS_WANTS_SCOPE(s->class))
+                        return sd_bus_error_setf(error, SD_BUS_ERROR_NOT_SUPPORTED,
+                                                 "Session '%s' has no associated scope", s->id);
+
+                if (!s->scope)
+                        return sd_bus_error_set_errnof(error, ESRCH, "Scope for session '%s' not active", s->id);
+
+                return manager_kill_unit(s->manager, s->scope, KILL_ALL, signo, error);
+
+        case KILL_LEADER:
+                return pidref_kill(&s->leader, signo);
+
+        default:
+                assert_not_reached();
+        }
 }
 
 static int session_open_vt(Session *s, bool reopen) {
@@ -1628,6 +1657,35 @@ void session_drop_controller(Session *s) {
         session_restore_vt(s);
 }
 
+bool session_job_pending(Session *s) {
+        assert(s);
+        assert(s->user);
+
+        /* Check if we have some jobs enqueued and not finished yet. Each time we get JobRemoved signal about
+         * relevant units, session_send_create_reply and hence us is called (see match_job_removed).
+         * Note that we don't care about job result here. */
+
+        return s->scope_job ||
+               s->user->runtime_dir_job ||
+               (SESSION_CLASS_WANTS_SERVICE_MANAGER(s->class) && s->user->service_manager_job);
+}
+
+int session_send_create_reply(Session *s, const sd_bus_error *error) {
+        int r;
+
+        assert(s);
+
+        /* If error occurred, return it immediately. Otherwise let's wait for all jobs to finish before
+         * continuing. */
+        if (!sd_bus_error_is_set(error) && session_job_pending(s))
+                return 0;
+
+        r = 0;
+        RET_GATHER(r, session_send_create_reply_bus(s, error));
+        RET_GATHER(r, session_send_create_reply_varlink(s, error));
+        return r;
+}
+
 static const char* const session_state_table[_SESSION_STATE_MAX] = {
         [SESSION_OPENING] = "opening",
         [SESSION_ONLINE]  = "online",
@@ -1652,22 +1710,25 @@ static const char* const session_class_table[_SESSION_CLASS_MAX] = {
         [SESSION_USER]              = "user",
         [SESSION_USER_EARLY]        = "user-early",
         [SESSION_USER_INCOMPLETE]   = "user-incomplete",
+        [SESSION_USER_LIGHT]        = "user-light",
+        [SESSION_USER_EARLY_LIGHT]  = "user-early-light",
         [SESSION_GREETER]           = "greeter",
         [SESSION_LOCK_SCREEN]       = "lock-screen",
         [SESSION_BACKGROUND]        = "background",
         [SESSION_BACKGROUND_LIGHT]  = "background-light",
         [SESSION_MANAGER]           = "manager",
         [SESSION_MANAGER_EARLY]     = "manager-early",
+        [SESSION_NONE]              = "none",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(session_class, SessionClass);
 
-static const char* const kill_who_table[_KILL_WHO_MAX] = {
+static const char* const kill_whom_table[_KILL_WHOM_MAX] = {
         [KILL_LEADER] = "leader",
         [KILL_ALL]    = "all",
 };
 
-DEFINE_STRING_TABLE_LOOKUP(kill_who, KillWho);
+DEFINE_STRING_TABLE_LOOKUP(kill_whom, KillWhom);
 
 static const char* const tty_validity_table[_TTY_VALIDITY_MAX] = {
         [TTY_FROM_PAM]          = "from-pam",

@@ -4,6 +4,7 @@ shared_sources = files(
         'acl-util.c',
         'acpi-fpdt.c',
         'apparmor-util.c',
+        'ask-password-agent.c',
         'ask-password-api.c',
         'async.c',
         'barrier.c',
@@ -11,6 +12,7 @@ shared_sources = files(
         'battery-util.c',
         'binfmt-util.c',
         'bitmap.c',
+        'blockdev-list.c',
         'blockdev-util.c',
         'bond-util.c',
         'boot-entry.c',
@@ -69,7 +71,7 @@ shared_sources = files(
         'exit-status.c',
         'extension-util.c',
         'fdset.c',
-        'fileio-label.c',
+        'fido2-util.c',
         'find-esp.c',
         'firewall-util-nft.c',
         'firewall-util.c',
@@ -96,10 +98,9 @@ shared_sources = files(
         'journal-file-util.c',
         'journal-importer.c',
         'journal-util.c',
-        'json.c',
         'kbd-util.c',
+        'kernel-config.c',
         'kernel-image.c',
-        'keyring-util.c',
         'killall.c',
         'label-util.c',
         'libarchive-util.c',
@@ -118,6 +119,7 @@ shared_sources = files(
         'macvlan-util.c',
         'mkdir-label.c',
         'mkfs-util.c',
+        'module-util.c',
         'mount-setup.c',
         'mount-util.c',
         'net-condition.c',
@@ -125,6 +127,7 @@ shared_sources = files(
         'netif-sriov.c',
         'netif-util.c',
         'nsflags.c',
+        'nsresource.c',
         'numa-util.c',
         'open-file.c',
         'openssl-util.c',
@@ -139,6 +142,8 @@ shared_sources = files(
         'pe-binary.c',
         'pkcs11-util.c',
         'plymouth-util.c',
+        'polkit-agent.c',
+        'portable-util.c',
         'pretty-print.c',
         'capsule-util.c',
         'ptyfwd.c',
@@ -153,12 +158,12 @@ shared_sources = files(
         'selinux-util.c',
         'serialize.c',
         'service-util.c',
+        'shift-uid.c',
         'sleep-config.c',
         'smack-util.c',
+        'smbios11.c',
         'socket-label.c',
         'socket-netlink.c',
-        'spawn-ask-password-agent.c',
-        'spawn-polkit-agent.c',
         'specifier.c',
         'switch-root.c',
         'tmpfile-util-label.c',
@@ -166,29 +171,36 @@ shared_sources = files(
         'tpm2-util.c',
         'tpm2-event-log.c',
         'udev-util.c',
+        'unit-file.c',
         'user-record-nss.c',
         'user-record-show.c',
         'user-record.c',
         'userdb-dropin.c',
         'userdb.c',
-        'varlink.c',
-        'varlink-idl.c',
-        'varlink-io.systemd.c',
+        'varlink-idl-common.c',
+        'varlink-io.systemd.AskPassword.c',
         'varlink-io.systemd.BootControl.c',
         'varlink-io.systemd.Credentials.c',
         'varlink-io.systemd.Hostname.c',
+        'varlink-io.systemd.Import.c',
         'varlink-io.systemd.Journal.c',
+        'varlink-io.systemd.Login.c',
+        'varlink-io.systemd.Machine.c',
+        'varlink-io.systemd.MachineImage.c',
         'varlink-io.systemd.ManagedOOM.c',
+        'varlink-io.systemd.MountFileSystem.c',
+        'varlink-io.systemd.NamespaceResource.c',
         'varlink-io.systemd.Network.c',
         'varlink-io.systemd.PCRExtend.c',
         'varlink-io.systemd.PCRLock.c',
         'varlink-io.systemd.Resolve.c',
         'varlink-io.systemd.Resolve.Monitor.c',
+        'varlink-io.systemd.Udev.c',
         'varlink-io.systemd.UserDatabase.c',
         'varlink-io.systemd.oom.c',
         'varlink-io.systemd.service.c',
         'varlink-io.systemd.sysext.c',
-        'varlink-org.varlink.service.c',
+        'varlink-serialize.c',
         'verb-log-control.c',
         'verbs.c',
         'vlan-util.c',
@@ -236,16 +248,8 @@ if conf.get('HAVE_LIBBPF') == 1
         shared_sources += files('bpf-link.c')
 endif
 
-if conf.get('HAVE_KMOD') == 1
-        shared_sources += files('module-util.c')
-endif
-
 if conf.get('HAVE_PAM') == 1
         shared_sources += files('pam-util.c')
-endif
-
-if conf.get('ENABLE_NSCD') == 1
-        shared_sources += files('nscd-flush.c')
 endif
 
 if conf.get('HAVE_LIBFIDO2') == 1 and conf.get('HAVE_LIBCRYPTSETUP') == 1
@@ -299,7 +303,7 @@ shared_sources += shared_generated_gperf_headers
 fname = 'ethtool-link-mode.h'
 ethtool_link_mode_h = custom_target(
         fname,
-        input : ['ethtool-link-mode.py', 'linux/ethtool.h'],
+        input : ['ethtool-link-mode.py', '../basic/linux/ethtool.h'],
         output : fname,
         command : [python, '@INPUT0@', '--header', cpp, '@INPUT1@'],
         capture : true)
@@ -308,7 +312,7 @@ shared_sources += ethtool_link_mode_h
 fname = 'ethtool-link-mode.xml'
 ethtool_link_mode_xml = custom_target(
         fname,
-        input : ['ethtool-link-mode.py', 'linux/ethtool.h'],
+        input : ['ethtool-link-mode.py', '../basic/linux/ethtool.h'],
         output : fname,
         command : [python, '@INPUT0@', '--xml', cpp, '@INPUT1@'],
         capture : true)
@@ -324,7 +328,7 @@ libshared_deps = [threads,
                   libdl,
                   libgcrypt,
                   libiptc_cflags,
-                  libkmod,
+                  libkmod_cflags,
                   liblz4_cflags,
                   libmount,
                   libopenssl,
@@ -357,7 +361,7 @@ libshared = shared_library(
                      '-Wl,--version-script=' + libshared_sym_path],
         link_depends : libshared_sym_path,
         link_whole : [libshared_static,
-                      libbasic,
+                      libbasic_static,
                       libsystemd_static],
         dependencies : [libshared_deps,
                         userspace],

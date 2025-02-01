@@ -4,6 +4,7 @@
 
 #include "sd-event.h"
 
+#include "ansi-color.h"
 #include "fileio.h"
 #include "journalctl.h"
 #include "journalctl-filter.h"
@@ -12,7 +13,7 @@
 #include "logs-show.h"
 #include "terminal-util.h"
 
-#define PROCESS_INOTIFY_INTERVAL 1024   /* Every 1,024 messages processed */
+#define PROCESS_INOTIFY_INTERVAL 1024   /* Every 1024 messages processed */
 
 typedef struct Context {
         sd_journal *journal;

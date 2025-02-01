@@ -59,8 +59,7 @@
 
 static const struct in6_addr local_address =
         { { { 0xfe, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, } } };
-static const struct in6_addr mcast_address =
-        IN6ADDR_ALL_DHCP6_RELAY_AGENTS_AND_SERVERS_INIT;
+static const struct in6_addr mcast_address = IN6_ADDR_ALL_DHCP6_RELAY_AGENTS_AND_SERVERS;
 static const struct in6_addr ia_na_address1 = { { { IA_NA_ADDRESS1_BYTES } } };
 static const struct in6_addr ia_na_address2 = { { { IA_NA_ADDRESS2_BYTES } } };
 static const struct in6_addr ia_pd_prefix1 = { { { IA_PD_PREFIX1_BYTES } } };
@@ -166,9 +165,8 @@ TEST(parse_domain) {
         domain = mfree(domain);
 
         data = (uint8_t []) { 4, 't', 'e', 's', 't' };
-        assert_se(dhcp6_option_parse_domainname(data, 5, &domain) >= 0);
-        assert_se(domain);
-        assert_se(streq(domain, "test"));
+        ASSERT_OK(dhcp6_option_parse_domainname(data, 5, &domain));
+        ASSERT_STREQ(domain, "test");
         domain = mfree(domain);
 
         data = (uint8_t []) { 0 };
@@ -746,8 +744,8 @@ static const uint8_t msg_reply[] = {
         0x00, SD_DHCP6_OPTION_DOMAIN, 0x00, 0x0b,
         0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a', 0x00,
         /* Client FQDN */
-        0x00, SD_DHCP6_OPTION_CLIENT_FQDN, 0x00, 0x12,
-        0x01, 0x06, 'c', 'l', 'i', 'e', 'n', 't', 0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a',
+        0x00, SD_DHCP6_OPTION_CLIENT_FQDN, 0x00, 0x13,
+        0x01, 0x06, 'c', 'l', 'i', 'e', 'n', 't', 0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a', 0x00,
         /* Vendor specific options */
         0x00, SD_DHCP6_OPTION_VENDOR_OPTS, 0x00, 0x09,
         0x00, 0x00, 0x00, 0x20, 0x00, 0xf7, 0x00, 0x01, VENDOR_SUBOPTION_BYTES,
@@ -828,8 +826,8 @@ static const uint8_t msg_advertise[] = {
         0x00, SD_DHCP6_OPTION_DOMAIN, 0x00, 0x0b,
         0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a', 0x00,
         /* Client FQDN */
-        0x00, SD_DHCP6_OPTION_CLIENT_FQDN, 0x00, 0x12,
-        0x01, 0x06, 'c', 'l', 'i', 'e', 'n', 't', 0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a',
+        0x00, SD_DHCP6_OPTION_CLIENT_FQDN, 0x00, 0x13,
+        0x01, 0x06, 'c', 'l', 'i', 'e', 'n', 't', 0x03, 'l', 'a', 'b', 0x05, 'i', 'n', 't', 'r', 'a', 0x00,
         /* Vendor specific options */
         0x00, SD_DHCP6_OPTION_VENDOR_OPTS, 0x00, 0x09,
         0x00, 0x00, 0x00, 0x20, 0x00, 0xf7, 0x00, 0x01, VENDOR_SUBOPTION_BYTES,
@@ -1028,7 +1026,7 @@ static void test_client_callback(sd_dhcp6_client *client, int event, void *userd
         }
 }
 
-int dhcp6_network_send_udp_socket(int s, struct in6_addr *a, const void *packet, size_t len) {
+int dhcp6_network_send_udp_socket(int s, const struct in6_addr *a, const void *packet, size_t len) {
         log_debug("/* %s(count=%u) */", __func__, test_client_sent_message_count);
 
         assert_se(a);
@@ -1072,7 +1070,7 @@ int dhcp6_network_send_udp_socket(int s, struct in6_addr *a, const void *packet,
         return len;
 }
 
-int dhcp6_network_bind_udp_socket(int ifindex, struct in6_addr *a) {
+int dhcp6_network_bind_udp_socket(int ifindex, const struct in6_addr *a) {
         assert_se(ifindex == test_ifindex);
         assert_se(a);
         assert_se(in6_addr_equal(a, &local_address));
@@ -1087,7 +1085,7 @@ TEST(dhcp6_client) {
 
         assert_se(sd_event_new(&e) >= 0);
         assert_se(sd_event_add_time_relative(e, NULL, CLOCK_BOOTTIME,
-                                             2 * USEC_PER_SEC, 0,
+                                             30 * USEC_PER_SEC, 0,
                                              NULL, INT_TO_PTR(-ETIMEDOUT)) >= 0);
 
         assert_se(sd_dhcp6_client_new(&client) >= 0);

@@ -89,20 +89,15 @@ assert_cc(MS_STRICTATIME == (1 << 24));
 assert_cc(MS_LAZYTIME == (1<<25));
 #endif
 
-/* Not exposed yet. Defined at fs/ext4/ext4.h */
-#ifndef EXT4_IOC_RESIZE_FS
-#define EXT4_IOC_RESIZE_FS _IOW('f', 16, __u64)
-#endif
-
-/* linux/nsfs.h */
-#ifndef NS_GET_NSTYPE /* d95fa3c76a66b6d76b1e109ea505c55e66360f3c (4.11) */
-#define NS_GET_NSTYPE _IO(0xb7, 0x3)
-#endif
-
 #ifndef FS_PROJINHERIT_FL
 #  define FS_PROJINHERIT_FL 0x20000000
 #else
 assert_cc(FS_PROJINHERIT_FL == 0x20000000);
+#endif
+
+/* Not exposed yet. Defined at fs/ext4/ext4.h */
+#ifndef EXT4_IOC_RESIZE_FS
+#define EXT4_IOC_RESIZE_FS _IOW('f', 16, __u64)
 #endif
 
 /* linux/fscrypt.h */
@@ -110,4 +105,9 @@ assert_cc(FS_PROJINHERIT_FL == 0x20000000);
 #  define FS_KEY_DESCRIPTOR_SIZE 8
 #else
 assert_cc(FS_KEY_DESCRIPTOR_SIZE == 8);
+#endif
+
+/* linux/exportfs.h */
+#ifndef FILEID_KERNFS
+#define FILEID_KERNFS 0xfe
 #endif

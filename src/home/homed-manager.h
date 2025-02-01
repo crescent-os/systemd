@@ -6,12 +6,12 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
 typedef struct Manager Manager;
 
 #include "hashmap.h"
 #include "homed-home.h"
-#include "varlink.h"
 
 /* The LUKS free disk space rebalancing logic goes through this state machine */
 typedef enum RebalanceState {
@@ -20,7 +20,7 @@ typedef enum RebalanceState {
         REBALANCE_WAITING,   /* Rebalancing has been requested for a later point in time */
         REBALANCE_PENDING,   /* Rebalancing has been requested and will be executed ASAP */
         REBALANCE_SHRINKING, /* Rebalancing ongoing, and we are running all shrinking operations */
-        REBALANCE_GROWING,   /* Rebalancing ongoign, and we are running all growing operations */
+        REBALANCE_GROWING,   /* Rebalancing ongoing, and we are running all growing operations */
         _REBALANCE_STATE_MAX,
         _REBALANCE_STATE_INVALID = -1,
 } RebalanceState;
@@ -55,7 +55,7 @@ struct Manager {
 
         Home *gc_focus;
 
-        VarlinkServer *varlink_server;
+        sd_varlink_server *varlink_server;
         char *userdb_service;
 
         EVP_PKEY *private_key; /* actually a pair of private and public key */
@@ -91,3 +91,5 @@ int manager_acquire_key_pair(Manager *m);
 int manager_sign_user_record(Manager *m, UserRecord *u, UserRecord **ret, sd_bus_error *error);
 
 int bus_manager_emit_auto_login_changed(Manager *m);
+
+int manager_get_home_by_name(Manager *m, const char *user_name, Home **ret);

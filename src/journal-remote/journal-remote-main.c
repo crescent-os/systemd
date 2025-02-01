@@ -13,6 +13,7 @@
 #include "fileio.h"
 #include "journal-remote-write.h"
 #include "journal-remote.h"
+#include "logs-show.h"
 #include "main-func.h"
 #include "memory-util.h"
 #include "parse-argument.h"
@@ -20,7 +21,6 @@
 #include "pretty-print.h"
 #include "process-util.h"
 #include "rlimit-util.h"
-#include "sigbus.h"
 #include "signal-util.h"
 #include "socket-netlink.h"
 #include "socket-util.h"
@@ -32,16 +32,16 @@
 #define CERT_FILE     CERTIFICATE_ROOT "/certs/journal-remote.pem"
 #define TRUST_FILE    CERTIFICATE_ROOT "/ca/trusted.pem"
 
-static const char* arg_url = NULL;
-static const char* arg_getter = NULL;
-static const char* arg_listen_raw = NULL;
-static const char* arg_listen_http = NULL;
-static const char* arg_listen_https = NULL;
-static char** arg_files = NULL; /* Do not free this. */
+static const char *arg_url = NULL;
+static const char *arg_getter = NULL;
+static const char *arg_listen_raw = NULL;
+static const char *arg_listen_http = NULL;
+static const char *arg_listen_https = NULL;
+static char **arg_files = NULL; /* Do not free this. */
 static bool arg_compress = true;
 static bool arg_seal = false;
 static int http_socket = -1, https_socket = -1;
-static char** arg_gnutls_log = NULL;
+static char **arg_gnutls_log = NULL;
 
 static JournalWriteSplitMode arg_split_mode = _JOURNAL_WRITE_SPLIT_INVALID;
 static char *arg_output = NULL;
@@ -72,16 +72,13 @@ static const char* const journal_write_split_mode_table[_JOURNAL_WRITE_SPLIT_MAX
 };
 
 DEFINE_PRIVATE_STRING_TABLE_LOOKUP(journal_write_split_mode, JournalWriteSplitMode);
-static DEFINE_CONFIG_PARSE_ENUM(config_parse_write_split_mode,
-                                journal_write_split_mode,
-                                JournalWriteSplitMode,
-                                "Failed to parse split mode setting");
+static DEFINE_CONFIG_PARSE_ENUM(config_parse_write_split_mode, journal_write_split_mode, JournalWriteSplitMode);
 
 /**********************************************************************
  **********************************************************************
  **********************************************************************/
 
-static int spawn_child(const char* child, char** argv) {
+static int spawn_child(const char *child, char **argv) {
         pid_t child_pid;
         int fd[2], r;
 
@@ -108,12 +105,12 @@ static int spawn_child(const char* child, char** argv) {
 
         r = fd_nonblock(fd[0], true);
         if (r < 0)
-                log_warning_errno(errno, "Failed to set child pipe to non-blocking: %m");
+                log_warning_errno(r, "Failed to set child pipe to non-blocking: %m");
 
         return fd[0];
 }
 
-static int spawn_curl(const char* url) {
+static int spawn_curl(const char *url) {
         char **argv = STRV_MAKE("curl",
                                 "-HAccept: application/vnd.fdo.journal",
                                 "--silent",
@@ -451,7 +448,7 @@ static int setup_microhttpd_server(RemoteServer *s,
         if (epoll_fd < 0)
                 return log_error_errno(SYNTHETIC_ERRNO(EUCLEAN), "μhttp epoll fd is invalid");
 
-        r = sd_event_add_io(s->events, &d->io_event,
+        r = sd_event_add_io(s->event, &d->io_event,
                             epoll_fd, EPOLLIN,
                             dispatch_http_event, d);
         if (r < 0)
@@ -461,7 +458,7 @@ static int setup_microhttpd_server(RemoteServer *s,
         if (r < 0)
                 return log_error_errno(r, "Failed to set source name: %m");
 
-        r = sd_event_add_time(s->events, &d->timer_event,
+        r = sd_event_add_time(s->event, &d->timer_event,
                               CLOCK_MONOTONIC, UINT64_MAX, 0,
                               null_timer_event_handler, d);
         if (r < 0)
@@ -535,24 +532,6 @@ static int dispatch_http_event(sd_event_source *event,
  **********************************************************************
  **********************************************************************/
 
-static int setup_signals(RemoteServer *s) {
-        int r;
-
-        assert(s);
-
-        assert_se(sigprocmask_many(SIG_SETMASK, NULL, SIGINT, SIGTERM) >= 0);
-
-        r = sd_event_add_signal(s->events, &s->sigterm_event, SIGTERM, NULL, s);
-        if (r < 0)
-                return r;
-
-        r = sd_event_add_signal(s->events, &s->sigint_event, SIGINT, NULL, s);
-        if (r < 0)
-                return r;
-
-        return 0;
-}
-
 static int setup_raw_socket(RemoteServer *s, const char *address) {
         int fd;
 
@@ -565,9 +544,9 @@ static int setup_raw_socket(RemoteServer *s, const char *address) {
 
 static int create_remoteserver(
                 RemoteServer *s,
-                const char* key,
-                const char* cert,
-                const char* trust) {
+                const char *key,
+                const char *cert,
+                const char *trust) {
 
         int r, n, fd;
 
@@ -580,9 +559,9 @@ static int create_remoteserver(
         if (r < 0)
                 return r;
 
-        r = setup_signals(s);
+        r = sd_event_set_signal_exit(s->event, true);
         if (r < 0)
-                return log_error_errno(r, "Failed to set up signals: %m");
+                return log_error_errno(r, "Failed to install SIGINT/SIGTERM handlers: %m");
 
         n = sd_listen_fds(true);
         if (n < 0)
@@ -958,7 +937,7 @@ static int parse_argv(int argc, char *argv[]) {
 
                 case ARG_GNUTLS_LOG:
 #if HAVE_GNUTLS
-                        for (const char* p = optarg;;) {
+                        for (const char *p = optarg;;) {
                                 _cleanup_free_ char *word = NULL;
 
                                 r = extract_first_word(&p, &word, ",", 0);
@@ -1088,13 +1067,7 @@ static int run(int argc, char **argv) {
         _cleanup_free_ char *cert = NULL, *trust = NULL;
         int r;
 
-        log_show_color(true);
-        log_parse_environment();
-
-        /* The journal merging logic potentially needs a lot of fds. */
-        (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
-
-        sigbus_install();
+        log_setup();
 
         r = parse_config();
         if (r < 0)
@@ -1103,6 +1076,8 @@ static int run(int argc, char **argv) {
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        journal_browse_prepare();
 
         if (arg_listen_http || arg_listen_https) {
                 r = setup_gnutls_logger(arg_gnutls_log);
@@ -1128,7 +1103,7 @@ static int run(int argc, char **argv) {
         if (r < 0)
                 return r;
 
-        r = sd_event_set_watchdog(s.events, true);
+        r = sd_event_set_watchdog(s.event, true);
         if (r < 0)
                 return log_error_errno(r, "Failed to enable watchdog: %m");
 
@@ -1140,13 +1115,13 @@ static int run(int argc, char **argv) {
         notify_message = notify_start(NOTIFY_READY, NOTIFY_STOPPING);
 
         while (s.active) {
-                r = sd_event_get_state(s.events);
+                r = sd_event_get_state(s.event);
                 if (r < 0)
                         return r;
                 if (r == SD_EVENT_FINISHED)
                         break;
 
-                r = sd_event_run(s.events, -1);
+                r = sd_event_run(s.event, -1);
                 if (r < 0)
                         return log_error_errno(r, "Failed to run event loop: %m");
         }

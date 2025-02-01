@@ -36,18 +36,21 @@ static int help(void) {
         if (r < 0)
                 return log_oom();
 
-        printf("%s [OPTIONS...]\n"
-               "\n%sInitialize /etc/machine-id from a random source.%s\n\n"
+        printf("%1$s [OPTIONS...]\n"
+               "\n%2$sInitialize /etc/machine-id from a random source.%4$s\n"
+               "\n%3$sCommands:%4$s\n"
+               "     --commit               Commit transient ID\n"
                "  -h --help                 Show this help\n"
                "     --version              Show package version\n"
+               "\n%3$sOptions:%4$s\n"
                "     --root=PATH            Operate on an alternate filesystem root\n"
                "     --image=PATH           Operate on disk image as filesystem root\n"
                "     --image-policy=POLICY  Specify disk image dissection policy\n"
-               "     --commit               Commit transient ID\n"
                "     --print                Print used machine ID\n"
-               "\nSee the %s for details.\n",
+               "\nSee the %5$s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
+               ansi_underline(),
                ansi_normal(),
                link);
 
@@ -139,8 +142,7 @@ static int run(int argc, char *argv[]) {
         _cleanup_(umount_and_freep) char *mounted_dir = NULL;
         int r;
 
-        log_parse_environment();
-        log_open();
+        log_setup();
 
         r = parse_argv(argc, argv);
         if (r <= 0)
@@ -189,7 +191,7 @@ static int run(int argc, char *argv[]) {
         } else {
                 sd_id128_t id;
 
-                r = machine_id_setup(arg_root, false, SD_ID128_NULL, &id);
+                r = machine_id_setup(arg_root, SD_ID128_NULL, /* flags = */ 0, &id);
                 if (r < 0)
                         return r;
 

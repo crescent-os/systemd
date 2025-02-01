@@ -7,6 +7,7 @@
 #include "hashmap.h"
 #include "hexdecoct.h"
 #include "path-util.h"
+#include "percent-util.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "rlimit-util.h"
@@ -17,7 +18,7 @@
 #include "user-util.h"
 #include "userdb.h"
 
-const char *user_record_state_color(const char *state) {
+const char* user_record_state_color(const char *state) {
         if (STR_IN_SET(state, "unfixated", "absent"))
                 return ansi_grey();
         else if (streq(state, "active"))
@@ -26,6 +27,52 @@ const char *user_record_state_color(const char *state) {
                  return ansi_highlight_yellow();
 
         return NULL;
+}
+
+static void show_self_modifiable(
+                const char *heading,
+                char **field,
+                const char **value) {
+
+        assert(heading);
+
+        /* Helper function for printing the various self_modifiable_* fields from the user record */
+
+        if (!value)
+                /* Case 1: no value is set and no default either */
+                printf("%13s %snone%s\n", heading, ansi_highlight(), ansi_normal());
+        else if (strv_isempty((char**) value))
+                /* Case 2: the array is explicitly set to empty by the administrator */
+                printf("%13s %sdisabled by administrator%s\n", heading, ansi_highlight_red(), ansi_normal());
+        else if (!field)
+                /* Case 3: we have values, but the field is NULL. This means that we're using the defaults.
+                 * We list them anyways, because they're security-sensitive to the administrator */
+                STRV_FOREACH(i, value)
+                        printf("%13s %s%s%s\n", i == value ? heading : "", ansi_grey(), *i, ansi_normal());
+        else
+                /* Case 4: we have a list provided by the administrator */
+                STRV_FOREACH(i, value)
+                        printf("%13s %s\n", i == value ? heading : "", *i);
+}
+
+static void show_tmpfs_limit(const char *tmpfs, const TmpfsLimit *limit, uint32_t scale) {
+        assert(tmpfs);
+        assert(limit);
+
+        if (!limit->is_set)
+                return;
+
+        printf("   %s Limit:", tmpfs);
+
+        if (limit->limit != UINT64_MAX)
+                printf(" %s", FORMAT_BYTES(limit->limit));
+        if (limit->limit == UINT64_MAX || limit->limit_scale != UINT32_MAX) {
+                if (limit->limit != UINT64_MAX)
+                        printf(" or");
+
+                printf(" %i%%", UINT32_SCALE_TO_PERCENT(scale));
+        }
+        printf("\n");
 }
 
 void user_record_show(UserRecord *hr, bool show_full_group_info) {
@@ -38,6 +85,13 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
 
         printf("   User name: %s\n",
                user_record_user_name_and_realm(hr));
+
+        if (!strv_isempty(hr->aliases)) {
+                STRV_FOREACH(i, hr->aliases)
+                        printf(i == hr->aliases ?
+                               "       Alias: %s" : ", %s", *i);
+                putchar('\n');
+        }
 
         if (hr->state) {
                 const char *color;
@@ -167,7 +221,7 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
                 if (show_full_group_info) {
                         _cleanup_(group_record_unrefp) GroupRecord *gr = NULL;
 
-                        r = groupdb_by_gid(hr->gid, 0, &gr);
+                        r = groupdb_by_gid(hr->gid, /* match= */ NULL, /* flags= */ 0, &gr);
                         if (r < 0) {
                                 errno = -r;
                                 printf("         GID: " GID_FMT " (unresolvable: %m)\n", hr->gid);
@@ -334,6 +388,9 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
 
         if (hr->io_weight != UINT64_MAX)
                 printf("   IO Weight: %" PRIu64 "\n", hr->io_weight);
+
+        show_tmpfs_limit("TMP", &hr->tmp_limit, user_record_tmp_limit_scale(hr));
+        show_tmpfs_limit("SHM", &hr->dev_shm_limit, user_record_dev_shm_limit_scale(hr));
 
         if (hr->access_mode != MODE_INVALID)
                 printf(" Access Mode: 0%03o\n", user_record_access_mode(hr));
@@ -585,6 +642,16 @@ void user_record_show(UserRecord *hr, bool show_full_group_info) {
 
         if (hr->service)
                 printf("     Service: %s\n", hr->service);
+
+        show_self_modifiable("Self Modify:",
+                             hr->self_modifiable_fields,
+                             user_record_self_modifiable_fields(hr));
+        show_self_modifiable("(Blobs)",
+                             hr->self_modifiable_blobs,
+                             user_record_self_modifiable_blobs(hr));
+        show_self_modifiable("(Privileged)",
+                             hr->self_modifiable_privileged,
+                             user_record_self_modifiable_privileged(hr));
 }
 
 void group_record_show(GroupRecord *gr, bool show_full_user_info) {

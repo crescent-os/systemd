@@ -1,11 +1,21 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+# The tests can be called via pytest:
+#   PATH=build/:$PATH pytest -v src/ukify/test/test_ukify.py
+# or directly:
+#   PATH=build/:$PATH src/ukify/test/test_ukify.py
+# or via the meson test machinery output:
+#   meson test -C build test-ukify -v
+# or without verbose output:
+#   meson test -C build test-ukify
+
 # pylint: disable=unused-import,import-outside-toplevel,useless-else-on-loop
 # pylint: disable=consider-using-with,wrong-import-position,unspecified-encoding
 # pylint: disable=protected-access,redefined-outer-name
 
 import base64
+import glob
 import json
 import os
 import pathlib
@@ -35,6 +45,13 @@ except ImportError as e:
 sys.path.append(os.path.dirname(__file__) + '/..')
 import ukify
 
+# Skip if we're running on an architecture that does not use UEFI.
+try:
+    ukify.guess_efi_arch()
+except ValueError as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(77)
+
 build_root = os.getenv('PROJECT_BUILD_ROOT')
 try:
     slow_tests = bool(int(os.getenv('SYSTEMD_SLOW_TESTS', '1')))
@@ -42,6 +59,8 @@ except ValueError:
     slow_tests = True
 
 arg_tools = ['--tools', build_root] if build_root else []
+if build_root and pathlib.Path(f"{build_root}/linux{ukify.guess_efi_arch()}.efi.stub").exists():
+    arg_tools += ['--stub', f"{build_root}/linux{ukify.guess_efi_arch()}.efi.stub"]
 
 def systemd_measure():
     opts = ukify.create_parser().parse_args(arg_tools)
@@ -121,7 +140,7 @@ def test_apply_config(tmp_path):
 
     assert ns._groups == ['NAME']
     assert ns.pcr_private_keys == ['some/path7']
-    assert ns.pcr_public_keys == [pathlib.Path('some/path8')]
+    assert ns.pcr_public_keys == ['some/path8']
     assert ns.phase_path_groups == [['enter-initrd:leave-initrd:sysinit:ready:shutdown:final']]
 
     ukify.finalize_options(ns)
@@ -139,12 +158,12 @@ def test_apply_config(tmp_path):
     assert ns.pcr_banks == ['sha512', 'sha1']
     assert ns.signing_engine == 'engine1'
     assert ns.sb_key == 'some/path5'
-    assert ns.sb_cert == 'some/path6'
+    assert ns.sb_cert == pathlib.Path('some/path6')
     assert ns.sign_kernel is False
 
     assert ns._groups == ['NAME']
     assert ns.pcr_private_keys == ['some/path7']
-    assert ns.pcr_public_keys == [pathlib.Path('some/path8')]
+    assert ns.pcr_public_keys == ['some/path8']
     assert ns.phase_path_groups == [['enter-initrd:leave-initrd:sysinit:ready:shutdown:final']]
 
 def test_parse_args_minimal():
@@ -190,11 +209,11 @@ def test_parse_args_many_deprecated():
     assert opts.uname == '1.2.3'
     assert opts.stub == pathlib.Path('STUBPATH')
     assert opts.pcr_private_keys == ['PKEY1']
-    assert opts.pcr_public_keys == [pathlib.Path('PKEY2')]
+    assert opts.pcr_public_keys == ['PKEY2']
     assert opts.pcr_banks == ['SHA1', 'SHA256']
     assert opts.signing_engine == 'ENGINE'
     assert opts.sb_key == 'SBKEY'
-    assert opts.sb_cert == 'SBCERT'
+    assert opts.sb_cert == pathlib.Path('SBCERT')
     assert opts.sign_kernel is False
     assert opts.tools == [pathlib.Path('TOOLZ/')]
     assert opts.output == pathlib.Path('OUTPUT')
@@ -225,6 +244,8 @@ def test_parse_args_many():
          '--output=OUTPUT',
          '--measure',
          '--no-measure',
+         '--policy-digest',
+         '--no-policy-digest',
          ])
     assert opts.linux == pathlib.Path('/ARG1')
     assert opts.initrd == [pathlib.Path('/ARG2'), pathlib.Path('/ARG3 WITH SPACE')]
@@ -236,15 +257,16 @@ def test_parse_args_many():
     assert opts.uname == '1.2.3'
     assert opts.stub == pathlib.Path('STUBPATH')
     assert opts.pcr_private_keys == ['PKEY1']
-    assert opts.pcr_public_keys == [pathlib.Path('PKEY2')]
+    assert opts.pcr_public_keys == ['PKEY2']
     assert opts.pcr_banks == ['SHA1', 'SHA256']
     assert opts.signing_engine == 'ENGINE'
     assert opts.sb_key == 'SBKEY'
-    assert opts.sb_cert == 'SBCERT'
+    assert opts.sb_cert == pathlib.Path('SBCERT')
     assert opts.sign_kernel is False
     assert opts.tools == [pathlib.Path('TOOLZ/')]
     assert opts.output == pathlib.Path('OUTPUT')
     assert opts.measure is False
+    assert opts.policy_digest is False
 
 def test_parse_sections():
     opts = ukify.parse_args(
@@ -343,13 +365,12 @@ def test_config_priority(tmp_path):
     assert opts.uname == '1.2.3'
     assert opts.stub == pathlib.Path('STUBPATH')
     assert opts.pcr_private_keys == ['PKEY1', 'some/path7']
-    assert opts.pcr_public_keys == [pathlib.Path('PKEY2'),
-                                    pathlib.Path('some/path8')]
+    assert opts.pcr_public_keys == ['PKEY2', 'some/path8']
     assert opts.pcr_banks == ['SHA1', 'SHA256']
     assert opts.signing_engine == 'ENGINE'
     assert opts.signtool == 'sbsign' # from args
     assert opts.sb_key == 'SBKEY' # from args
-    assert opts.sb_cert == 'SBCERT' # from args
+    assert opts.sb_cert == pathlib.Path('SBCERT') # from args
     assert opts.sb_certdir == 'some/path5' # from config
     assert opts.sb_cert_name == 'some/name1' # from config
     assert opts.sign_kernel is False
@@ -389,28 +410,19 @@ def test_help_error(capsys):
 
 @pytest.fixture(scope='session')
 def kernel_initrd():
-    opts = ukify.create_parser().parse_args(arg_tools)
-    bootctl = ukify.find_tool('bootctl', opts=opts)
-    if bootctl is None:
+    items = sorted(glob.glob('/lib/modules/*/vmlinuz'))
+    if not items:
+        items = sorted(glob.glob('/boot/vmlinuz*'))
+    if not items:
         return None
 
-    try:
-        text = subprocess.check_output([bootctl, 'list', '--json=short'],
-                                       text=True)
-    except subprocess.CalledProcessError:
-        return None
+    # This doesn't necessarily give us the latest version, since we're just
+    # using alphanumeric ordering. But this is fine, a predictable result is
+    # enough.
+    linux = items[-1]
 
-    items = json.loads(text)
-
-    for item in items:
-        try:
-            linux = f"{item['root']}{item['linux']}"
-            initrd = f"{item['root']}{item['initrd'][0].split(' ')[0]}"
-        except (KeyError, IndexError):
-            continue
-        return ['--linux', linux, '--initrd', initrd]
-    else:
-        return None
+    # We don't look _into_ the initrd. Any file is OK.
+    return ['--linux', linux, '--initrd', ukify.__file__]
 
 def test_check_splash():
     try:
@@ -617,7 +629,7 @@ def test_efi_signing_pesign(kernel_initrd, tmp_path):
 
     ukify.make_uki(opts)
 
-    # let's check that sbverify likes the resulting file
+    # let's check that pesign likes the resulting file
     dump = subprocess.check_output([
         'pesign', '-S',
         '-i', output,
@@ -649,7 +661,7 @@ def test_inspect(kernel_initrd, tmp_path, capsys):
         f'--os-release={osrel_arg}',
         f'--uname={uname_arg}',
         f'--output={output}',
-    ]
+    ] + arg_tools
     if slow_tests:
         args += [
             f'--secureboot-certificate={cert.name}',
@@ -684,7 +696,9 @@ def test_inspect(kernel_initrd, tmp_path, capsys):
 def test_pcr_signing(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
-    if systemd_measure() is None:
+    try:
+        systemd_measure()
+    except ValueError:
         pytest.skip('systemd-measure not found')
 
     ourdir = pathlib.Path(__file__).parent
@@ -699,7 +713,7 @@ def test_pcr_signing(kernel_initrd, tmp_path):
         '--uname=1.2.3',
         '--cmdline=ARG1 ARG2 ARG3',
         '--os-release=ID=foobar\n',
-        '--pcr-banks=sha1',   # use sha1 because it doesn't really matter
+        '--pcr-banks=sha384',   # sha1 might not be allowed, use something else
         f'--pcr-private-key={priv.name}',
     ] + arg_tools
 
@@ -742,8 +756,8 @@ def test_pcr_signing(kernel_initrd, tmp_path):
         assert open(tmp_path / 'out.cmdline').read() == 'ARG1 ARG2 ARG3'
         sig = open(tmp_path / 'out.pcrsig').read()
         sig = json.loads(sig)
-        assert list(sig.keys()) == ['sha1']
-        assert len(sig['sha1']) == 4   # four items for four phases
+        assert list(sig.keys()) == ['sha384']
+        assert len(sig['sha384']) == 4   # four items for four phases
 
     shutil.rmtree(tmp_path)
 
@@ -751,7 +765,9 @@ def test_pcr_signing(kernel_initrd, tmp_path):
 def test_pcr_signing2(kernel_initrd, tmp_path):
     if kernel_initrd is None:
         pytest.skip('linux+initrd not found')
-    if systemd_measure() is None:
+    try:
+        systemd_measure()
+    except ValueError:
         pytest.skip('systemd-measure not found')
 
     ourdir = pathlib.Path(__file__).parent
@@ -775,7 +791,7 @@ def test_pcr_signing2(kernel_initrd, tmp_path):
         '--uname=1.2.3',
         '--cmdline=ARG1 ARG2 ARG3',
         '--os-release=ID=foobar\n',
-        '--pcr-banks=sha1',
+        '--pcr-banks=sha384',
         f'--pcrpkey={pub2.name}',
         f'--pcr-public-key={pub.name}',
         f'--pcr-private-key={priv.name}',
@@ -815,8 +831,8 @@ def test_pcr_signing2(kernel_initrd, tmp_path):
 
     sig = open(tmp_path / 'out.pcrsig').read()
     sig = json.loads(sig)
-    assert list(sig.keys()) == ['sha1']
-    assert len(sig['sha1']) == 6   # six items for six phases paths
+    assert list(sig.keys()) == ['sha384']
+    assert len(sig['sha384']) == 6   # six items for six phases paths
 
     shutil.rmtree(tmp_path)
 

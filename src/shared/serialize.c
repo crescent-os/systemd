@@ -164,10 +164,13 @@ int serialize_dual_timestamp(FILE *f, const char *name, const dual_timestamp *t)
         return serialize_item_format(f, name, USEC_FMT " " USEC_FMT, t->realtime, t->monotonic);
 }
 
-int serialize_strv(FILE *f, const char *key, char **l) {
+int serialize_strv(FILE *f, const char *key, char * const *l) {
         int ret = 0, r;
 
         /* Returns the first error, or positive if anything was serialized, 0 otherwise. */
+
+        assert(f);
+        assert(key);
 
         STRV_FOREACH(i, l) {
                 r = serialize_item_escaped(f, key, *i);
@@ -179,6 +182,16 @@ int serialize_strv(FILE *f, const char *key, char **l) {
         return ret;
 }
 
+int serialize_id128(FILE *f, const char *key, sd_id128_t id) {
+        assert(f);
+        assert(key);
+
+        if (sd_id128_is_null(id))
+                return 0;
+
+        return serialize_item_format(f, key, SD_ID128_FORMAT_STR, SD_ID128_FORMAT_VAL(id));
+}
+
 int serialize_pidref(FILE *f, FDSet *fds, const char *key, PidRef *pidref) {
         int r;
 
@@ -188,18 +201,20 @@ int serialize_pidref(FILE *f, FDSet *fds, const char *key, PidRef *pidref) {
         if (!pidref_is_set(pidref))
                 return 0;
 
-        /* We always serialize the pid, to keep downgrades mostly working (older versions will deserialize
-         * the pid and silently fail to deserialize the pidfd). If we also have a pidfd, we serialize it
-         * first and encode the fd number prefixed by "@" in the serialization. */
+        /* We always serialize the pid separately, to keep downgrades mostly working (older versions will
+         * deserialize the pid and silently fail to deserialize the pidfd). If we also have a pidfd, we
+         * serialize both the pid and pidfd, so that we can construct the exact same pidref after
+         * deserialization (this doesn't work with only the pidfd, as we can't retrieve the original pid
+         * from the pidfd anymore if the process is reaped). */
 
         if (pidref->fd >= 0) {
                 int copy = fdset_put_dup(fds, pidref->fd);
                 if (copy < 0)
                         return log_error_errno(copy, "Failed to add file descriptor to serialization set: %m");
 
-                r = serialize_item_format(f, key, "@%i", copy);
+                r = serialize_item_format(f, key, "@%i:" PID_FMT, copy, pidref->pid);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to serialize PID file descriptor: %m");
+                        return r;
         }
 
         return serialize_item_format(f, key, PID_FMT, pidref->pid);
@@ -265,8 +280,7 @@ int serialize_item_base64mem(FILE *f, const char *key, const void *p, size_t l) 
         return 1;
 }
 
-int serialize_string_set(FILE *f, const char *key, Set *s) {
-        const char *e;
+int serialize_string_set(FILE *f, const char *key, const Set *s) {
         int r;
 
         assert(f);
@@ -277,6 +291,7 @@ int serialize_string_set(FILE *f, const char *key, Set *s) {
 
         /* Serialize as individual items, as each element might contain separators and escapes */
 
+        const char *e;
         SET_FOREACH(e, s) {
                 r = serialize_item(f, key, e);
                 if (r < 0)
@@ -480,12 +495,39 @@ int deserialize_pidref(FDSet *fds, const char *value, PidRef *ret) {
 
         e = startswith(value, "@");
         if (e) {
-                int fd = deserialize_fd(fds, e);
+                _cleanup_free_ char *fdstr = NULL, *pidstr = NULL;
+                _cleanup_close_ int fd = -EBADF;
 
+                r = extract_many_words(&e, ":", /* flags = */ 0, &fdstr, &pidstr);
+                if (r < 0)
+                        return log_debug_errno(r, "Failed to deserialize pidref '%s': %m", e);
+                if (r == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Cannot deserialize pidref from empty string.");
+
+                assert(r <= 2);
+
+                fd = deserialize_fd(fds, fdstr);
                 if (fd < 0)
                         return fd;
 
-                r = pidref_set_pidfd_consume(ret, fd);
+                /* The serialization format changed after 255.4. In systemd <= 255.4 only pidfd is
+                 * serialized, but that causes problems when reconstructing pidref (see serialize_pidref for
+                 * details). After 255.4 the pid is serialized as well even if we have a pidfd, but we still
+                 * need to support older format as we might be upgrading from a version that still uses the
+                 * old format. */
+                if (pidstr) {
+                        pid_t pid;
+
+                        r = parse_pid(pidstr, &pid);
+                        if (r < 0)
+                                return log_debug_errno(r, "Failed to parse PID: %s", pidstr);
+
+                        *ret = (PidRef) {
+                                .pid = pid,
+                                .fd = TAKE_FD(fd),
+                        };
+                } else
+                        r = pidref_set_pidfd_consume(ret, TAKE_FD(fd));
         } else {
                 pid_t pid;
 
@@ -518,21 +560,13 @@ void deserialize_ratelimit(RateLimit *rl, const char *name, const char *value) {
 }
 
 int open_serialization_fd(const char *ident) {
-        int fd;
+        assert(ident);
 
-        fd = memfd_create_wrapper(ident, MFD_CLOEXEC | MFD_NOEXEC_SEAL);
-        if (fd < 0) {
-                const char *path;
+        int fd = memfd_new_full(ident, MFD_ALLOW_SEALING);
+        if (fd < 0)
+                return fd;
 
-                path = getpid_cached() == 1 ? "/run/systemd" : "/tmp";
-                fd = open_tmpfile_unlinkable(path, O_RDWR|O_CLOEXEC);
-                if (fd < 0)
-                        return fd;
-
-                log_debug("Serializing %s to %s.", ident, path);
-        } else
-                log_debug("Serializing %s to memfd.", ident);
-
+        log_debug("Serializing %s to memfd.", ident);
         return fd;
 }
 
@@ -551,6 +585,33 @@ int open_serialization_file(const char *ident, FILE **ret) {
                 return -errno;
 
         *ret = TAKE_PTR(f);
-
         return 0;
+}
+
+int finish_serialization_fd(int fd) {
+        assert(fd >= 0);
+
+        if (lseek(fd, 0, SEEK_SET) < 0)
+                return -errno;
+
+        return memfd_set_sealed(fd);
+}
+
+int finish_serialization_file(FILE *f) {
+        int r;
+
+        assert(f);
+
+        r = fflush_and_check(f);
+        if (r < 0)
+                return r;
+
+        if (fseeko(f, 0, SEEK_SET) < 0)
+                return -errno;
+
+        int fd = fileno(f);
+        if (fd < 0)
+                return -EBADF;
+
+        return memfd_set_sealed(fd);
 }

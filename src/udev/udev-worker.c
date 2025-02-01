@@ -18,6 +18,7 @@
 #include "signal-util.h"
 #include "string-util.h"
 #include "udev-event.h"
+#include "udev-rules.h"
 #include "udev-spawn.h"
 #include "udev-trace.h"
 #include "udev-util.h"
@@ -97,6 +98,12 @@ static int worker_lock_whole_disk(sd_device *dev, int *ret_fd) {
          * event handling; in the case udev acquired the lock, the external process can block until udev has
          * finished its event handling. */
 
+        /* Do not try to lock device on remove event, as the device node specified by DEVNAME= has already
+         * been removed, and may already be assigned to another device. Consider the case e.g. a USB stick
+         * memory was unplugged and then another one is plugged. */
+        if (device_for_action(dev, SD_DEVICE_REMOVE))
+                goto nolock;
+
         r = udev_get_whole_disk(dev, &dev_whole_disk, &val);
         if (r < 0)
                 return r;
@@ -163,7 +170,7 @@ static int worker_mark_block_device_read_only(sd_device *dev) {
 }
 
 static int worker_process_device(UdevWorker *worker, sd_device *dev) {
-        _cleanup_(udev_event_freep) UdevEvent *udev_event = NULL;
+        _cleanup_(udev_event_unrefp) UdevEvent *udev_event = NULL;
         _cleanup_close_ int fd_lock = -EBADF;
         int r;
 
@@ -175,6 +182,7 @@ static int worker_process_device(UdevWorker *worker, sd_device *dev) {
         udev_event = udev_event_new(dev, worker, EVENT_UDEV_WORKER);
         if (!udev_event)
                 return -ENOMEM;
+        udev_event->trace = worker->config.trace;
 
         /* If this is a block device and the device is locked currently via the BSD advisory locks,
          * someone else is using it exclusively. We don't run our udev rules now to not interfere.
@@ -187,7 +195,7 @@ static int worker_process_device(UdevWorker *worker, sd_device *dev) {
         if (r < 0)
                 return r;
 
-        if (worker->blockdev_read_only)
+        if (worker->config.blockdev_read_only)
                 (void) worker_mark_block_device_read_only(dev);
 
         /* Disable watch during event processing. */
@@ -200,26 +208,31 @@ static int worker_process_device(UdevWorker *worker, sd_device *dev) {
         if (r < 0)
                 return r;
 
+        /* Process RUN=. */
         udev_event_execute_run(udev_event);
 
         if (!worker->rtnl)
                 /* in case rtnl was initialized */
                 worker->rtnl = sd_netlink_ref(udev_event->rtnl);
 
+        /* Enable watch if requested. */
         if (udev_event->inotify_watch) {
                 r = udev_watch_begin(worker->inotify_fd, dev);
                 if (r < 0 && r != -ENOENT) /* The device may be already removed, ignore -ENOENT. */
                         log_device_warning_errno(dev, r, "Failed to add inotify watch, ignoring: %m");
         }
 
-        /* Finalize database. */
-        r = device_add_property(dev, "ID_PROCESSING", NULL);
-        if (r < 0)
-                return log_device_warning_errno(dev, r, "Failed to remove 'ID_PROCESSING' property: %m");
+        /* Finalize database. But do not re-create database on remove, which has been already removed in
+         * event_execute_rules_on_remove(). */
+        if (!device_for_action(dev, SD_DEVICE_REMOVE)) {
+                r = device_add_property(dev, "ID_PROCESSING", NULL);
+                if (r < 0)
+                        return log_device_warning_errno(dev, r, "Failed to remove 'ID_PROCESSING' property: %m");
 
-        r = device_update_db(dev);
-        if (r < 0)
-                return log_device_warning_errno(dev, r, "Failed to update database under /run/udev/data/: %m");
+                r = device_update_db(dev);
+                if (r < 0)
+                        return log_device_warning_errno(dev, r, "Failed to update database under /run/udev/data/: %m");
+        }
 
         log_device_uevent(dev, "Device processed");
         return 0;
@@ -272,7 +285,7 @@ void udev_broadcast_result(sd_device_monitor *monitor, sd_device *dev, EventResu
                 }
         }
 
-        r = device_monitor_send_device(monitor, NULL, dev);
+        r = device_monitor_send(monitor, NULL, dev);
         if (r < 0)
                 log_device_warning_errno(dev, r,
                                          "Failed to broadcast event to libudev listeners, ignoring: %m");
@@ -309,7 +322,7 @@ static int worker_device_monitor_handler(sd_device_monitor *monitor, sd_device *
                 log_device_warning_errno(dev, r, "Failed to send signal to main daemon, ignoring: %m");
 
         /* Reset the log level, as it might be changed by "OPTIONS=log_level=". */
-        log_set_max_level(worker->log_level);
+        log_set_max_level(worker->config.log_level);
 
         return 1;
 }

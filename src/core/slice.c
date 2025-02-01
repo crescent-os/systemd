@@ -27,24 +27,22 @@ static void slice_init(Unit *u) {
         u->ignore_on_isolate = true;
 }
 
-static void slice_set_state(Slice *t, SliceState state) {
+static void slice_set_state(Slice *s, SliceState state) {
         SliceState old_state;
 
-        assert(t);
+        assert(s);
 
-        if (t->state != state)
-                bus_unit_send_pending_change_signal(UNIT(t), false);
+        if (s->state != state)
+                bus_unit_send_pending_change_signal(UNIT(s), false);
 
-        old_state = t->state;
-        t->state = state;
+        old_state = s->state;
+        s->state = state;
 
         if (state != old_state)
-                log_debug("%s changed %s -> %s",
-                          UNIT(t)->id,
-                          slice_state_to_string(old_state),
-                          slice_state_to_string(state));
+                log_unit_debug(UNIT(s), "Changed %s -> %s",
+                               slice_state_to_string(old_state), slice_state_to_string(state));
 
-        unit_notify(UNIT(t), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
+        unit_notify(UNIT(s), state_translation_table[old_state], state_translation_table[state], /* reload_success = */ true);
 }
 
 static int slice_add_parent_slice(Slice *s) {
@@ -341,32 +339,31 @@ static void slice_enumerate_perpetual(Manager *m) {
                 (void) slice_make_perpetual(m, SPECIAL_SYSTEM_SLICE, NULL);
 }
 
-static bool slice_can_freeze(Unit *s) {
+static bool slice_can_freeze(const Unit *u) {
+        assert(u);
+
         Unit *member;
-
-        assert(s);
-
-        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF)
+        UNIT_FOREACH_DEPENDENCY(member, u, UNIT_ATOM_SLICE_OF)
                 if (!unit_can_freeze(member))
                         return false;
+
         return true;
 }
 
 static int slice_freezer_action(Unit *s, FreezerAction action) {
         FreezerAction child_action;
-        Unit *member;
         int r;
 
         assert(s);
-        assert(IN_SET(action, FREEZER_FREEZE, FREEZER_PARENT_FREEZE,
-                      FREEZER_THAW, FREEZER_PARENT_THAW));
+        assert(action >= 0);
+        assert(action < _FREEZER_ACTION_MAX);
 
         if (action == FREEZER_FREEZE && !slice_can_freeze(s)) {
                 /* We're intentionally only checking for FREEZER_FREEZE here and ignoring the
                  * _BY_PARENT variant. If we're being frozen by parent, that means someone has
                  * already checked if we can be frozen further up the call stack. No point to
                  * redo that work */
-                log_unit_warning(s, "Requested freezer operation is not supported by all children of the slice");
+                log_unit_warning(s, "Requested freezer operation is not supported by all children of the slice.");
                 return 0;
         }
 
@@ -377,15 +374,13 @@ static int slice_freezer_action(Unit *s, FreezerAction action) {
         else
                 child_action = action;
 
-        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF) {
-                if (UNIT_VTABLE(member)->freezer_action)
+        Unit *member;
+        UNIT_FOREACH_DEPENDENCY(member, s, UNIT_ATOM_SLICE_OF)
+                if (UNIT_VTABLE(member)->freezer_action) {
                         r = UNIT_VTABLE(member)->freezer_action(member, child_action);
-                else
-                        /* Only thawing will reach here, since freezing checks for a method in can_freeze */
-                        r = 0;
-                if (r < 0)
-                        return r;
-        }
+                        if (r < 0)
+                                return r;
+                }
 
         return unit_cgroup_freezer_action(s, action);
 }

@@ -76,6 +76,11 @@ evdev:input:b0003v08CAp0020*
  EVDEV_ABS_00=::20
  EVDEV_ABS_01=::20
 
+# AIPTEK Media Tablet Ultimate (detected as Waltop International Corp. Batteryless Tablet)
+evdev:input:b0003v172Fp0503*
+ EVDEV_ABS_00=::160
+ EVDEV_ABS_01=::160
+
 #########################################
 # Apple
 #########################################
@@ -247,8 +252,24 @@ evdev:input:b0003v0ED1p7821*
  EVDEV_ABS_01=::5080
 
 #########################################
+# Chuwi
+#########################################
+
+# Chuwi MiniBook X
+evdev:name:XXXX0000:05 0911:5288 Touchpad:dmi:*:pnMiniBookX:*
+ EVDEV_ABS_00=:::8
+ EVDEV_ABS_01=:::8
+
+#########################################
 # Dell
 #########################################
+
+# Dell AlpsPS/2 ALPS DualPoint TouchPad
+evdev:name:AlpsPS/2 ALPS DualPoint TouchPad:dmi:*:svnDellInc.*:pnLatitudeE7440*:
+ EVDEV_ABS_00=:::28
+ EVDEV_ABS_01=:::28
+ EVDEV_ABS_35=:::28
+ EVDEV_ABS_36=:::28
 
 # Dell Vostro 1510
 evdev:name:AlpsPS/2 ALPS GlidePoint*:dmi:bvn*:bvr*:bd*:svnDellInc.:pnVostro1510:*
@@ -373,6 +394,8 @@ evdev:input:b0003v0430p0530*
 evdev:input:b0003v256Cp006F*
  EVDEV_ABS_00=::210
  EVDEV_ABS_01=::323
+ EVDEV_ABS_35=::210
+ EVDEV_ABS_36=::323
 
 #########################################
 # Google
@@ -615,6 +638,13 @@ evdev:name:SynPS/2 Synaptics TouchPad:dmi:*svnLENOVO:*pvrThinkPadL14Gen1**
  EVDEV_ABS_01=::50
  EVDEV_ABS_35=::44
  EVDEV_ABS_36=::50
+
+# Lenovo Thinkpad E16 Gen1 (Intel)
+evdev:name:SYNA801A:00 06CB:CEC6 Touchpad:dmi:*svnLENOVO:*pvrThinkPadE16Gen1**
+ EVDEV_ABS_00=::11
+ EVDEV_ABS_01=::11
+ EVDEV_ABS_35=::11
+ EVDEV_ABS_36=::11
 
 # Lenovo T460
 evdev:name:SynPS/2 Synaptics TouchPad:dmi:*svnLENOVO*:pn*ThinkPad*T460:*
@@ -911,6 +941,12 @@ evdev:input:b0003v2179p0004*
 evdev:input:b0003v172Fp0031*
  EVDEV_ABS_00=0:10000:400
  EVDEV_ABS_01=0:6250:400
+
+# WALTOP International Corp. Slim Tablet Stylus
+evdev:input:b0003v172Fp0034*
+ EVDEV_ABS_00=0:20000:80
+ EVDEV_ABS_01=0:12500:80
+ EVDEV_ABS_24=0:1023:500
 
 # WALTOP International Corp. Graphics Tablet
 evdev:input:b0003v172Fp0047*

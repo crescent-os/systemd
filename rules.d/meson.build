@@ -15,6 +15,7 @@ rules = [
                '60-infiniband.rules',
                '60-input-id.rules',
                '60-persistent-alsa.rules',
+               '60-persistent-hidraw.rules',
                '60-persistent-input.rules',
                '60-persistent-storage-mtd.rules',
                '60-persistent-storage-tape.rules',
@@ -29,6 +30,7 @@ rules = [
                '75-probe_mtd.rules',
                '78-sound-card.rules',
                '80-net-setup-link.rules',
+               '81-net-bridge.rules',
                '81-net-dhcp.rules',
                '90-iocost.rules',
               )],
@@ -44,11 +46,14 @@ rules = [
 ]
 
 all_rules = []
+# For the udev alias
+buildable_rules = []
 
 foreach tuple : rules
         if tuple.length() == 1 or tuple[1]
                 install_data(tuple[0],
-                             install_dir : udevrulesdir)
+                             install_dir : udevrulesdir,
+                             install_tag : 'udev')
                 all_rules += tuple[0]
         endif
 endforeach
@@ -75,9 +80,11 @@ foreach tuple : rules_in
                 output: tuple[0],
                 command : [jinja2_cmdline, '@INPUT@', '@OUTPUT@'],
                 install : want,
-                install_dir : udevrulesdir)
+                install_dir : udevrulesdir,
+                install_tag : 'udev')
 
         if want
                 all_rules += rule
+                buildable_rules += rule
         endif
 endforeach

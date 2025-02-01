@@ -10,9 +10,13 @@
 ACTION=="remove", GOTO="systemd_end"
 
 SUBSYSTEM=="tty", KERNEL=="tty[a-zA-Z]*|hvc*|xvc*|hvsi*|ttysclp*|sclp_line*|3270/tty[0-9]*", TAG+="systemd"
+# Exclude 8250 serial ports with a zero IO port, as they are not usable until "setserial /dev/ttySxxx port …" is invoked.
+SUBSYSTEM=="tty", KERNEL=="ttyS*", DRIVERS=="serial8250", ATTR{port}=="0x0", ATTR{iomem_base}=="0x0", ENV{SYSTEMD_READY}="0"
 KERNEL=="vport*", TAG+="systemd"
 
 SUBSYSTEM=="ptp", TAG+="systemd"
+
+SUBSYSTEM=="mtd", TAG+="systemd"
 
 SUBSYSTEM=="ubi", TAG+="systemd"
 
@@ -57,6 +61,7 @@ SUBSYSTEM=="bluetooth", TAG+="systemd", ENV{SYSTEMD_ALIAS}+="/sys/subsystem/blue
   ENV{SYSTEMD_WANTS}+="bluetooth.target", ENV{SYSTEMD_USER_WANTS}+="bluetooth.target"
 
 ENV{ID_SMARTCARD_READER}=="?*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="smartcard.target", ENV{SYSTEMD_USER_WANTS}+="smartcard.target"
+TAG=="security-device", TAG+="systemd"
 SUBSYSTEM=="sound", KERNEL=="controlC*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="sound.target", ENV{SYSTEMD_USER_WANTS}+="sound.target"
 
 SUBSYSTEM=="printer", TAG+="systemd", ENV{SYSTEMD_WANTS}+="printer.target", ENV{SYSTEMD_USER_WANTS}+="printer.target"

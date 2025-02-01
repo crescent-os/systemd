@@ -173,6 +173,8 @@ static const NLAPolicy rtnl_link_info_data_bridge_policies[] = {
         [IFLA_BR_MCAST_MLD_VERSION]          = BUILD_POLICY(U8),
         [IFLA_BR_VLAN_STATS_PER_PORT]        = BUILD_POLICY(U8),
         [IFLA_BR_MULTI_BOOLOPT]              = BUILD_POLICY_WITH_SIZE(BINARY, sizeof(struct br_boolopt_multi)),
+        [IFLA_BR_FDB_N_LEARNED]              = BUILD_POLICY(U32),
+        [IFLA_BR_FDB_MAX_LEARNED]            = BUILD_POLICY(U32),
 };
 
 static const NLAPolicy rtnl_link_info_data_can_policies[] = {
@@ -483,6 +485,8 @@ static const struct NLAPolicy rtnl_bridge_port_policies[] = {
         [IFLA_BRPORT_MRP_IN_OPEN]           = BUILD_POLICY(U8),
         [IFLA_BRPORT_MCAST_EHT_HOSTS_LIMIT] = BUILD_POLICY(U32),
         [IFLA_BRPORT_MCAST_EHT_HOSTS_CNT]   = BUILD_POLICY(U32),
+        [IFLA_BRPORT_LOCKED]                = BUILD_POLICY(U8),
+        [IFLA_BRPORT_MAB]                   = BUILD_POLICY(U8),
 };
 
 static const NLAPolicySetUnionElement rtnl_link_info_slave_data_policy_set_union_elements[] = {

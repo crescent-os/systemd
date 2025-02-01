@@ -31,7 +31,6 @@
 
 #if HAVE_SELINUX
 DEFINE_TRIVIAL_CLEANUP_FUNC_FULL(context_t, context_free, NULL);
-#define _cleanup_context_free_ _cleanup_(context_freep)
 
 typedef enum Initialized {
         UNINITIALIZED,
@@ -64,7 +63,7 @@ static int mac_selinux_label_pre(int dir_fd, const char *path, mode_t mode) {
         return mac_selinux_create_file_prepare_at(dir_fd, path, mode);
 }
 
-static int mac_selinux_label_post(int dir_fd, const char *path) {
+static int mac_selinux_label_post(int dir_fd, const char *path, bool created) {
         mac_selinux_create_file_clear();
         return 0;
 }
@@ -168,7 +167,7 @@ static int selinux_init(bool force) {
         if (!force && initialized != LAZY_INITIALIZED)
                 return 1;
 
-        r = selinux_status_open(/* netlink fallback */ 1);
+        r = selinux_status_open(/* netlink fallback= */ 1);
         if (r < 0) {
                 if (!ERRNO_IS_PRIVILEGE(errno))
                         return log_enforcing_errno(errno, "Failed to open SELinux status page: %m");
@@ -471,7 +470,7 @@ int mac_selinux_get_our_label(char **ret) {
 int mac_selinux_get_child_mls_label(int socket_fd, const char *exe, const char *exec_label, char **ret_label) {
 #if HAVE_SELINUX
         _cleanup_freecon_ char *mycon = NULL, *peercon = NULL, *fcon = NULL;
-        _cleanup_context_free_ context_t pcon = NULL, bcon = NULL;
+        _cleanup_(context_freep) context_t pcon = NULL, bcon = NULL;
         const char *range = NULL, *bcon_str = NULL;
         security_class_t sclass;
         int r;
@@ -532,17 +531,6 @@ int mac_selinux_get_child_mls_label(int socket_fd, const char *exe, const char *
 #endif
 }
 
-char* mac_selinux_free(char *label) {
-
-#if HAVE_SELINUX
-        freecon(label);
-#else
-        assert(!label);
-#endif
-
-        return NULL;
-}
-
 #if HAVE_SELINUX
 static int selinux_create_file_prepare_abspath(const char *abspath, mode_t mode) {
         _cleanup_freecon_ char *filecon = NULL;
@@ -595,10 +583,7 @@ int mac_selinux_create_file_prepare_at(
                 return 0;
 
         if (isempty(path) || !path_is_absolute(path)) {
-                if (dir_fd == AT_FDCWD)
-                        r = safe_getcwd(&abspath);
-                else
-                        r = fd_get_path(dir_fd, &abspath);
+                r = fd_get_path(dir_fd, &abspath);
                 if (r < 0)
                         return r;
 

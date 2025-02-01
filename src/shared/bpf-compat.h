@@ -15,7 +15,6 @@
  * compile time is that we can then load either the old or the new symbols at runtime
  * regardless of the version we were compiled with */
 
-
 /* declare the struct for libbpf <= 0.6.0 -- it causes no harm on newer versions */
 struct bpf_map_create_opts;
 
@@ -26,6 +25,7 @@ struct bpf_map_create_opts;
  * When removing this file move these back to bpf-dlopen.h */
 extern int (*sym_bpf_map_create)(enum bpf_map_type,  const char *, __u32, __u32, __u32, const struct bpf_map_create_opts *);
 extern int (*sym_libbpf_probe_bpf_prog_type)(enum bpf_prog_type, const void *);
+extern struct bpf_map* (*sym_bpf_object__next_map)(const struct bpf_object *obj, const struct bpf_map *map);
 
 /* compat symbols removed in libbpf 1.0 */
 extern int (*sym_bpf_create_map)(enum bpf_map_type, int key_size, int value_size, int max_entries, __u32 map_flags);

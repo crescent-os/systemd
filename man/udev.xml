@@ -86,7 +86,7 @@
           <varlistentry>
             <term><literal>!=</literal></term>
             <listitem>
-              <para>Compare for inequality. (The specified key doesn't have the specified value, or the
+              <para>Compare for inequality. (The specified key does not have the specified value, or the
               specified key is not present at all.)
               </para>
             </listitem>
@@ -140,6 +140,12 @@
           <ulink url="https://en.wikipedia.org/wiki/Escape_sequences_in_C#Table_of_escape_sequences">Escape sequences in C</ulink>.
           For example, e"string\n" is parsed as 7 characters: 6 lowercase letters and a newline.
           This can be useful for writing special characters when a kernel driver requires them.</para>
+
+          <para>The string can be prefixed with a lowercase i (i"string") to mark that the string or pattern
+          will match case-insensitively. For example, i"foo" will match
+          <literal>foo</literal>, <literal>FOO</literal>, <literal>FoO</literal> and so on. The prefix can be
+          used only for match (<literal>==</literal>) or unmatch (<literal>!=</literal>) rules, e.g.
+          <varname>ATTR{foo}==i"abcd"</varname>.</para>
 
           <para>Please note that <constant>NUL</constant> is not allowed in either string variant.</para>
       </refsect2>
@@ -712,6 +718,15 @@
 SUBSYSTEM=="net", OPTIONS="log_level=debug"</programlisting></para>
 
                     <xi:include href="version-info.xml" xpointer="v248"/>
+                  </listitem>
+                </varlistentry>
+                <varlistentry>
+                  <term><option>dump</option></term>
+                  <listitem>
+                    <para>Dump the status of the event currently processing. It may be useful for debugging
+                    udev rules by inserting this option.</para>
+
+                    <xi:include href="version-info.xml" xpointer="v258"/>
                   </listitem>
                 </varlistentry>
               </variablelist>

@@ -13,6 +13,7 @@
 #include "fileio.h"
 #include "filesystems.h"
 #include "fs-util.h"
+#include "missing_fcntl.h"
 #include "missing_fs.h"
 #include "missing_mount.h"
 #include "missing_stat.h"
@@ -35,6 +36,24 @@
  * with large file handles anyway. */
 #define ORIGINAL_MAX_HANDLE_SZ 128
 
+bool is_name_to_handle_at_fatal_error(int err) {
+        /* name_to_handle_at() can return "acceptable" errors that are due to the context. For example
+         * the file system does not support name_to_handle_at() (EOPNOTSUPP), or the syscall was blocked
+         * (EACCES/EPERM; maybe through seccomp, because we are running inside of a container), or
+         * the mount point is not triggered yet (EOVERFLOW, think autofs+nfs4), or some general name_to_handle_at()
+         * flakiness (EINVAL). However other errors are not supposed to happen and therefore are considered
+         * fatal ones. */
+
+        assert(err < 0);
+
+        if (ERRNO_IS_NEG_NOT_SUPPORTED(err))
+                return false;
+        if (ERRNO_IS_NEG_PRIVILEGE(err))
+                return false;
+
+        return !IN_SET(err, -EOVERFLOW, -EINVAL);
+}
+
 int name_to_handle_at_loop(
                 int fd,
                 const char *path,
@@ -44,7 +63,8 @@ int name_to_handle_at_loop(
 
         size_t n = ORIGINAL_MAX_HANDLE_SZ;
 
-        assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
+        assert(fd >= 0 || fd == AT_FDCWD);
+        assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH|AT_HANDLE_FID)) == 0);
 
         /* We need to invoke name_to_handle_at() in a loop, given that it might return EOVERFLOW when the specified
          * buffer is too small. Note that in contrast to what the docs might suggest, MAX_HANDLE_SZ is only good as a
@@ -86,9 +106,9 @@ int name_to_handle_at_loop(
                         return 0;
                 }
 
-                /* If name_to_handle_at() didn't increase the byte size, then this EOVERFLOW is caused by something
-                 * else (apparently EOVERFLOW is returned for untriggered nfs4 mounts sometimes), not by the too small
-                 * buffer. In that case propagate EOVERFLOW */
+                /* If name_to_handle_at() didn't increase the byte size, then this EOVERFLOW is caused by
+                 * something else (apparently EOVERFLOW is returned for untriggered nfs4 autofs mounts
+                 * sometimes), not by the too small buffer. In that case propagate EOVERFLOW */
                 if (h->handle_bytes <= n)
                         return -EOVERFLOW;
 
@@ -101,15 +121,36 @@ int name_to_handle_at_loop(
         }
 }
 
+int name_to_handle_at_try_fid(
+                int fd,
+                const char *path,
+                struct file_handle **ret_handle,
+                int *ret_mnt_id,
+                int flags) {
+
+        int r;
+
+        assert(fd >= 0 || fd == AT_FDCWD);
+
+        /* First issues name_to_handle_at() with AT_HANDLE_FID. If this fails and this is not a fatal error
+         * we'll try without the flag, in order to support older kernels that didn't have AT_HANDLE_FID
+         * (i.e. older than Linux 6.5). */
+
+        r = name_to_handle_at_loop(fd, path, ret_handle, ret_mnt_id, flags | AT_HANDLE_FID);
+        if (r >= 0 || is_name_to_handle_at_fatal_error(r))
+                return r;
+
+        return name_to_handle_at_loop(fd, path, ret_handle, ret_mnt_id, flags & ~AT_HANDLE_FID);
+}
+
 static int fd_fdinfo_mnt_id(int fd, const char *filename, int flags, int *ret_mnt_id) {
         char path[STRLEN("/proc/self/fdinfo/") + DECIMAL_STR_MAX(int)];
         _cleanup_free_ char *fdinfo = NULL;
         _cleanup_close_ int subfd = -EBADF;
-        char *p;
         int r;
 
-        assert(ret_mnt_id);
         assert((flags & ~(AT_SYMLINK_FOLLOW|AT_EMPTY_PATH)) == 0);
+        assert(ret_mnt_id);
 
         if ((flags & AT_EMPTY_PATH) && isempty(filename))
                 xsprintf(path, "/proc/self/fdinfo/%i", fd);
@@ -122,16 +163,16 @@ static int fd_fdinfo_mnt_id(int fd, const char *filename, int flags, int *ret_mn
         }
 
         r = read_full_virtual_file(path, &fdinfo, NULL);
-        if (r == -ENOENT) /* The fdinfo directory is a relatively new addition */
-                return proc_mounted() > 0 ? -EOPNOTSUPP : -ENOSYS;
+        if (r == -ENOENT)
+                return proc_fd_enoent_errno();
         if (r < 0)
                 return r;
 
-        p = find_line_startswith(fdinfo, "mnt_id:");
-        if (!p) /* The mnt_id field is a relatively new addition */
-                return -EOPNOTSUPP;
+        char *p = find_line_startswith(fdinfo, "mnt_id:");
+        if (!p)
+                return -EBADMSG;
 
-        p += strspn(p, WHITESPACE);
+        p = skip_leading_chars(p, /* bad = */ NULL);
         p[strcspn(p, WHITESPACE)] = 0;
 
         return safe_atoi(p, ret_mnt_id);
@@ -160,41 +201,47 @@ static bool filename_possibly_with_slash_suffix(const char *s) {
         return filename_is_valid(copied);
 }
 
-static bool is_name_to_handle_at_fatal_error(int err) {
-        /* name_to_handle_at() can return "acceptable" errors that are due to the context. For
-         * example the kernel does not support name_to_handle_at() at all (ENOSYS), or the syscall
-         * was blocked (EACCES/EPERM; maybe through seccomp, because we are running inside of a
-         * container), or the mount point is not triggered yet (EOVERFLOW, think nfs4), or some
-         * general name_to_handle_at() flakiness (EINVAL). However other errors are not supposed to
-         * happen and therefore are considered fatal ones. */
+bool file_handle_equal(const struct file_handle *a, const struct file_handle *b) {
+        if (a == b)
+                return true;
+        if (!a != !b)
+                return false;
+        if (a->handle_type != b->handle_type)
+                return false;
 
-        assert(err < 0);
-
-        return !IN_SET(err, -EOPNOTSUPP, -ENOSYS, -EACCES, -EPERM, -EOVERFLOW, -EINVAL);
+        return memcmp_nn(a->f_handle, a->handle_bytes, b->f_handle, b->handle_bytes) == 0;
 }
 
-int fd_is_mount_point(int fd, const char *filename, int flags) {
-        _cleanup_free_ struct file_handle *h = NULL, *h_parent = NULL;
-        int mount_id = -1, mount_id_parent = -1;
-        bool nosupp = false, check_st_dev = true;
-        STRUCT_STATX_DEFINE(sx);
-        struct stat a, b;
+int is_mount_point_at(int fd, const char *filename, int flags) {
+        bool fd_is_self;
         int r;
 
-        assert(fd >= 0);
+        assert(fd >= 0 || fd == AT_FDCWD);
         assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
 
-        if (!filename) {
-                /* If the file name is specified as NULL we'll see if the specified 'fd' is a mount
-                 * point. That's only supported if the kernel supports statx(), or if the inode specified via
-                 * 'fd' refers to a directory. Otherwise, we'll have to fail (ENOTDIR), because we have no
-                 * kernel API to query the information we need. */
-                flags |= AT_EMPTY_PATH;
-                filename = "";
-        } else if (!filename_possibly_with_slash_suffix(filename))
-                /* Insist that the specified filename is actually a filename, and not a path, i.e. some inode further
-                 * up or down the tree then immediately below the specified directory fd. */
-                return -EINVAL;
+        if (isempty(filename)) {
+                if (fd == AT_FDCWD)
+                        filename = ".";
+                else {
+                        /* If the file name is empty we'll see if the specified 'fd' is a mount point.
+                         * That's only supported if the kernel supports statx(), or if the inode specified
+                         * via 'fd' refers to a directory. Otherwise, we'll have to fail (ENOTDIR), because
+                         * we have no kernel API to query the information we need. */
+                        flags |= AT_EMPTY_PATH;
+                        filename = "";
+                }
+
+                fd_is_self = true;
+        } else if (STR_IN_SET(filename, ".", "./"))
+                fd_is_self = true;
+        else {
+                /* Insist that the specified filename is actually a filename, and not a path, i.e. some inode
+                 * further up or down the tree then immediately below the specified directory fd. */
+                if (!filename_possibly_with_slash_suffix(filename))
+                        return -EINVAL;
+
+                fd_is_self = false;
+        }
 
         /* First we will try statx()' STATX_ATTR_MOUNT_ROOT attribute, which is our ideal API, available
          * since kernel 5.8.
@@ -207,18 +254,17 @@ int fd_is_mount_point(int fd, const char *filename, int flags) {
          * If that didn't work we will try to read the mount id from /proc/self/fdinfo/<fd>. This is almost
          * as good as name_to_handle_at(), however, does not return the opaque file handle. The opaque file
          * handle is pretty useful to detect the root directory, which we should always consider a mount
-         * point. Hence we use this only as fallback. Exporting the mnt_id in fdinfo is a pretty recent
-         * kernel addition.
+         * point. Hence we use this only as fallback.
          *
-         * As last fallback we do traditional fstat() based st_dev comparisons. This is how things were
-         * traditionally done, but unionfs breaks this since it exposes file systems with a variety of st_dev
-         * reported. Also, btrfs subvolumes have different st_dev, even though they aren't real mounts of
-         * their own. */
+         * Note that traditionally the check is done via fstat()-based st_dev comparisons. However, various
+         * file systems don't guarantee same st_dev across single fs anymore, e.g. unionfs exposes file systems
+         * with a variety of st_dev reported. Also, btrfs subvolumes have different st_dev, even though
+         * they aren't real mounts of their own. */
 
-        if (statx(fd,
-                  filename,
-                  (FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : AT_SYMLINK_NOFOLLOW) |
-                  (flags & AT_EMPTY_PATH) |
+        STRUCT_STATX_DEFINE(sx);
+
+        if (statx(fd, filename,
+                  at_flags_normalize_nofollow(flags) |
                   AT_NO_AUTOMOUNT |            /* don't trigger automounts – mounts are a local concept, hence no need to trigger automounts to determine STATX_ATTR_MOUNT_ROOT */
                   AT_STATX_DONT_SYNC,          /* don't go to the network for this – for similar reasons */
                   STATX_TYPE,
@@ -231,30 +277,31 @@ int fd_is_mount_point(int fd, const char *filename, int flags) {
                 /* If statx() is not available or forbidden, fall back to name_to_handle_at() below */
         } else if (FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT)) /* yay! */
                 return FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
-        else if (FLAGS_SET(sx.stx_mask, STATX_TYPE) && S_ISLNK(sx.stx_mode))
-                return false; /* symlinks are never mount points */
 
-        r = name_to_handle_at_loop(fd, filename, &h, &mount_id, flags);
+        _cleanup_free_ struct file_handle *h = NULL, *h_parent = NULL;
+        int mount_id = -1, mount_id_parent = -1;
+        bool nosupp = false;
+
+        r = name_to_handle_at_try_fid(fd, filename, &h, &mount_id, flags);
         if (r < 0) {
                 if (is_name_to_handle_at_fatal_error(r))
                         return r;
-                if (r != -EOPNOTSUPP)
+                if (!ERRNO_IS_NOT_SUPPORTED(r))
                         goto fallback_fdinfo;
 
-                /* This kernel or file system does not support name_to_handle_at(), hence let's see
-                 * if the upper fs supports it (in which case it is a mount point), otherwise fall
-                 * back to the traditional stat() logic */
+                /* This file system does not support name_to_handle_at(), hence let's see if the upper fs
+                 * supports it (in which case it is a mount point), otherwise fall back to the fdinfo logic. */
                 nosupp = true;
         }
 
-        if (isempty(filename))
-                r = name_to_handle_at_loop(fd, "..", &h_parent, &mount_id_parent, 0); /* can't work for non-directories 😢 */
+        if (fd_is_self)
+                r = name_to_handle_at_try_fid(fd, "..", &h_parent, &mount_id_parent, 0); /* can't work for non-directories 😢 */
         else
-                r = name_to_handle_at_loop(fd, "", &h_parent, &mount_id_parent, AT_EMPTY_PATH);
+                r = name_to_handle_at_try_fid(fd, "", &h_parent, &mount_id_parent, AT_EMPTY_PATH);
         if (r < 0) {
                 if (is_name_to_handle_at_fatal_error(r))
                         return r;
-                if (r != -EOPNOTSUPP)
+                if (!ERRNO_IS_NOT_SUPPORTED(r))
                         goto fallback_fdinfo;
                 if (nosupp)
                         /* Both the parent and the directory can't do name_to_handle_at() */
@@ -272,22 +319,17 @@ int fd_is_mount_point(int fd, const char *filename, int flags) {
 
         /* If the file handle for the directory we are interested in and its parent are identical,
          * we assume this is the root directory, which is a mount point. */
-
-        if (h->handle_type == h_parent->handle_type &&
-            memcmp_nn(h->f_handle, h->handle_bytes,
-                      h_parent->f_handle, h_parent->handle_bytes) == 0)
+        if (file_handle_equal(h_parent, h))
                 return 1;
 
         return mount_id != mount_id_parent;
 
 fallback_fdinfo:
         r = fd_fdinfo_mnt_id(fd, filename, flags, &mount_id);
-        if (IN_SET(r, -EOPNOTSUPP, -EACCES, -EPERM, -ENOSYS))
-                goto fallback_fstat;
         if (r < 0)
                 return r;
 
-        if (isempty(filename))
+        if (fd_is_self)
                 r = fd_fdinfo_mnt_id(fd, "..", 0, &mount_id_parent); /* can't work for non-directories 😢 */
         else
                 r = fd_fdinfo_mnt_id(fd, "", AT_EMPTY_PATH, &mount_id_parent);
@@ -299,40 +341,33 @@ fallback_fdinfo:
 
         /* Hmm, so, the mount ids are the same. This leaves one special case though for the root file
          * system. For that, let's see if the parent directory has the same inode as we are interested
-         * in. Hence, let's also do fstat() checks now, too, but avoid the st_dev comparisons, since they
-         * aren't that useful on unionfs mounts. */
-        check_st_dev = false;
+         * in. */
 
-fallback_fstat:
+        struct stat a, b;
+
         /* yay for fstatat() taking a different set of flags than the other _at() above */
-        if (flags & AT_SYMLINK_FOLLOW)
-                flags &= ~AT_SYMLINK_FOLLOW;
-        else
-                flags |= AT_SYMLINK_NOFOLLOW;
-        if (fstatat(fd, filename, &a, flags) < 0)
+        if (fstatat(fd, filename, &a, at_flags_normalize_nofollow(flags)) < 0)
                 return -errno;
-        if (S_ISLNK(a.st_mode)) /* Symlinks are never mount points */
-                return false;
 
-        if (isempty(filename))
+        if (fd_is_self)
                 r = fstatat(fd, "..", &b, 0);
         else
                 r = fstatat(fd, "", &b, AT_EMPTY_PATH);
         if (r < 0)
                 return -errno;
 
-        /* A directory with same device and inode as its parent? Must be the root directory */
-        if (stat_inode_same(&a, &b))
-                return 1;
-
-        return check_st_dev && (a.st_dev != b.st_dev);
+        /* A directory with same device and inode as its parent must be the root directory. Otherwise
+         * not a mount point.
+         *
+         * NB: we avoid inode_same_at() here because it internally attempts name_to_handle_at_try_fid() first,
+         * which is redundant. */
+        return stat_inode_same(&a, &b);
 }
 
 /* flags can be AT_SYMLINK_FOLLOW or 0 */
 int path_is_mount_point_full(const char *path, const char *root, int flags) {
-        _cleanup_free_ char *canonical = NULL;
-        _cleanup_close_ int fd = -EBADF;
-        int r;
+        _cleanup_close_ int dfd = -EBADF;
+        _cleanup_free_ char *fn = NULL;
 
         assert(path);
         assert((flags & ~AT_SYMLINK_FOLLOW) == 0);
@@ -340,22 +375,16 @@ int path_is_mount_point_full(const char *path, const char *root, int flags) {
         if (path_equal(path, "/"))
                 return 1;
 
-        /* we need to resolve symlinks manually, we can't just rely on fd_is_mount_point() to do that for us;
+        /* we need to resolve symlinks manually, we can't just rely on is_mount_point_at() to do that for us;
          * if we have a structure like /bin -> /usr/bin/ and /usr is a mount point, then the parent that we
          * look at needs to be /usr, not /. */
-        if (FLAGS_SET(flags, AT_SYMLINK_FOLLOW)) {
-                r = chase(path, root, CHASE_TRAIL_SLASH, &canonical, NULL);
-                if (r < 0)
-                        return r;
+        dfd = chase_and_open_parent(path, root,
+                                    CHASE_TRAIL_SLASH|(FLAGS_SET(flags, AT_SYMLINK_FOLLOW) ? 0 : CHASE_NOFOLLOW),
+                                    &fn);
+        if (dfd < 0)
+                return dfd;
 
-                path = canonical;
-        }
-
-        fd = open_parent(path, O_PATH|O_CLOEXEC, 0);
-        if (fd < 0)
-                return fd;
-
-        return fd_is_mount_point(fd, last_path_component(path), flags);
+        return is_mount_point_at(dfd, fn, flags);
 }
 
 int path_get_mnt_id_at_fallback(int dir_fd, const char *path, int *ret) {
@@ -365,7 +394,7 @@ int path_get_mnt_id_at_fallback(int dir_fd, const char *path, int *ret) {
         assert(ret);
 
         r = name_to_handle_at_loop(dir_fd, path, NULL, ret, isempty(path) ? AT_EMPTY_PATH : 0);
-        if (r == 0 || is_name_to_handle_at_fatal_error(r))
+        if (r >= 0 || is_name_to_handle_at_fatal_error(r))
                 return r;
 
         return fd_fdinfo_mnt_id(dir_fd, path, isempty(path) ? AT_EMPTY_PATH : 0, ret);
@@ -495,25 +524,43 @@ bool fstype_can_discard(const char *fstype) {
         return mount_option_supported(fstype, "discard", NULL) > 0;
 }
 
-bool fstype_can_norecovery(const char *fstype) {
+const char* fstype_norecovery_option(const char *fstype) {
+        int r;
+
         assert(fstype);
 
         /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
          * not be allowed in our MAC context. */
-        if (STR_IN_SET(fstype, "ext3", "ext4", "xfs", "btrfs"))
-                return true;
+        if (STR_IN_SET(fstype, "ext3", "ext4", "xfs"))
+                return "norecovery";
+
+        /* btrfs dropped support for the "norecovery" option in 6.8
+         * (https://github.com/torvalds/linux/commit/a1912f712188291f9d7d434fba155461f1ebef66) and replaced
+         * it with rescue=nologreplay, so we check for the new name first and fall back to checking for the
+         * old name if the new name doesn't work. */
+        if (streq(fstype, "btrfs")) {
+                r = mount_option_supported(fstype, "rescue=nologreplay", NULL);
+                if (r == -EAGAIN) {
+                        log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming old kernel with 'norecovery': %m");
+                        return "norecovery";
+                }
+                if (r < 0)
+                        log_debug_errno(r, "Failed to check for btrfs 'rescue=nologreplay' option, assuming it is not supported: %m");
+                if (r > 0)
+                        return "rescue=nologreplay";
+        }
 
         /* On new kernels we can just ask the kernel */
-        return mount_option_supported(fstype, "norecovery", NULL) > 0;
+        return mount_option_supported(fstype, "norecovery", NULL) > 0 ? "norecovery" : NULL;
 }
 
-bool fstype_can_umask(const char *fstype) {
+bool fstype_can_fmask_dmask(const char *fstype) {
         assert(fstype);
 
         /* Use a curated list as first check, to avoid calling fsopen() which might load kmods, which might
          * not be allowed in our MAC context. If we don't know ourselves, on new kernels we can just ask the
          * kernel. */
-        return streq(fstype, "vfat") || mount_option_supported(fstype, "umask", "0077") > 0;
+        return streq(fstype, "vfat") || (mount_option_supported(fstype, "fmask", "0177") > 0 && mount_option_supported(fstype, "dmask", "0077") > 0);
 }
 
 bool fstype_can_uid_gid(const char *fstype) {
@@ -578,11 +625,14 @@ int dev_is_devtmpfs(void) {
         return false;
 }
 
-int mount_fd(const char *source,
-             int target_fd,
-             const char *filesystemtype,
-             unsigned long mountflags,
-             const void *data) {
+static int mount_fd(
+                const char *source,
+                int target_fd,
+                const char *filesystemtype,
+                unsigned long mountflags,
+                const void *data) {
+
+        assert(target_fd >= 0);
 
         if (mount(source, FORMAT_PROC_FD_PATH(target_fd), filesystemtype, mountflags, data) < 0) {
                 if (errno != ENOENT)
@@ -608,6 +658,8 @@ int mount_nofollow(
 
         _cleanup_close_ int fd = -EBADF;
 
+        assert(target);
+
         /* In almost all cases we want to manipulate the mount table without following symlinks, hence
          * mount_nofollow() is usually the way to go. The only exceptions are environments where /proc/ is
          * not available yet, since we need /proc/self/fd/ for this logic to work. i.e. during the early
@@ -624,7 +676,7 @@ int mount_nofollow(
         return mount_fd(source, fd, filesystemtype, mountflags, data);
 }
 
-const char *mount_propagation_flag_to_string(unsigned long flags) {
+const char* mount_propagation_flag_to_string(unsigned long flags) {
 
         switch (flags & (MS_SHARED|MS_SLAVE|MS_PRIVATE)) {
         case 0:

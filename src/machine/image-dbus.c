@@ -67,19 +67,13 @@ int bus_image_method_remove(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
                 r = image_remove(image);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
@@ -127,9 +121,9 @@ int bus_image_method_rename(
         if (r == 0)
                 return 1; /* Will call us back */
 
-        r = image_rename(image, new_name);
+        r = rename_image_and_update_cache(m, image, new_name);
         if (r < 0)
-                return r;
+                return sd_bus_error_set_errnof(error, r, "Failed to rename image: %m");
 
         return sd_bus_reply_method_return(message, NULL);
 }
@@ -184,19 +178,13 @@ int bus_image_method_clone(
                 return sd_bus_error_set_errnof(error, r, "Failed to fork(): %m");
         if (r == 0) {
                 errno_pipe_fd[0] = safe_close(errno_pipe_fd[0]);
-
-                r = image_clone(image, new_name, read_only);
-                if (r < 0) {
-                        (void) write(errno_pipe_fd[1], &r, sizeof(r));
-                        _exit(EXIT_FAILURE);
-                }
-
-                _exit(EXIT_SUCCESS);
+                r = image_clone(image, new_name, read_only, m->runtime_scope);
+                report_errno_and_exit(errno_pipe_fd[1], r);
         }
 
         errno_pipe_fd[1] = safe_close(errno_pipe_fd[1]);
 
-        r = operation_new(m, NULL, child, message, errno_pipe_fd[0], NULL);
+        r = operation_new_with_bus_reply(m, /* machine= */ NULL, child, message, errno_pipe_fd[0], /* ret= */ NULL);
         if (r < 0) {
                 (void) sigkill_wait(child);
                 return r;
@@ -369,19 +357,10 @@ int bus_image_method_get_os_release(
         return bus_reply_pair_array(message, image->os_release);
 }
 
-static int image_flush_cache(sd_event_source *s, void *userdata) {
-        Manager *m = ASSERT_PTR(userdata);
-
-        assert(s);
-
-        hashmap_clear(m->image_cache);
-        return 0;
-}
-
 static int image_object_find(sd_bus *bus, const char *path, const char *interface, void *userdata, void **found, sd_bus_error *error) {
         _cleanup_free_ char *e = NULL;
         Manager *m = userdata;
-        Image *image = NULL;
+        Image *image;
         const char *p;
         int r;
 
@@ -398,45 +377,17 @@ static int image_object_find(sd_bus *bus, const char *path, const char *interfac
         if (!e)
                 return -ENOMEM;
 
-        image = hashmap_get(m->image_cache, e);
-        if (image) {
-                *found = image;
-                return 1;
-        }
-
-        if (!m->image_cache_defer_event) {
-                r = sd_event_add_defer(m->event, &m->image_cache_defer_event, image_flush_cache, m);
-                if (r < 0)
-                        return r;
-
-                r = sd_event_source_set_priority(m->image_cache_defer_event, SD_EVENT_PRIORITY_IDLE);
-                if (r < 0)
-                        return r;
-        }
-
-        r = sd_event_source_set_enabled(m->image_cache_defer_event, SD_EVENT_ONESHOT);
-        if (r < 0)
-                return r;
-
-        r = image_find(IMAGE_MACHINE, e, NULL, &image);
+        r = manager_acquire_image(m, e, &image);
         if (r == -ENOENT)
                 return 0;
         if (r < 0)
                 return r;
 
-        image->userdata = m;
-
-        r = hashmap_ensure_put(&m->image_cache, &image_hash_ops, image->name, image);
-        if (r < 0) {
-                image_unref(image);
-                return r;
-        }
-
         *found = image;
         return 1;
 }
 
-char *image_bus_path(const char *name) {
+char* image_bus_path(const char *name) {
         _cleanup_free_ char *e = NULL;
 
         assert(name);
@@ -451,6 +402,7 @@ char *image_bus_path(const char *name) {
 static int image_node_enumerator(sd_bus *bus, const char *path, void *userdata, char ***nodes, sd_bus_error *error) {
         _cleanup_hashmap_free_ Hashmap *images = NULL;
         _cleanup_strv_free_ char **l = NULL;
+        Manager *m = ASSERT_PTR(userdata);
         Image *image;
         int r;
 
@@ -462,7 +414,7 @@ static int image_node_enumerator(sd_bus *bus, const char *path, void *userdata, 
         if (!images)
                 return -ENOMEM;
 
-        r = image_discover(IMAGE_MACHINE, NULL, images);
+        r = image_discover(m->runtime_scope, IMAGE_MACHINE, NULL, images);
         if (r < 0)
                 return r;
 

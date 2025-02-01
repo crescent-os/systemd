@@ -7,7 +7,9 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
+#include "calendarspec.h"
 #include "conf-parser.h"
 #include "hashmap.h"
 #include "list.h"
@@ -108,6 +110,7 @@ struct Manager {
         HandleAction handle_suspend_key_long_press;
         HandleAction handle_hibernate_key;
         HandleAction handle_hibernate_key_long_press;
+        HandleAction handle_secure_attention_key;
 
         HandleAction handle_lid_switch;
         HandleAction handle_lid_switch_ep;
@@ -141,6 +144,12 @@ struct Manager {
 
         char *efi_loader_entry_one_shot;
         struct stat efi_loader_entry_one_shot_stat;
+
+        CalendarSpec *maintenance_time;
+
+        dual_timestamp init_ts;
+
+        sd_varlink_server *varlink_server;
 };
 
 void manager_reset_config(Manager *m);

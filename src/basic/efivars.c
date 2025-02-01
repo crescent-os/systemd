@@ -96,6 +96,22 @@ int efi_get_variable(
                                 (void) usleep_safe(EFI_RETRY_DELAY);
                 }
 
+                /* Unfortunately kernel reports EOF if there's an inconsistency between efivarfs var list
+                 * and what's actually stored in firmware, c.f. #34304. A zero size env var is not allowed in
+                 * efi and hence the variable doesn't really exist in the backing store as long as it is zero
+                 * sized, and the kernel calls this "uncommitted". Hence we translate EOF back to ENOENT here,
+                 * as with kernel behavior before
+                 * https://github.com/torvalds/linux/commit/3fab70c165795431f00ddf9be8b84ddd07bd1f8f
+                 *
+                 * If the kernel changes behaviour (to flush dentries on resume), we can drop
+                 * this at some point in the future. But note that the commit is 11
+                 * years old at this point so we'll need to deal with the current behaviour for
+                 * a long time.
+                 */
+                if (n == 0)
+                        return log_debug_errno(SYNTHETIC_ERRNO(ENOENT),
+                                               "EFI variable %s is uncommitted", p);
+
                 if (n != sizeof(a))
                         return log_debug_errno(SYNTHETIC_ERRNO(EIO),
                                                "Read %zi bytes from EFI variable %s, expected %zu.",  n, p, sizeof(a));
@@ -145,8 +161,10 @@ int efi_get_variable(
 int efi_get_variable_string(const char *variable, char **ret) {
         _cleanup_free_ void *s = NULL;
         size_t ss = 0;
-        int r;
         char *x;
+        int r;
+
+        assert(variable);
 
         r = efi_get_variable(variable, NULL, &s, &ss);
         if (r < 0)
@@ -156,8 +174,25 @@ int efi_get_variable_string(const char *variable, char **ret) {
         if (!x)
                 return -ENOMEM;
 
-        *ret = x;
+        if (ret)
+                *ret = x;
+
         return 0;
+}
+
+int efi_get_variable_path(const char *variable, char **ret) {
+        int r;
+
+        assert(variable);
+
+        r = efi_get_variable_string(variable, ret);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                efi_tilt_backslashes(*ret);
+
+        return r;
 }
 
 static int efi_verify_variable(const char *variable, uint32_t attr, const void *value, size_t size) {
@@ -239,10 +274,7 @@ int efi_set_variable(const char *variable, const void *value, size_t size) {
 
         /* For some reason efivarfs doesn't update mtime automatically. Let's do it manually then. This is
          * useful for processes that cache EFI variables to detect when changes occurred. */
-        if (futimens(fd, (const struct timespec[2]) {
-                                { .tv_nsec = UTIME_NOW },
-                                { .tv_nsec = UTIME_NOW }
-                         }) < 0)
+        if (futimens(fd, /* times = */ NULL) < 0)
                 log_debug_errno(errno, "Failed to update mtime/atime on %s, ignoring: %m", p);
 
         r = 0;
@@ -314,7 +346,7 @@ bool is_efi_secure_boot(void) {
         int r;
 
         if (cache < 0) {
-                r = read_flag(EFI_GLOBAL_VARIABLE(SecureBoot));
+                r = read_flag(EFI_GLOBAL_VARIABLE_STR("SecureBoot"));
                 if (r == -ENOENT)
                         cache = false;
                 else if (r < 0)
@@ -332,7 +364,7 @@ SecureBootMode efi_get_secure_boot_mode(void) {
         if (cache != _SECURE_BOOT_INVALID)
                 return cache;
 
-        int secure = read_flag(EFI_GLOBAL_VARIABLE(SecureBoot));
+        int secure = read_flag(EFI_GLOBAL_VARIABLE_STR("SecureBoot"));
         if (secure < 0) {
                 if (secure != -ENOENT)
                         log_debug_errno(secure, "Error reading SecureBoot EFI variable, assuming not in SecureBoot mode: %m");
@@ -342,9 +374,9 @@ SecureBootMode efi_get_secure_boot_mode(void) {
 
         /* We can assume false for all these if they are abscent (AuditMode and
          * DeployedMode may not exist on older firmware). */
-        int audit    = read_flag(EFI_GLOBAL_VARIABLE(AuditMode));
-        int deployed = read_flag(EFI_GLOBAL_VARIABLE(DeployedMode));
-        int setup    = read_flag(EFI_GLOBAL_VARIABLE(SetupMode));
+        int audit    = read_flag(EFI_GLOBAL_VARIABLE_STR("AuditMode"));
+        int deployed = read_flag(EFI_GLOBAL_VARIABLE_STR("DeployedMode"));
+        int setup    = read_flag(EFI_GLOBAL_VARIABLE_STR("SetupMode"));
         log_debug("Secure boot variables: SecureBoot=%d AuditMode=%d DeployedMode=%d SetupMode=%d",
                   secure, audit, deployed, setup);
 
@@ -365,13 +397,13 @@ static int read_efi_options_variable(char **ret) {
                 /* Let's be helpful with the returned error and check if the variable exists at all. If it
                  * does, let's return a recognizable error (EPERM), and if not ENODATA. */
 
-                if (access(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), F_OK) < 0)
+                if (access(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), F_OK) < 0)
                         return errno == ENOENT ? -ENODATA : -errno;
 
                 return -EPERM;
         }
 
-        r = efi_get_variable_string(EFI_SYSTEMD_VARIABLE(SystemdOptions), ret);
+        r = efi_get_variable_string(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions"), ret);
         if (r == -ENOENT)
                 return -ENODATA;
         return r;
@@ -385,7 +417,7 @@ int cache_efi_options_variable(void) {
         if (r < 0)
                 return r;
 
-        return write_string_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), line,
+        return write_string_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), line,
                                  WRITE_STRING_FILE_ATOMIC|WRITE_STRING_FILE_CREATE|WRITE_STRING_FILE_MKDIR_0755);
 }
 
@@ -402,7 +434,7 @@ int systemd_efi_options_variable(char **ret) {
         if (e)
                 return strdup_to(ret, e);
 
-        r = read_one_line_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), ret);
+        r = read_one_line_file(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), ret);
         if (r == -ENOENT)
                 return -ENODATA;
         return r;
@@ -416,12 +448,12 @@ int systemd_efi_options_efivarfs_if_newer(char **ret) {
         struct stat a = {}, b;
         int r;
 
-        if (stat(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), &a) < 0 && errno != ENOENT)
+        if (stat(EFIVAR_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), &a) < 0 && errno != ENOENT)
                 return log_debug_errno(errno, "Failed to stat EFI variable SystemdOptions: %m");
 
-        if (stat(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions)), &b) < 0) {
+        if (stat(EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions")), &b) < 0) {
                 if (errno != ENOENT)
-                        log_debug_errno(errno, "Failed to stat "EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE(SystemdOptions))": %m");
+                        log_debug_errno(errno, "Failed to stat "EFIVAR_CACHE_PATH(EFI_SYSTEMD_VARIABLE_STR("SystemdOptions"))": %m");
         } else if (compare_stat_mtime(&a, &b) > 0)
                 log_debug("Variable SystemdOptions in evifarfs is newer than in cache.");
         else {

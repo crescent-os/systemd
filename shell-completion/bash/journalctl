@@ -47,11 +47,11 @@ _journalctl() {
                       --show-cursor --dmesg -k --pager-end -e -r --reverse
                       --utc -x --catalog --no-full --force --dump-catalog
                       --flush --rotate --sync --no-hostname -N --fields
-                      --list-namespaces'
+                      --list-namespaces --list-invocations -I'
         [ARG]='-b --boot -D --directory --file -F --field -t --identifier
                       -T --exclude-identifier --facility -M --machine -o --output
                       -u --unit --user-unit -p --priority --root --case-sensitive
-                      --namespace'
+                      --namespace --invocation'
         [ARGUNKNOWN]='-c --cursor --interval -n --lines -S --since -U --until
                       --after-cursor --cursor-file --verify-key -g --grep
                       --vacuum-size --vacuum-time --vacuum-files --output-fields'
@@ -94,7 +94,11 @@ _journalctl() {
                 compopt -o nosort
                 ;;
             --unit|-u)
-                comps=$(journalctl -F '_SYSTEMD_UNIT' 2>/dev/null)
+                if __contains_word "--user" ${COMP_WORDS[*]}; then
+                     comps=$(journalctl -F '_SYSTEMD_USER_UNIT' 2>/dev/null)
+                else
+                     comps=$(journalctl -F '_SYSTEMD_UNIT' 2>/dev/null)
+                fi
                 # Similarly to systemctl, we need to distinguish between
                 # escaped and unescaped names in order to be able to correctly
                 # complete them. In this particular case, if the name we're
@@ -109,6 +113,10 @@ _journalctl() {
                 ;;
             --user-unit)
                 comps=$(journalctl -F '_SYSTEMD_USER_UNIT' 2>/dev/null)
+                if ! [[ $cur =~ '\\' ]]; then
+                    cur="$(printf '%q' $cur)"
+                fi
+                compopt -o filenames
                 ;;
             --identifier|-t|--exclude-identifier|-T)
                 comps=$(journalctl -F 'SYSLOG_IDENTIFIER' 2>/dev/null)

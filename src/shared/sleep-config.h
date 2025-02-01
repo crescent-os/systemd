@@ -33,6 +33,7 @@ typedef struct SleepConfig {
         char **mem_modes;                           /* /sys/power/mem_sleep */
 
         usec_t hibernate_delay_usec;
+        bool hibernate_on_ac_power;
         usec_t suspend_estimation_usec;
 } SleepConfig;
 
@@ -59,6 +60,8 @@ typedef enum SleepSupport {
         SLEEP_NOT_CONFIGURED,              /* SleepConfig.states is not configured */
         SLEEP_STATE_OR_MODE_NOT_SUPPORTED, /* SleepConfig.states/modes are not supported by kernel */
         SLEEP_RESUME_NOT_SUPPORTED,
+        SLEEP_RESUME_DEVICE_MISSING,       /* resume= is specified, but the device cannot be found in /proc/swaps */
+        SLEEP_RESUME_MISCONFIGURED,        /* resume= is not set yet resume_offset= is configured */
         SLEEP_NOT_ENOUGH_SWAP_SPACE,
         SLEEP_ALARM_NOT_SUPPORTED,         /* CLOCK_BOOTTIME_ALARM is unsupported by kernel (only used by s2h) */
 } SleepSupport;

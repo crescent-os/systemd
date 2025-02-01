@@ -7,6 +7,7 @@
 #include "sd-bus.h"
 #include "sd-device.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
 #include "common-signal.h"
 #include "cgroup-util.h"
@@ -16,7 +17,6 @@
 #include "list.h"
 #include "prioq.h"
 #include "ratelimit.h"
-#include "varlink.h"
 
 struct libmnt_monitor;
 typedef struct Unit Unit;
@@ -121,7 +121,7 @@ typedef enum ManagerTimestamp {
         MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_START,
         MANAGER_TIMESTAMP_INITRD_UNITS_LOAD_FINISH,
 
-        MANAGER_TIMESTAMP_SOFTREBOOT_START,
+        MANAGER_TIMESTAMP_SHUTDOWN_START,
 
         _MANAGER_TIMESTAMP_MAX,
         _MANAGER_TIMESTAMP_INVALID = -EINVAL,
@@ -139,6 +139,7 @@ typedef enum WatchdogType {
 #include "job.h"
 #include "path-lookup.h"
 #include "show-status.h"
+#include "transaction.h"
 #include "unit-name.h"
 #include "unit.h"
 
@@ -162,8 +163,7 @@ typedef struct UnitDefaults {
         usec_t restart_usec, timeout_start_usec, timeout_stop_usec, timeout_abort_usec, device_timeout_usec;
         bool timeout_abort_set;
 
-        usec_t start_limit_interval;
-        unsigned start_limit_burst;
+        RateLimit start_limit;
 
         bool cpu_accounting;
         bool memory_accounting;
@@ -286,6 +286,12 @@ struct Manager {
         int user_lookup_fds[2];
         sd_event_source *user_lookup_event_source;
 
+        int handoff_timestamp_fds[2];
+        sd_event_source *handoff_timestamp_event_source;
+
+        int pidref_transport_fds[2];
+        sd_event_source *pidref_event_source;
+
         RuntimeScope runtime_scope;
 
         LookupPaths lookup_paths;
@@ -329,12 +335,15 @@ struct Manager {
         int private_listen_fd;
         sd_event_source *private_listen_event_source;
 
-        /* Contains all the clients that are subscribed to signals via
-        the API bus. Note that private bus connections are always
-        considered subscribes, since they last for very short only,
-        and it is much simpler that way. */
+        /* Contains all the clients that are subscribed to signals via the API bus. Note that private bus
+         * connections are always considered subscribes, since they last for very short only, and it is
+         * much simpler that way. */
         sd_bus_track *subscribed;
-        char **deserialized_subscribed;
+        char **subscribed_as_strv;
+
+        /* The bus id of API bus acquired through org.freedesktop.DBus.GetId, which before deserializing
+         * subscriptions we'd use to verify the bus is still the same instance as before. */
+        sd_id128_t bus_id, deserialized_bus_id;
 
         /* This is used during reloading: before the reload we queue
          * the reply message here, and afterwards we send it */
@@ -379,6 +388,8 @@ struct Manager {
         bool etc_localtime_accessible;
 
         ManagerObjective objective;
+        /* Objective as it was before serialization, mostly to detect soft-reboots */
+        ManagerObjective previous_objective;
 
         /* Flags */
         bool dispatching_load_queue;
@@ -429,7 +440,6 @@ struct Manager {
 
         /* Do we have any outstanding password prompts? */
         int have_ask_password;
-        int ask_password_inotify_fd;
         sd_event_source *ask_password_event_source;
 
         /* Type=idle pipes */
@@ -481,12 +491,12 @@ struct Manager {
         unsigned sigchldgen;
         unsigned notifygen;
 
-        VarlinkServer *varlink_server;
+        sd_varlink_server *varlink_server;
         /* When we're a system manager, this object manages the subscription from systemd-oomd to PID1 that's
          * used to report changes in ManagedOOM settings (systemd server - oomd client). When
          * we're a user manager, this object manages the client connection from the user manager to
          * systemd-oomd to report changes in ManagedOOM settings (systemd client - oomd server). */
-        Varlink *managed_oom_varlink;
+        sd_varlink *managed_oom_varlink;
 
         /* Reference to RestrictFileSystems= BPF program */
         struct restrict_fs_bpf *restrict_fs;
@@ -506,6 +516,9 @@ struct Manager {
         int executor_fd;
 
         unsigned soft_reboots_count;
+
+        /* Original ambient capabilities when we were initialized */
+        uint64_t saved_ambient_set;
 };
 
 static inline usec_t manager_default_timeout_abort_usec(Manager *m) {
@@ -548,9 +561,26 @@ int manager_load_unit(Manager *m, const char *name, const char *path, sd_bus_err
 int manager_load_startable_unit_or_warn(Manager *m, const char *name, const char *path, Unit **ret);
 int manager_load_unit_from_dbus_path(Manager *m, const char *s, sd_bus_error *e, Unit **_u);
 
-int manager_add_job(Manager *m, JobType type, Unit *unit, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **_ret);
-int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **_ret);
-int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs,  Job **ret);
+int manager_add_job_full(
+                Manager *m,
+                JobType type,
+                Unit *unit,
+                JobMode mode,
+                TransactionAddFlags extra_flags,
+                Set *affected_jobs,
+                sd_bus_error *error,
+                Job **ret);
+static inline int manager_add_job(
+                Manager *m,
+                JobType type,
+                Unit *unit,
+                JobMode mode,
+                sd_bus_error *error,
+                Job **ret) {
+        return manager_add_job_full(m, type, unit, mode, 0, NULL, error, ret);
+}
+int manager_add_job_by_name(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, sd_bus_error *e, Job **ret);
+int manager_add_job_by_name_and_warn(Manager *m, JobType type, const char *name, JobMode mode, Set *affected_jobs, Job **ret);
 int manager_propagate_reload(Manager *m, Unit *unit, JobMode mode, sd_bus_error *e);
 
 void manager_clear_jobs(Manager *m);
@@ -614,8 +644,6 @@ int manager_ref_uid(Manager *m, uid_t uid, bool clean_ipc);
 void manager_unref_gid(Manager *m, gid_t gid, bool destroy_now);
 int manager_ref_gid(Manager *m, gid_t gid, bool clean_ipc);
 
-char* manager_taint_string(const Manager *m);
-
 void manager_ref_console(Manager *m);
 void manager_unref_console(Manager *m);
 
@@ -625,13 +653,16 @@ void manager_restore_original_log_level(Manager *m);
 void manager_override_log_target(Manager *m, LogTarget target);
 void manager_restore_original_log_target(Manager *m);
 
-const char *manager_state_to_string(ManagerState m) _const_;
-ManagerState manager_state_from_string(const char *s) _pure_;
-
-const char *manager_get_confirm_spawn(Manager *m);
+const char* manager_get_confirm_spawn(Manager *m);
 void manager_disable_confirm_spawn(void);
 
-const char *manager_timestamp_to_string(ManagerTimestamp m) _const_;
+const char* manager_state_to_string(ManagerState m) _const_;
+ManagerState manager_state_from_string(const char *s) _pure_;
+
+const char* manager_objective_to_string(ManagerObjective m) _const_;
+ManagerObjective manager_objective_from_string(const char *s) _pure_;
+
+const char* manager_timestamp_to_string(ManagerTimestamp m) _const_;
 ManagerTimestamp manager_timestamp_from_string(const char *s) _pure_;
 ManagerTimestamp manager_timestamp_initrd_mangle(ManagerTimestamp s);
 
@@ -653,22 +684,24 @@ void unit_defaults_done(UnitDefaults *defaults);
 
 enum {
         /* most important … */
-        EVENT_PRIORITY_USER_LOOKUP      = SD_EVENT_PRIORITY_NORMAL-10,
-        EVENT_PRIORITY_MOUNT_TABLE      = SD_EVENT_PRIORITY_NORMAL-9,
-        EVENT_PRIORITY_SWAP_TABLE       = SD_EVENT_PRIORITY_NORMAL-9,
-        EVENT_PRIORITY_CGROUP_AGENT     = SD_EVENT_PRIORITY_NORMAL-8, /* cgroupv1 */
-        EVENT_PRIORITY_CGROUP_INOTIFY   = SD_EVENT_PRIORITY_NORMAL-8, /* cgroupv2 */
-        EVENT_PRIORITY_CGROUP_OOM       = SD_EVENT_PRIORITY_NORMAL-7,
-        EVENT_PRIORITY_EXEC_FD          = SD_EVENT_PRIORITY_NORMAL-6,
-        EVENT_PRIORITY_NOTIFY           = SD_EVENT_PRIORITY_NORMAL-5,
-        EVENT_PRIORITY_SIGCHLD          = SD_EVENT_PRIORITY_NORMAL-4,
-        EVENT_PRIORITY_SIGNALS          = SD_EVENT_PRIORITY_NORMAL-3,
-        EVENT_PRIORITY_CGROUP_EMPTY     = SD_EVENT_PRIORITY_NORMAL-2,
-        EVENT_PRIORITY_TIME_CHANGE      = SD_EVENT_PRIORITY_NORMAL-1,
-        EVENT_PRIORITY_TIME_ZONE        = SD_EVENT_PRIORITY_NORMAL-1,
-        EVENT_PRIORITY_IPC              = SD_EVENT_PRIORITY_NORMAL,
-        EVENT_PRIORITY_REWATCH_PIDS     = SD_EVENT_PRIORITY_IDLE,
-        EVENT_PRIORITY_SERVICE_WATCHDOG = SD_EVENT_PRIORITY_IDLE+1,
-        EVENT_PRIORITY_RUN_QUEUE        = SD_EVENT_PRIORITY_IDLE+2,
+        EVENT_PRIORITY_USER_LOOKUP       = SD_EVENT_PRIORITY_NORMAL-12,
+        EVENT_PRIORITY_MOUNT_TABLE       = SD_EVENT_PRIORITY_NORMAL-11,
+        EVENT_PRIORITY_SWAP_TABLE        = SD_EVENT_PRIORITY_NORMAL-11,
+        EVENT_PRIORITY_CGROUP_AGENT      = SD_EVENT_PRIORITY_NORMAL-10, /* cgroupv1 */
+        EVENT_PRIORITY_CGROUP_INOTIFY    = SD_EVENT_PRIORITY_NORMAL-10, /* cgroupv2 */
+        EVENT_PRIORITY_CGROUP_OOM        = SD_EVENT_PRIORITY_NORMAL-9,
+        EVENT_PRIORITY_PIDREF            = SD_EVENT_PRIORITY_NORMAL-8,
+        EVENT_PRIORITY_HANDOFF_TIMESTAMP = SD_EVENT_PRIORITY_NORMAL-7,
+        EVENT_PRIORITY_EXEC_FD           = SD_EVENT_PRIORITY_NORMAL-6,
+        EVENT_PRIORITY_NOTIFY            = SD_EVENT_PRIORITY_NORMAL-5,
+        EVENT_PRIORITY_SIGCHLD           = SD_EVENT_PRIORITY_NORMAL-4,
+        EVENT_PRIORITY_SIGNALS           = SD_EVENT_PRIORITY_NORMAL-3,
+        EVENT_PRIORITY_CGROUP_EMPTY      = SD_EVENT_PRIORITY_NORMAL-2,
+        EVENT_PRIORITY_TIME_CHANGE       = SD_EVENT_PRIORITY_NORMAL-1,
+        EVENT_PRIORITY_TIME_ZONE         = SD_EVENT_PRIORITY_NORMAL-1,
+        EVENT_PRIORITY_IPC               = SD_EVENT_PRIORITY_NORMAL,
+        EVENT_PRIORITY_REWATCH_PIDS      = SD_EVENT_PRIORITY_IDLE,
+        EVENT_PRIORITY_SERVICE_WATCHDOG  = SD_EVENT_PRIORITY_IDLE+1,
+        EVENT_PRIORITY_RUN_QUEUE         = SD_EVENT_PRIORITY_IDLE+2,
         /* … to least important */
 };

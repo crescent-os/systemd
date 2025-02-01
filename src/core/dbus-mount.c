@@ -63,7 +63,7 @@ const sd_bus_vtable bus_mount_vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_PROPERTY("Where", "s", NULL, offsetof(Mount, where), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("What", "s", property_get_what, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
-        SD_BUS_PROPERTY("Options","s", property_get_options, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("Options", "s", property_get_options, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("Type", "s", property_get_type, 0, SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("TimeoutUSec", "t", bus_property_get_usec, offsetof(Mount, timeout_usec), SD_BUS_VTABLE_PROPERTY_CONST),
         SD_BUS_PROPERTY("ControlPID", "u", bus_property_get_pid, offsetof(Mount, control_pid.pid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
@@ -75,6 +75,7 @@ const sd_bus_vtable bus_mount_vtable[] = {
         SD_BUS_PROPERTY("Result", "s", property_get_result, offsetof(Mount, result), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("UID", "u", bus_property_get_uid, offsetof(Unit, ref_uid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
         SD_BUS_PROPERTY("GID", "u", bus_property_get_gid, offsetof(Unit, ref_gid), SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+        SD_BUS_PROPERTY("GracefulOptions", "as", NULL, offsetof(Mount, graceful_options), SD_BUS_VTABLE_PROPERTY_CONST),
         BUS_EXEC_COMMAND_VTABLE("ExecMount", offsetof(Mount, exec_command[MOUNT_EXEC_MOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_VTABLE("ExecUnmount", offsetof(Mount, exec_command[MOUNT_EXEC_UNMOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
         BUS_EXEC_COMMAND_VTABLE("ExecRemount", offsetof(Mount, exec_command[MOUNT_EXEC_REMOUNT]), SD_BUS_VTABLE_PROPERTY_EMITS_INVALIDATION),
@@ -150,6 +151,30 @@ static int bus_mount_set_transient_property(
         if (streq(name, "ReadWriteOnly"))
                 return bus_set_transient_bool(u, name, &m->read_write_only, message, flags, error);
 
+        if (streq(name, "GracefulOptions")) {
+                _cleanup_strv_free_ char **add = NULL;
+                r = sd_bus_message_read_strv(message, &add);
+                if (r < 0)
+                        return r;
+
+                if (!UNIT_WRITE_FLAGS_NOOP(flags)) {
+
+                        if (strv_isempty(add)) {
+                                m->graceful_options = strv_free(m->graceful_options);
+                                unit_write_settingf(u, flags, name, "GracefulOptions=");
+                        } else {
+                                r = strv_extend_strv(&m->graceful_options, add, /* filter_duplicates= */ false);
+                                if (r < 0)
+                                        return r;
+
+                                STRV_FOREACH(a, add)
+                                        unit_write_settingf(u, flags|UNIT_ESCAPE_SPECIFIERS, name, "GracefulOptions=%s", *a);
+                        }
+                }
+
+                return 1;
+        }
+
         return 0;
 }
 
@@ -193,7 +218,7 @@ int bus_mount_set_property(
 int bus_mount_commit_properties(Unit *u) {
         assert(u);
 
-        unit_realize_cgroup(u);
+        (void) unit_realize_cgroup(u);
 
         return 0;
 }

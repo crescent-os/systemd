@@ -26,12 +26,12 @@ static int help(void) {
                 { "test",         "Test an event run"                 },
                 { "test-builtin", "Test a built-in command"           },
                 { "verify",       "Verify udev rules files"           },
+                { "cat",          "Show udev rules files"             },
                 { "wait",         "Wait for device or device symlink" },
                 { "lock",         "Lock a block device"               },
         };
 
         _cleanup_free_ char *link = NULL;
-        size_t i;
         int r;
 
         r = terminal_urlify_man("udevadm", "8", &link);
@@ -43,8 +43,8 @@ static int help(void) {
                "Commands:\n",
                program_invocation_short_name);
 
-        for (i = 0; i < ELEMENTSOF(short_descriptions); i++)
-                printf("  %-12s  %s\n", short_descriptions[i][0], short_descriptions[i][1]);
+        FOREACH_ELEMENT(desc, short_descriptions)
+                printf("  %-12s  %s\n", (*desc)[0], (*desc)[1]);
 
         printf("\nSee the %s for details.\n", link);
         return 0;
@@ -98,6 +98,7 @@ static int help_main(int argc, char *argv[], void *userdata) {
 
 static int udevadm_main(int argc, char *argv[]) {
         static const Verb verbs[] = {
+                { "cat",          VERB_ANY, VERB_ANY, 0, cat_main     },
                 { "info",         VERB_ANY, VERB_ANY, 0, info_main    },
                 { "trigger",      VERB_ANY, VERB_ANY, 0, trigger_main },
                 { "settle",       VERB_ANY, VERB_ANY, 0, settle_main  },
@@ -123,7 +124,7 @@ static int run(int argc, char *argv[]) {
         if (invoked_as(argv, "udevd"))
                 return run_udevd(argc, argv);
 
-        udev_parse_config();
+        (void) udev_parse_config();
         log_setup();
 
         r = parse_argv(argc, argv);

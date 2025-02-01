@@ -13,10 +13,12 @@
 #include "mountpoint-util.h"
 #include "nspawn-cgroup.h"
 #include "nspawn-mount.h"
+#include "nsresource.h"
 #include "path-util.h"
 #include "rm-rf.h"
 #include "string-util.h"
 #include "strv.h"
+#include "tmpfile-util.h"
 #include "user-util.h"
 
 static int chown_cgroup_path(const char *path, uid_t uid_shift) {
@@ -46,41 +48,10 @@ static int chown_cgroup_path(const char *path, uid_t uid_shift) {
         return 0;
 }
 
-int chown_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
-        _cleanup_free_ char *path = NULL, *fs = NULL;
-        int r;
-
-        r = cg_pid_get_path(NULL, pid, &path);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get container cgroup path: %m");
-
-        r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, path, NULL, &fs);
-        if (r < 0)
-                return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
-
-        r = chown_cgroup_path(fs, uid_shift);
-        if (r < 0)
-                return log_error_errno(r, "Failed to chown() cgroup %s: %m", fs);
-
-        if (unified_requested == CGROUP_UNIFIED_SYSTEMD || (unified_requested == CGROUP_UNIFIED_NONE && cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0)) {
-                _cleanup_free_ char *lfs = NULL;
-                /* Always propagate access rights from unified to legacy controller */
-
-                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER_LEGACY, path, NULL, &lfs);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
-
-                r = chown_cgroup_path(lfs, uid_shift);
-                if (r < 0)
-                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", lfs);
-        }
-
-        return 0;
-}
-
 int sync_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
+        _cleanup_(rmdir_and_freep) char *tree = NULL;
         _cleanup_free_ char *cgroup = NULL;
-        char tree[] = "/tmp/unifiedXXXXXX", pid_string[DECIMAL_STR_MAX(pid) + 1];
+        char pid_string[DECIMAL_STR_MAX(pid) + 1];
         bool undo_mount = false;
         const char *fn;
         int r, unified_controller;
@@ -101,8 +72,9 @@ int sync_cgroup(pid_t pid, CGroupUnified unified_requested, uid_t uid_shift) {
                 return log_error_errno(r, "Failed to get control group of " PID_FMT ": %m", pid);
 
         /* In order to access the unified hierarchy we need to mount it */
-        if (!mkdtemp(tree))
-                return log_error_errno(errno, "Failed to generate temporary mount point for unified hierarchy: %m");
+        r = mkdtemp_malloc("/tmp/unifiedXXXXXX", &tree);
+        if (r < 0)
+                return log_error_errno(r, "Failed to generate temporary mount point for unified hierarchy: %m");
 
         if (unified_controller > 0)
                 r = mount_nofollow_verbose(LOG_ERR, "cgroup", tree, "cgroup",
@@ -138,11 +110,17 @@ finish:
         if (undo_mount)
                 (void) umount_verbose(LOG_ERR, tree, UMOUNT_NOFOLLOW);
 
-        (void) rmdir(tree);
         return r;
 }
 
-int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested) {
+int create_subcgroup(
+                pid_t pid,
+                bool keep_unit,
+                CGroupUnified unified_requested,
+                uid_t uid_shift,
+                int userns_fd,
+                UserNamespaceMode userns_mode) {
+
         _cleanup_free_ char *cgroup = NULL, *payload = NULL;
         CGroupMask supported;
         char *e;
@@ -185,13 +163,54 @@ int create_subcgroup(pid_t pid, bool keep_unit, CGroupUnified unified_requested)
         if (!payload)
                 return log_oom();
 
-        r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, payload, pid);
+        if (userns_mode != USER_NAMESPACE_MANAGED)
+                r = cg_create_and_attach(SYSTEMD_CGROUP_CONTROLLER, payload, pid);
+        else
+                r = cg_create(SYSTEMD_CGROUP_CONTROLLER, payload);
         if (r < 0)
                 return log_error_errno(r, "Failed to create %s subcgroup: %m", payload);
 
+        if (userns_mode != USER_NAMESPACE_MANAGED) {
+                _cleanup_free_ char *fs = NULL;
+                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER, payload, NULL, &fs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
+
+                r = chown_cgroup_path(fs, uid_shift);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", fs);
+
+        } else if (userns_fd >= 0) {
+                _cleanup_close_ int cgroup_fd = -EBADF;
+
+                cgroup_fd = cg_path_open(SYSTEMD_CGROUP_CONTROLLER, payload);
+                if (cgroup_fd < 0)
+                        return log_error_errno(cgroup_fd, "Failed to open cgroup %s: %m", payload);
+
+                r = cg_fd_attach(cgroup_fd, pid);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add process " PID_FMT " to cgroup %s: %m", pid, payload);
+
+                r = nsresource_add_cgroup(userns_fd, cgroup_fd);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to add cgroup %s to userns: %m", payload);
+        }
+
+        if (unified_requested == CGROUP_UNIFIED_SYSTEMD || (unified_requested == CGROUP_UNIFIED_NONE && cg_unified_controller(SYSTEMD_CGROUP_CONTROLLER) > 0)) {
+                _cleanup_free_ char *lfs = NULL;
+                /* Always propagate access rights from unified to legacy controller */
+
+                r = cg_get_path(SYSTEMD_CGROUP_CONTROLLER_LEGACY, payload, NULL, &lfs);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to get file system path for container cgroup: %m");
+
+                r = chown_cgroup_path(lfs, uid_shift);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to chown() cgroup %s: %m", lfs);
+        }
+
         if (keep_unit) {
                 _cleanup_free_ char *supervisor = NULL;
-
                 supervisor = path_join(cgroup, "supervisor");
                 if (!supervisor)
                         return log_oom();

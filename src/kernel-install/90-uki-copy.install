@@ -34,9 +34,10 @@ UKI_DIR="$BOOT_ROOT/EFI/Linux"
 case "$COMMAND" in
     remove)
         [ "$KERNEL_INSTALL_VERBOSE" -gt 0 ] && \
-            echo "Removing $UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION*.efi"
-        exec rm -f \
+            echo "Removing $UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION*.efi and extras"
+        exec rm -rf \
             "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi" \
+            "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi.extra.d/" \
             "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION+"*".efi"
         ;;
     add)
@@ -61,10 +62,18 @@ if [ -f "$TRIES_FILE" ]; then
         echo "$TRIES_FILE does not contain an integer." >&2
         exit 1
     fi
+    if [ -f "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi" ]; then
+        [ "$KERNEL_INSTALL_VERBOSE" -gt 0 ] && \
+            echo "Removing previous UKI '$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi' without boot counting." >&2
+        rm -f "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi" "$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION+"*.efi
+    fi
+
     UKI_FILE="$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION+$TRIES.efi"
 else
     UKI_FILE="$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi"
 fi
+
+ADDON_DIR="$UKI_DIR/$ENTRY_TOKEN-$KERNEL_VERSION.efi.extra.d"
 
 # If there is a UKI named uki.efi on the staging area use that, if not use what
 # was passed in as $KERNEL_IMAGE but insist it has a .efi extension
@@ -74,6 +83,14 @@ if [ -f "$KERNEL_INSTALL_STAGING_AREA/uki.efi" ]; then
         echo "Error: could not copy '$KERNEL_INSTALL_STAGING_AREA/uki.efi' to '$UKI_FILE'." >&2
         exit 1
     }
+    for f in "$KERNEL_INSTALL_STAGING_AREA/uki.efi.extra.d"/*; do
+        [ -f "$f" ] || continue
+        [ "$KERNEL_INSTALL_VERBOSE" -gt 0 ] && echo "Installing $f as $ADDON_DIR/$(basename "$f")"
+        install -D -m 0644 "$f" "$ADDON_DIR/$(basename "$f")" || {
+            echo "Error: could not copy '$f' to '$ADDON_DIR/$(basename "$f")'." >&2
+            exit 1
+        }
+    done
 elif [ -n "$KERNEL_IMAGE" ]; then
     [ -f "$KERNEL_IMAGE" ] || {
         echo "Error: UKI '$KERNEL_IMAGE' not a file." >&2
@@ -88,6 +105,14 @@ elif [ -n "$KERNEL_IMAGE" ]; then
         echo "Error: could not copy '$KERNEL_IMAGE' to '$UKI_FILE'." >&2
         exit 1
     }
+    for f in "$KERNEL_IMAGE.extra.d"/* "$KERNEL_INSTALL_STAGING_AREA/uki.efi.extra.d"/*; do
+        [ -f "$f" ] || continue
+        [ "$KERNEL_INSTALL_VERBOSE" -gt 0 ] && echo "Installing $f as $ADDON_DIR/$(basename "$f")"
+        install -D -m 0644 "$f" "$ADDON_DIR/$(basename "$f")" || {
+            echo "Error: could not copy '$f' to '$ADDON_DIR/$(basename "$f")'." >&2
+            exit 1
+        }
+    done
 else
     [ "$KERNEL_INSTALL_VERBOSE" -gt 0 ] && echo "No UKI available. Nothing to do."
     exit 0

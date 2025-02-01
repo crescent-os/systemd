@@ -318,6 +318,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 .name = "@default",
                 .help = "System calls that are always permitted",
                 .value =
+                "@sandbox\0"
                 "arch_prctl\0"      /* Used during platform-specific initialization by ld-linux.so. */
                 "brk\0"
                 "cacheflush\0"
@@ -362,6 +363,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "mmap\0"
                 "mmap2\0"
                 "mprotect\0"
+                "mseal\0"
                 "munmap\0"
                 "nanosleep\0"
                 "pause\0"
@@ -380,6 +382,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "sigreturn\0"
                 "time\0"
                 "ugetrlimit\0"
+                "uretprobe\0"
         },
         [SYSCALL_FILTER_SET_AIO] = {
                 .name = "@aio",
@@ -406,6 +409,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "dup\0"
                 "dup2\0"
                 "dup3\0"
+                "llseek\0"
                 "lseek\0"
                 "pread64\0"
                 "preadv\0"
@@ -487,6 +491,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "fsetxattr\0"
                 "fstat\0"
                 "fstat64\0"
+                "fstatat\0"
                 "fstatat64\0"
                 "fstatfs\0"
                 "fstatfs64\0"
@@ -497,6 +502,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "getdents\0"
                 "getdents64\0"
                 "getxattr\0"
+                "getxattrat\0"
                 "inotify_add_watch\0"
                 "inotify_init\0"
                 "inotify_init1\0"
@@ -504,7 +510,9 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "lgetxattr\0"
                 "link\0"
                 "linkat\0"
+                "listmount\0"
                 "listxattr\0"
+                "listxattrat\0"
                 "llistxattr\0"
                 "lremovexattr\0"
                 "lsetxattr\0"
@@ -514,6 +522,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "mkdirat\0"
                 "mknod\0"
                 "mknodat\0"
+                "newfstat\0"
                 "newfstatat\0"
                 "oldfstat\0"
                 "oldlstat\0"
@@ -524,15 +533,18 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 "readlink\0"
                 "readlinkat\0"
                 "removexattr\0"
+                "removexattrat\0"
                 "rename\0"
                 "renameat\0"
                 "renameat2\0"
                 "rmdir\0"
                 "setxattr\0"
+                "setxattrat\0"
                 "stat\0"
                 "stat64\0"
                 "statfs\0"
                 "statfs64\0"
+                "statmount\0"
                 "statx\0"
                 "symlink\0"
                 "symlinkat\0"
@@ -873,6 +885,7 @@ const SyscallFilterSet syscall_filter_sets[_SYSCALL_FILTER_SET_MAX] = {
                 .name = "@sync",
                 .help = "Synchronize files and memory to storage",
                 .value =
+                /* Please also update the list in seccomp_suppress_sync(). */
                 "fdatasync\0"
                 "fsync\0"
                 "msync\0"
@@ -1725,14 +1738,13 @@ int seccomp_restrict_realtime_full(int error_code) {
 
         int r, max_policy = 0;
         uint32_t arch;
-        unsigned i;
 
         assert(error_code > 0);
 
         /* Determine the highest policy constant we want to allow */
-        for (i = 0; i < ELEMENTSOF(permitted_policies); i++)
-                if (permitted_policies[i] > max_policy)
-                        max_policy = permitted_policies[i];
+        FOREACH_ELEMENT(policy, permitted_policies)
+                if (*policy > max_policy)
+                        max_policy = *policy;
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
                 _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
@@ -1750,8 +1762,8 @@ int seccomp_restrict_realtime_full(int error_code) {
                         bool good = false;
 
                         /* Check if this is in the allow list. */
-                        for (i = 0; i < ELEMENTSOF(permitted_policies); i++)
-                                if (permitted_policies[i] == p) {
+                        FOREACH_ELEMENT(policy, permitted_policies)
+                                if (*policy == p) {
                                         good = true;
                                         break;
                                 }
@@ -2030,39 +2042,43 @@ int parse_syscall_archs(char **l, Set **ret_archs) {
         return 0;
 }
 
+int seccomp_filter_set_add_by_name(Hashmap *filter, bool add, const char *name) {
+        assert(filter);
+        assert(name);
+
+        if (name[0] == '@') {
+                const SyscallFilterSet *more;
+
+                more = syscall_filter_set_find(name);
+                if (!more)
+                        return -ENXIO;
+
+                return seccomp_filter_set_add(filter, add, more);
+        }
+
+        int id = seccomp_syscall_resolve_name(name);
+        if (id == __NR_SCMP_ERROR) {
+                log_debug("System call %s is not known, ignoring.", name);
+                return 0;
+        }
+
+        if (add)
+                return hashmap_put(filter, INT_TO_PTR(id + 1), INT_TO_PTR(-1));
+
+        (void) hashmap_remove(filter, INT_TO_PTR(id + 1));
+        return 0;
+}
+
 int seccomp_filter_set_add(Hashmap *filter, bool add, const SyscallFilterSet *set) {
         int r;
 
+        assert(filter);
         assert(set);
 
         NULSTR_FOREACH(i, set->value) {
-
-                if (i[0] == '@') {
-                        const SyscallFilterSet *more;
-
-                        more = syscall_filter_set_find(i);
-                        if (!more)
-                                return -ENXIO;
-
-                        r = seccomp_filter_set_add(filter, add, more);
-                        if (r < 0)
-                                return r;
-                } else {
-                        int id;
-
-                        id = seccomp_syscall_resolve_name(i);
-                        if (id == __NR_SCMP_ERROR) {
-                                log_debug("System call %s is not known, ignoring.", i);
-                                continue;
-                        }
-
-                        if (add) {
-                                r = hashmap_put(filter, INT_TO_PTR(id + 1), INT_TO_PTR(-1));
-                                if (r < 0)
-                                        return r;
-                        } else
-                                (void) hashmap_remove(filter, INT_TO_PTR(id + 1));
-                }
+                r = seccomp_filter_set_add_by_name(filter, add, i);
+                if (r < 0)
+                        return r;
         }
 
         return 0;
@@ -2454,8 +2470,10 @@ int seccomp_suppress_sync(void) {
         uint32_t arch;
         int r;
 
-        /* This is mostly identical to SystemCallFilter=~@sync:0, but simpler to use, and separately
-         * manageable, and also masks O_SYNC/O_DSYNC */
+        /* This behaves slightly differently from SystemCallFilter=~@sync:0, in that negative fds (which
+         * we can determine to be invalid) are still refused with EBADF. See #34478.
+         *
+         * Additionally, O_SYNC/O_DSYNC are masked. */
 
         SECCOMP_FOREACH_LOCAL_ARCH(arch) {
                 _cleanup_(seccomp_releasep) scmp_filter_ctx seccomp = NULL;
@@ -2473,11 +2491,21 @@ int seccomp_suppress_sync(void) {
                                 continue;
                         }
 
-                        r = seccomp_rule_add_exact(
-                                        seccomp,
-                                        SCMP_ACT_ERRNO(0), /* success → we want this to be a NOP after all */
-                                        id,
-                                        0);
+                        if (STR_IN_SET(c, "fdatasync", "fsync", "sync_file_range", "sync_file_range2", "syncfs"))
+                                r = seccomp_rule_add_exact(
+                                                seccomp,
+                                                SCMP_ACT_ERRNO(0), /* success → we want this to be a NOP after all */
+                                                id,
+                                                1,
+                                                SCMP_A0(SCMP_CMP_LE, INT_MAX)); /* The rule handles arguments in unsigned. Hence, this
+                                                                                 * means non-negative fd matches the rule, and the negative
+                                                                                 * fd passed to the syscall (then it fails with EBADF). */
+                        else
+                                r = seccomp_rule_add_exact(
+                                                seccomp,
+                                                SCMP_ACT_ERRNO(0), /* success → we want this to be a NOP after all */
+                                                id,
+                                                0);
                         if (r < 0)
                                 log_debug_errno(r, "Failed to add filter for system call %s, ignoring: %m", c);
                 }

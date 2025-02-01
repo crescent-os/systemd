@@ -109,7 +109,7 @@ TEST(device_path_make_canonical) {
 static void test_devnum_format_str_one(dev_t devnum, const char *s) {
         dev_t x;
 
-        assert_se(streq(FORMAT_DEVNUM(devnum), s));
+        ASSERT_STREQ(FORMAT_DEVNUM(devnum), s);
         assert_se(parse_devnum(s, &x) >= 0);
         assert_se(x == devnum);
 }
@@ -119,6 +119,23 @@ TEST(devnum_format_str) {
         test_devnum_format_str_one(makedev(1, 2), "1:2");
         test_devnum_format_str_one(makedev(99, 100), "99:100");
         test_devnum_format_str_one(makedev(4095, 1048575), "4095:1048575");
+}
+
+TEST(devnum_to_ptr) {
+        dev_t m = makedev(0, 0);
+        ASSERT_EQ(major(m), 0U);
+        ASSERT_EQ(minor(m), 0U);
+        ASSERT_EQ(m, PTR_TO_DEVNUM(DEVNUM_TO_PTR(m)));
+
+        m = makedev(DEVNUM_MAJOR_MAX, DEVNUM_MINOR_MAX);
+        ASSERT_EQ(major(m), DEVNUM_MAJOR_MAX);
+        ASSERT_EQ(minor(m), DEVNUM_MINOR_MAX);
+        ASSERT_EQ(m, PTR_TO_DEVNUM(DEVNUM_TO_PTR(m)));
+
+        m = makedev(5, 8);
+        ASSERT_EQ(major(m), 5U);
+        ASSERT_EQ(minor(m), 8U);
+        ASSERT_EQ(m, PTR_TO_DEVNUM(DEVNUM_TO_PTR(m)));
 }
 
 DEFINE_TEST_MAIN(LOG_INFO);

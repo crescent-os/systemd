@@ -28,7 +28,7 @@
 static bool arg_ready = false;
 static bool arg_reloading = false;
 static bool arg_stopping = false;
-static pid_t arg_pid = 0;
+static PidRef arg_pid = PIDREF_NULL;
 static const char *arg_status = NULL;
 static bool arg_booted = false;
 static uid_t arg_uid = UID_INVALID;
@@ -39,6 +39,7 @@ static char **arg_exec = NULL;
 static FDSet *arg_fds = NULL;
 static char *arg_fdname = NULL;
 
+STATIC_DESTRUCTOR_REGISTER(arg_pid, pidref_done);
 STATIC_DESTRUCTOR_REGISTER(arg_env, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_exec, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_fds, fdset_freep);
@@ -79,36 +80,71 @@ static int help(void) {
         return 0;
 }
 
-static pid_t manager_pid(void) {
-        const char *e;
-        pid_t pid;
+static int get_manager_pid(PidRef *ret) {
         int r;
+
+        assert(ret);
 
         /* If we run as a service managed by systemd --user the $MANAGERPID environment variable points to
          * the service manager's PID. */
-        e = getenv("MANAGERPID");
-        if (!e)
-                return 0;
-
-        r = parse_pid(e, &pid);
-        if (r < 0) {
-                log_warning_errno(r, "$MANAGERPID is set to an invalid PID, ignoring: %s", e);
+        const char *e = getenv("MANAGERPID");
+        if (!e) {
+                *ret = PIDREF_NULL;
                 return 0;
         }
 
-        return pid;
+        _cleanup_(pidref_done) PidRef manager = PIDREF_NULL;
+        r = pidref_set_pidstr(&manager, e);
+        if (r < 0)
+                return log_warning_errno(r, "$MANAGERPID is set to an invalid PID, ignoring: %s", e);
+
+        e = getenv("MANAGERPIDFDID");
+        if (e) {
+                uint64_t manager_pidfd_id;
+
+                r = safe_atou64(e, &manager_pidfd_id);
+                if (r < 0)
+                        return log_warning_errno(r, "$MANAGERPIDFDID is not set to a valid inode number, ignoring: %s", e);
+
+                r = pidref_acquire_pidfd_id(&manager);
+                if (r < 0)
+                        return log_warning_errno(r, "Unable to acquire pidfd ID for manager: %m");
+
+                if (manager_pidfd_id != manager.fd_id) {
+                        log_debug("$MANAGERPIDFDID doesn't match process currently referenced by $MANAGERPID, suppressing.");
+                        *ret = PIDREF_NULL;
+                        return 0;
+                }
+        }
+
+        *ret = TAKE_PIDREF(manager);
+        return 1;
 }
 
-static pid_t pid_parent_if_possible(void) {
-        pid_t parent_pid = getppid();
+static int pidref_parent_if_applicable(PidRef *ret) {
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL, manager = PIDREF_NULL;
+        int r;
+
+        assert(ret);
+
+        r = pidref_set_parent(&pidref);
+        if (r < 0)
+                return log_debug_errno(r, "Failed to create reference to our parent process: %m");
 
         /* Don't send from PID 1 or the service manager's PID (which might be distinct from 1, if we are a
          * --user service). That'd just be confusing for the service manager. */
-        if (parent_pid <= 1 ||
-            parent_pid == manager_pid())
-                return getpid_cached();
+        if (pidref.pid == 1)
+                goto from_self;
 
-        return parent_pid;
+        r = get_manager_pid(&manager);
+        if (r > 0 && pidref_equal(&pidref, &manager))
+                goto from_self;
+
+        *ret = TAKE_PIDREF(pidref);
+        return 0;
+
+from_self:
+        return pidref_set_self(ret);
 }
 
 static int parse_argv(int argc, char *argv[]) {
@@ -175,17 +211,18 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case ARG_PID:
+                        pidref_done(&arg_pid);
+
                         if (isempty(optarg) || streq(optarg, "auto"))
-                                arg_pid = pid_parent_if_possible();
+                                r = pidref_parent_if_applicable(&arg_pid);
                         else if (streq(optarg, "parent"))
-                                arg_pid = getppid();
+                                r = pidref_set_parent(&arg_pid);
                         else if (streq(optarg, "self"))
-                                arg_pid = getpid_cached();
-                        else {
-                                r = parse_pid(optarg, &arg_pid);
-                                if (r < 0)
-                                        return log_error_errno(r, "Failed to parse PID %s.", optarg);
-                        }
+                                r = pidref_set_self(&arg_pid);
+                        else
+                                r = pidref_set_pidstr(&arg_pid, optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to refer to --pid='%s': %m", optarg);
 
                         break;
 
@@ -276,7 +313,7 @@ static int parse_argv(int argc, char *argv[]) {
         if (arg_fdname && fdset_isempty(arg_fds))
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "No file descriptors passed, but --fdname= set, refusing.");
 
-        bool have_env = arg_ready || arg_stopping || arg_reloading || arg_status || arg_pid > 0 || !fdset_isempty(arg_fds);
+        bool have_env = arg_ready || arg_stopping || arg_reloading || arg_status || pidref_is_set(&arg_pid) || !fdset_isempty(arg_fds);
         size_t n_arg_env;
 
         if (do_exec) {
@@ -326,9 +363,10 @@ static int parse_argv(int argc, char *argv[]) {
 }
 
 static int run(int argc, char* argv[]) {
-        _cleanup_free_ char *status = NULL, *cpid = NULL, *msg = NULL, *monotonic_usec = NULL, *fdn = NULL;
+        _cleanup_free_ char *status = NULL, *main_pid = NULL, *main_pidfd_id = NULL, *msg = NULL,
+                       *monotonic_usec = NULL, *fdn = NULL;
         _cleanup_strv_free_ char **final_env = NULL;
-        const char *our_env[9];
+        const char *our_env[10];
         size_t i = 0;
         int r;
 
@@ -371,11 +409,22 @@ static int run(int argc, char* argv[]) {
                 our_env[i++] = status;
         }
 
-        if (arg_pid > 0) {
-                if (asprintf(&cpid, "MAINPID="PID_FMT, arg_pid) < 0)
+        if (pidref_is_set(&arg_pid)) {
+                if (asprintf(&main_pid, "MAINPID="PID_FMT, arg_pid.pid) < 0)
                         return log_oom();
 
-                our_env[i++] = cpid;
+                our_env[i++] = main_pid;
+
+                r = pidref_acquire_pidfd_id(&arg_pid);
+                if (r < 0)
+                        log_debug_errno(r, "Unable to acquire pidfd id of new main pid " PID_FMT ", ignoring: %m",
+                                        arg_pid.pid);
+                else {
+                        if (asprintf(&main_pidfd_id, "MAINPIDFDID=%" PRIu64, arg_pid.fd_id) < 0)
+                                return log_oom();
+
+                        our_env[i++] = main_pidfd_id;
+                }
         }
 
         if (!fdset_isempty(arg_fds)) {
@@ -415,11 +464,11 @@ static int run(int argc, char* argv[]) {
 
         /* If --pid= is explicitly specified, use it as source pid. Otherwise, pretend the message originates
          * from our parent, i.e. --pid=auto */
-        if (arg_pid <= 0)
-                arg_pid = pid_parent_if_possible();
+        if (!pidref_is_set(&arg_pid))
+                (void) pidref_parent_if_applicable(&arg_pid);
 
         if (fdset_isempty(arg_fds))
-                r = sd_pid_notify(arg_pid, /* unset_environment= */ false, msg);
+                r = sd_pid_notify(arg_pid.pid, /* unset_environment= */ false, msg);
         else {
                 _cleanup_free_ int *a = NULL;
                 int k;
@@ -428,9 +477,11 @@ static int run(int argc, char* argv[]) {
                 if (k < 0)
                         return log_error_errno(k, "Failed to convert file descriptor set to array: %m");
 
-                r = sd_pid_notify_with_fds(arg_pid, /* unset_environment= */ false, msg, a, k);
+                r = sd_pid_notify_with_fds(arg_pid.pid, /* unset_environment= */ false, msg, a, k);
 
         }
+        if (r == -E2BIG)
+                return log_error_errno(r, "Too many file descriptors passed.");
         if (r < 0)
                 return log_error_errno(r, "Failed to notify init system: %m");
         if (r == 0)
@@ -440,7 +491,7 @@ static int run(int argc, char* argv[]) {
         arg_fds = fdset_free(arg_fds); /* Close before we execute anything */
 
         if (!arg_no_block) {
-                r = sd_pid_notify_barrier(arg_pid, /* unset_environment= */ false, 5 * USEC_PER_SEC);
+                r = sd_pid_notify_barrier(arg_pid.pid, /* unset_environment= */ false, 5 * USEC_PER_SEC);
                 if (r < 0)
                         return log_error_errno(r, "Failed to invoke barrier: %m");
                 if (r == 0)

@@ -149,7 +149,7 @@ static int loop_configure_verify(int fd, const struct loop_config *c) {
                  * into the block device. Let's hence verify if things work correctly here
                  * before returning. */
 
-                r = blockdev_partscan_enabled(fd);
+                r = blockdev_partscan_enabled_fd(fd);
                 if (r < 0)
                         return r;
                 if (r == 0) {
@@ -312,11 +312,8 @@ static int loop_configure(
 
         if (!loop_configure_broken) {
                 if (ioctl(fd, LOOP_CONFIGURE, c) < 0) {
-                        /* Do fallback only if LOOP_CONFIGURE is not supported, propagate all other
-                         * errors. Note that the kernel is weird: non-existing ioctls currently return EINVAL
-                         * rather than ENOTTY on loopback block devices. They should fix that in the kernel,
-                         * but in the meantime we accept both here. */
-                        if (!ERRNO_IS_NOT_SUPPORTED(errno) && errno != EINVAL)
+                        /* Do fallback only if LOOP_CONFIGURE is not supported, propagate all other errors. */
+                        if (!ERRNO_IS_IOCTL_NOT_SUPPORTED(errno))
                                 return log_device_debug_errno(dev, errno, "ioctl(LOOP_CONFIGURE) failed: %m");
 
                         loop_configure_broken = true;

@@ -7,10 +7,12 @@ set -o pipefail
 # default to Debian testing
 DISTRO="${DISTRO:-debian}"
 RELEASE="${RELEASE:-bookworm}"
+SALSA_URL="${SALSA_URL:-https://salsa.debian.org/systemd-team/systemd.git}"
 BRANCH="${BRANCH:-debian/master}"
 ARCH="${ARCH:-amd64}"
 CONTAINER="${RELEASE}-${ARCH}"
-CACHE_DIR="${SEMAPHORE_CACHE_DIR:-/tmp}"
+CACHE_DIR=/var/tmp
+TMPDIR=/var/tmp
 AUTOPKGTEST_DIR="${CACHE_DIR}/autopkgtest"
 # semaphore cannot expose these, but useful for interactive/local runs
 ARTIFACTS_DIR=/tmp/artifacts
@@ -72,7 +74,7 @@ for phase in "${PHASES[@]}"; do
         ;;
         RUN)
             # add current debian/ packaging
-            git fetch --depth=1 https://salsa.debian.org/systemd-team/systemd.git "$BRANCH"
+            git fetch --depth=1 "$SALSA_URL" "$BRANCH"
             git checkout FETCH_HEAD debian
 
             # craft changelog
@@ -93,7 +95,7 @@ EOF
             # disable autopkgtests which are not for upstream
             sed -i '/# NOUPSTREAM/ q' debian/tests/control
             # enable more unit tests
-            sed -i '/^CONFFLAGS =/ s/=/= --werror -Dtests=unsafe -Dslow-tests=true -Dfuzz-tests=true -Dman=true /' debian/rules
+            sed -i '/^CONFFLAGS =/ s/=/= --werror /' debian/rules
             # no orig tarball
             echo '1.0' >debian/source/format
 
@@ -103,9 +105,9 @@ EOF
             # now build the package and run the tests
             rm -rf "$ARTIFACTS_DIR"
             # autopkgtest exits with 2 for "some tests skipped", accept that
-            sudo "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS="noudeb nostrip optimize=-lto" \
+            sudo TMPDIR=/var/tmp "$AUTOPKGTEST_DIR/runner/autopkgtest" --env DEB_BUILD_OPTIONS="noudeb nostrip nodoc optimize=-lto" \
                                                        --env DPKG_DEB_COMPRESSOR_TYPE="none" \
-                                                       --env DEB_BUILD_PROFILES="pkg.systemd.upstream noudeb" \
+                                                       --env DEB_BUILD_PROFILES="pkg.systemd.upstream noudeb nodoc" \
                                                        --env TEST_UPSTREAM=1 \
                                                        ../systemd_*.dsc \
                                                        -o "$ARTIFACTS_DIR" \

@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
-#include <sys/utsname.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
+#include <sys/utsname.h>
 
 #include "alloc-util.h"
 #include "color-util.h"
@@ -17,6 +18,7 @@
 #include "string-util.h"
 #include "strv.h"
 #include "terminal-util.h"
+#include "utf8.h"
 
 void draw_cylon(char buffer[], size_t buflen, unsigned width, unsigned pos) {
         char *p = buffer;
@@ -74,6 +76,25 @@ bool urlify_enabled(void) {
 #endif
 }
 
+static bool url_suitable_for_osc8(const char *url) {
+        assert(url);
+
+        /* Not all URLs are safe for inclusion in OSC 8 due to charset and length restrictions. Let's detect
+         * which ones those are */
+
+        /* If the URL is longer than 2K let's not try to do OSC 8. As per recommendation in
+         * https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda#length-limits */
+        if (strlen(url) > 2000)
+                return false;
+
+        /* OSC sequences may only contain chars from the 32..126 range, as per ECMA-48 */
+        for (const char *c = url; *c; c++)
+                if (!osc_char_is_valid(*c))
+                        return false;
+
+        return true;
+}
+
 int terminal_urlify(const char *url, const char *text, char **ret) {
         char *n;
 
@@ -85,8 +106,10 @@ int terminal_urlify(const char *url, const char *text, char **ret) {
         if (isempty(text))
                 text = url;
 
-        if (urlify_enabled())
-                n = strjoin("\x1B]8;;", url, "\a", text, "\x1B]8;;\a");
+        if (urlify_enabled() && url_suitable_for_osc8(url))
+                n = strjoin(ANSI_OSC "8;;", url, ANSI_ST,
+                            text,
+                            ANSI_OSC "8;;" ANSI_ST);
         else
                 n = strdup(text);
         if (!n)
@@ -160,34 +183,20 @@ int terminal_urlify_man(const char *page, const char *section, char **ret) {
         return terminal_urlify(url, text, ret);
 }
 
-typedef enum {
-        LINE_SECTION,
-        LINE_COMMENT,
-        LINE_NORMAL,
-} LineType;
-
-static LineType classify_line_type(const char *line, CatFlags flags) {
-        const char *t = skip_leading_chars(line, WHITESPACE);
-
-        if ((flags & CAT_FORMAT_HAS_SECTIONS) && *t == '[')
-                return LINE_SECTION;
-        if (IN_SET(*t, '#', ';', '\0'))
-                return LINE_COMMENT;
-        return LINE_NORMAL;
-}
-
 static int cat_file(const char *filename, bool newline, CatFlags flags) {
         _cleanup_fclose_ FILE *f = NULL;
         _cleanup_free_ char *urlified = NULL, *section = NULL, *old_section = NULL;
         int r;
 
+        assert(filename);
+
         f = fopen(filename, "re");
         if (!f)
-                return -errno;
+                return log_error_errno(errno, "Failed to open \"%s\": %m", filename);
 
         r = terminal_urlify_path(filename, NULL, &urlified);
         if (r < 0)
-                return r;
+                return log_error_errno(r, "Failed to urlify path \"%s\": %m", filename);
 
         printf("%s%s# %s%s\n",
                newline ? "\n" : "",
@@ -196,7 +205,7 @@ static int cat_file(const char *filename, bool newline, CatFlags flags) {
                ansi_normal());
         fflush(stdout);
 
-        for (;;) {
+        for (bool continued = false;;) {
                 _cleanup_free_ char *line = NULL;
 
                 r = read_line(f, LONG_LINE_MAX, &line);
@@ -205,58 +214,78 @@ static int cat_file(const char *filename, bool newline, CatFlags flags) {
                 if (r == 0)
                         break;
 
-                LineType line_type = classify_line_type(line, flags);
-                if (FLAGS_SET(flags, CAT_TLDR)) {
-                        if (line_type == LINE_SECTION) {
-                                /* The start of a section, let's not print it yet. */
+                const char *l = skip_leading_chars(line, WHITESPACE);
+
+                /* comment */
+                if (*l != '\0' && strchr(COMMENTS, *l)) {
+                        if (!FLAGS_SET(flags, CAT_TLDR))
+                                printf("%s%s%s\n", ansi_highlight_grey(), line, ansi_normal());
+                        continue;
+                }
+
+                /* empty line */
+                if (FLAGS_SET(flags, CAT_TLDR) && (isempty(l) || streq(l, "\\")))
+                        continue;
+
+                /* section */
+                if (FLAGS_SET(flags, CAT_FORMAT_HAS_SECTIONS) && *l == '[' && !continued) {
+                        if (FLAGS_SET(flags, CAT_TLDR))
+                                /* On TLDR, let's not print it yet. */
                                 free_and_replace(section, line);
-                                continue;
-                        }
+                        else
+                                printf("%s%s%s\n", ansi_highlight_cyan(), line, ansi_normal());
+                        continue;
+                }
 
-                        if (line_type == LINE_COMMENT)
-                                continue;
+                /* normal line */
 
-                        /* Before we print the actual line, print the last section header */
-                        if (section) {
-                                /* Do not print redundant section headers */
-                                if (!streq_ptr(section, old_section))
-                                        printf("%s%s%s\n",
-                                               ansi_highlight_cyan(),
-                                               section,
-                                               ansi_normal());
+                /* Before we print the line, print the last section header. */
+                if (FLAGS_SET(flags, CAT_TLDR) && section) {
+                        /* Do not print redundant section headers */
+                        if (!streq_ptr(section, old_section))
+                                printf("%s%s%s\n", ansi_highlight_cyan(), section, ansi_normal());
 
-                                free_and_replace(old_section, section);
-                        }
+                        free_and_replace(old_section, section);
+                }
+
+                /* Check if the line ends with a backslash. */
+                bool escaped = false;
+                char *e;
+                for (e = line; *e != '\0'; e++) {
+                        if (escaped)
+                                escaped = false;
+                        else if (*e == '\\')
+                                escaped = true;
+                }
+
+                /* Highlight the trailing backslash. */
+                if (escaped) {
+                        assert(e > line);
+                        *(e-1) = '\0';
+
+                        if (!strextend(&line, ansi_highlight_red(), "\\", ansi_normal()))
+                                return log_oom();
                 }
 
                 /* Highlight the left side (directive) of a Foo=bar assignment */
-                if (FLAGS_SET(flags, CAT_FORMAT_HAS_SECTIONS) && line_type == LINE_NORMAL) {
+                if (FLAGS_SET(flags, CAT_FORMAT_HAS_SECTIONS) && !continued) {
                         const char *p = strchr(line, '=');
                         if (p) {
-                                _cleanup_free_ char *highlighted = NULL, *directive = NULL;
+                                _cleanup_free_ char *directive = NULL;
 
                                 directive = strndup(line, p - line);
                                 if (!directive)
                                         return log_oom();
 
-                                highlighted = strjoin(ansi_highlight_green(),
-                                                      directive,
-                                                      "=",
-                                                      ansi_normal(),
-                                                      p + 1);
-                                if (!highlighted)
-                                        return log_oom();
-
-                                free_and_replace(line, highlighted);
+                                printf("%s%s=%s%s\n", ansi_highlight_green(), directive, ansi_normal(), p + 1);
+                                continued = escaped;
+                                continue;
                         }
                 }
 
-                printf("%s%s%s\n",
-                       line_type == LINE_SECTION ? ansi_highlight_cyan() :
-                       line_type == LINE_COMMENT ? ansi_highlight_grey() :
-                       "",
-                       line,
-                       line_type != LINE_NORMAL ? ansi_normal() : "");
+                /* Otherwise, print the line as is. */
+                printf("%s\n", line);
+                continued = escaped;
         }
 
         return 0;
@@ -289,12 +318,13 @@ void print_separator(void) {
                 size_t c = columns();
 
                 flockfile(stdout);
-                fputs_unlocked(ANSI_UNDERLINE, stdout);
+                fputs_unlocked(ansi_grey_underline(), stdout);
 
                 for (size_t i = 0; i < c; i++)
                         fputc_unlocked(' ', stdout);
 
-                fputs_unlocked(ANSI_NORMAL "\n\n", stdout);
+                fputs_unlocked(ansi_normal(), stdout);
+                fputs_unlocked("\n\n", stdout);
                 funlockfile(stdout);
         } else
                 fputs("\n\n", stdout);
@@ -444,16 +474,40 @@ int terminal_tint_color(double hue, char **ret) {
         return 0;
 }
 
-void draw_progress_bar(const char *prefix, double percentage) {
+bool shall_tint_background(void) {
+        static int cache = -1;
 
+        if (cache >= 0)
+                return cache;
+
+        cache = getenv_bool("SYSTEMD_TINT_BACKGROUND");
+        if (cache == -ENXIO)
+                return (cache = true);
+        if (cache < 0)
+                log_debug_errno(cache, "Failed to parse $SYSTEMD_TINT_BACKGROUND, leaving background tinting enabled: %m");
+
+        return cache != 0;
+}
+
+void draw_progress_bar_unbuffered(const char *prefix, double percentage) {
         fputc('\r', stderr);
-        if (prefix)
+        if (prefix) {
                 fputs(prefix, stderr);
+                fputc(' ', stderr);
+        }
 
         if (!terminal_is_dumb()) {
+                /* Generate the Windows Terminal progress indication OSC sequence here. Most Linux terminals currently
+                 * ignore this. But let's hope this changes one day. For details about this OSC sequence, see:
+                 *
+                 * https://conemu.github.io/en/AnsiEscapeCodes.html#ConEmu_specific_OSC
+                 * https://github.com/microsoft/terminal/pull/8055
+                 */
+                fprintf(stderr, ANSI_OSC "9;4;1;%u" ANSI_ST, (unsigned) ceil(percentage));
+
                 size_t cols = columns();
-                size_t prefix_length = strlen_ptr(prefix);
-                size_t length = cols > prefix_length + 6 ? cols - prefix_length - 6 : 0;
+                size_t prefix_width = utf8_console_width(prefix) + 1 /* space */;
+                size_t length = cols > prefix_width + 6 ? cols - prefix_width - 6 : 0;
 
                 if (length > 5 && percentage >= 0.0 && percentage <= 100.0) {
                         size_t p = (size_t) (length * percentage / 100.0);
@@ -496,19 +550,49 @@ void draw_progress_bar(const char *prefix, double percentage) {
                 fputs(ANSI_ERASE_TO_END_OF_LINE, stderr);
 
         fputc('\r', stderr);
-        fflush(stderr);
 }
 
-void clear_progress_bar(const char *prefix) {
-
+void clear_progress_bar_unbuffered(const char *prefix) {
         fputc('\r', stderr);
 
         if (terminal_is_dumb())
-                fputs(strrepa(" ", strlen_ptr(prefix) + 4), /* 4: %3.0f%% */
+                fputs(strrepa(" ",
+                              prefix ? utf8_console_width(prefix) + 5 : /* %3.0f%% (4 chars) + space */
+                              LESS_BY(columns(), 1U)),
                       stderr);
         else
-                fputs(ANSI_ERASE_TO_END_OF_LINE, stderr);
+                /* Undo Windows Terminal progress indication again. */
+                fputs(ANSI_OSC "9;4;0;" ANSI_ST
+                      ANSI_ERASE_TO_END_OF_LINE, stderr);
 
         fputc('\r', stderr);
-        fflush(stderr);
+}
+
+void draw_progress_bar(const char *prefix, double percentage) {
+        /* We are going output a bunch of small strings that shall appear as a single line to STDERR which is
+         * unbuffered by default. Let's temporarily turn on full buffering, so that this is passed to the tty
+         * as a single buffer, to make things more efficient. */
+        WITH_BUFFERED_STDERR;
+        draw_progress_bar_unbuffered(prefix, percentage);
+}
+
+int draw_progress_barf(double percentage, const char *prefixf, ...) {
+        _cleanup_free_ char *s = NULL;
+        va_list ap;
+        int r;
+
+        va_start(ap, prefixf);
+        r = vasprintf(&s, prefixf, ap);
+        va_end(ap);
+
+        if (r < 0)
+                return -ENOMEM;
+
+        draw_progress_bar(s, percentage);
+        return 0;
+}
+
+void clear_progress_bar(const char *prefix) {
+        WITH_BUFFERED_STDERR;
+        clear_progress_bar_unbuffered(prefix);
 }

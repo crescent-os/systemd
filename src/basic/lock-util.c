@@ -139,7 +139,14 @@ static int fcntl_lock(int fd, int operation, bool ofd) {
                 .l_len = 0,
         }));
 
-        if (r == -EACCES) /* Treat EACCESS/EAGAIN the same as per man page. */
+        /* If we are doing non-blocking operations, treat EACCES/EAGAIN the same as per man page. But if
+         * not, propagate EACCES back, as it will likely be due to an LSM denying the operation (for example
+         * LXC with AppArmor when running on kernel < 6.2), and in some cases we want to gracefully
+         * fallback (e.g.: PrivateNetwork=yes). As per documentation, it's only the non-blocking operation
+         * F_SETLK that might return EACCES on some platforms (although the Linux implementation doesn't
+         * seem to), as F_SETLKW and F_OFD_SETLKW block so this is not an issue, and F_OFD_SETLK is documented
+         * to only return EAGAIN if the lock is already held. */
+        if ((operation & LOCK_NB) && r == -EACCES)
                 r = -EAGAIN;
 
         return r;
@@ -196,9 +203,9 @@ int lock_generic_with_timeout(int fd, LockType type, int operation, usec_t timeo
 
         assert(fd >= 0);
 
-        /* A version of lock_generic(), but with a time-out. We do this in a child process, since the kernel
+        /* A version of lock_generic(), but with a timeout. We do this in a child process, since the kernel
          * APIs natively don't support a timeout. We set a SIGALRM timer that will kill the child after the
-         * timeout is hit. Returns -ETIMEDOUT if the time-out is hit, and 0 on success.
+         * timeout is hit. Returns -ETIMEDOUT if the timeout is hit, and 0 on success.
          *
          * This only works for BSD and UNPOSIX locks, as only those are fd-bound, and hence can be acquired
          * from any process that has access to the fd. POSIX locks OTOH are process-bound, and hence if we'd
@@ -224,7 +231,7 @@ int lock_generic_with_timeout(int fd, LockType type, int operation, usec_t timeo
                         .sigev_notify = SIGEV_SIGNAL,
                         .sigev_signo = SIGALRM,
                 };
-                timer_t id = 0;
+                timer_t id;
 
                 if (timer_create(CLOCK_MONOTONIC, &sev, &id) < 0) {
                         log_error_errno(errno, "Failed to allocate CLOCK_MONOTONIC timer: %m");

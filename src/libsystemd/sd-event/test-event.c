@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#if HAVE_PIDFD_OPEN
+#include <sys/pidfd.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -195,7 +198,7 @@ static int post_handler(sd_event_source *s, void *userdata) {
         return 2;
 }
 
-static void test_basic_one(bool with_pidfd) {
+TEST(basic) {
         sd_event *e = NULL;
         sd_event_source *w = NULL, *x = NULL, *y = NULL, *z = NULL, *q = NULL, *t = NULL;
         static const char ch = 'x';
@@ -203,10 +206,6 @@ static void test_basic_one(bool with_pidfd) {
             d[2] = EBADF_PAIR, k[2] = EBADF_PAIR;
         uint64_t event_now;
         int64_t priority;
-
-        log_info("/* %s(pidfd=%s) */", __func__, yes_no(with_pidfd));
-
-        assert_se(setenv("SYSTEMD_PIDFD", yes_no(with_pidfd), 1) >= 0);
 
         assert_se(pipe(a) >= 0);
         assert_se(pipe(b) >= 0);
@@ -298,13 +297,6 @@ static void test_basic_one(bool with_pidfd) {
         safe_close_pair(b);
         safe_close_pair(d);
         safe_close_pair(k);
-
-        assert_se(unsetenv("SYSTEMD_PIDFD") >= 0);
-}
-
-TEST(basic) {
-        test_basic_one(true);   /* test with pidfd */
-        test_basic_one(false);  /* test without pidfd */
 }
 
 TEST(sd_event_now) {
@@ -396,6 +388,7 @@ struct inotify_context {
         unsigned create_called[CREATE_EVENTS_MAX];
         unsigned create_overflow;
         unsigned n_create_events;
+        const char *path;
 };
 
 static void maybe_exit(sd_event_source *s, struct inotify_context *c) {
@@ -422,9 +415,11 @@ static void maybe_exit(sd_event_source *s, struct inotify_context *c) {
 }
 
 static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, void *userdata) {
-        struct inotify_context *c = userdata;
-        const char *description;
+        struct inotify_context *c = ASSERT_PTR(userdata);
+        const char *path, *description;
         unsigned bit, n;
+
+        assert_se(sd_event_source_get_inotify_path(s, &path) >= 0);
 
         assert_se(sd_event_source_get_description(s, &description) >= 0);
         assert_se(safe_atou(description, &n) >= 0);
@@ -433,11 +428,12 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
         bit = 1U << n;
 
         if (ev->mask & IN_Q_OVERFLOW) {
-                log_info("inotify-handler <%s>: overflow", description);
+                log_info("inotify-handler for %s <%s>: overflow", path, description);
                 c->create_overflow |= bit;
         } else if (ev->mask & IN_CREATE) {
+                assert_se(path_equal_or_inode_same(path, c->path, 0));
                 if (streq(ev->name, "sub"))
-                        log_debug("inotify-handler <%s>: create on %s", description, ev->name);
+                        log_debug("inotify-handler for %s <%s>: create on %s", path, description, ev->name);
                 else {
                         unsigned i;
 
@@ -446,7 +442,7 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
                         c->create_called[i] |= bit;
                 }
         } else if (ev->mask & IN_DELETE) {
-                log_info("inotify-handler <%s>: delete of %s", description, ev->name);
+                log_info("inotify-handler for %s <%s>: delete of %s", path, description, ev->name);
                 assert_se(streq(ev->name, "sub"));
         } else
                 assert_not_reached();
@@ -456,16 +452,19 @@ static int inotify_handler(sd_event_source *s, const struct inotify_event *ev, v
 }
 
 static int delete_self_handler(sd_event_source *s, const struct inotify_event *ev, void *userdata) {
-        struct inotify_context *c = userdata;
+        struct inotify_context *c = ASSERT_PTR(userdata);
+        const char *path;
+
+        assert_se(sd_event_source_get_inotify_path(s, &path) >= 0);
 
         if (ev->mask & IN_Q_OVERFLOW) {
-                log_info("delete-self-handler: overflow");
+                log_info("delete-self-handler for %s: overflow", path);
                 c->delete_self_handler_called = true;
         } else if (ev->mask & IN_DELETE_SELF) {
-                log_info("delete-self-handler: delete-self");
+                log_info("delete-self-handler for %s: delete-self", path);
                 c->delete_self_handler_called = true;
         } else if (ev->mask & IN_IGNORED) {
-                log_info("delete-self-handler: ignore");
+                log_info("delete-self-handler for %s: ignore", path);
         } else
                 assert_not_reached();
 
@@ -480,7 +479,7 @@ static void test_inotify_one(unsigned n_create_events) {
                 .n_create_events = n_create_events,
         };
         sd_event *e = NULL;
-        const char *q;
+        const char *q, *pp;
         unsigned i;
 
         log_info("/* %s(%u) */", __func__, n_create_events);
@@ -488,6 +487,7 @@ static void test_inotify_one(unsigned n_create_events) {
         assert_se(sd_event_default(&e) >= 0);
 
         assert_se(mkdtemp_malloc("/tmp/test-inotify-XXXXXX", &p) >= 0);
+        context.path = p;
 
         assert_se(sd_event_add_inotify(e, &a, p, IN_CREATE|IN_ONLYDIR, inotify_handler, &context) >= 0);
         assert_se(sd_event_add_inotify(e, &b, p, IN_CREATE|IN_DELETE|IN_DONT_FOLLOW, inotify_handler, &context) >= 0);
@@ -499,6 +499,13 @@ static void test_inotify_one(unsigned n_create_events) {
         assert_se(sd_event_source_set_description(a, "0") >= 0);
         assert_se(sd_event_source_set_description(b, "1") >= 0);
         assert_se(sd_event_source_set_description(c, "2") >= 0);
+
+        assert_se(sd_event_source_get_inotify_path(a, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
+        assert_se(sd_event_source_get_inotify_path(b, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
+        assert_se(sd_event_source_get_inotify_path(b, &pp) >= 0);
+        assert_se(path_equal_or_inode_same(pp, p, 0));
 
         q = strjoina(p, "/sub");
         assert_se(touch(q) >= 0);
@@ -565,13 +572,7 @@ TEST(pidfd) {
 
         assert_se(pid > 1);
 
-        pidfd = pidfd_open(pid, 0);
-        if (pidfd < 0) {
-                /* No pidfd_open() supported or blocked? */
-                assert_se(ERRNO_IS_NOT_SUPPORTED(errno) || ERRNO_IS_PRIVILEGE(errno));
-                (void) wait_for_terminate(pid, NULL);
-                return;
-        }
+        ASSERT_OK(pidfd = pidfd_open(pid, 0));
 
         pid2 = fork();
         if (pid2 == 0)
@@ -826,6 +827,24 @@ TEST(fork) {
         }
 
         assert_se(r >= 0);
+}
+
+TEST(sd_event_source_set_io_fd) {
+        _cleanup_(sd_event_source_unrefp) sd_event_source *s = NULL;
+        _cleanup_(sd_event_unrefp) sd_event *e = NULL;
+        _cleanup_close_pair_ int pfd_a[2] = EBADF_PAIR, pfd_b[2] = EBADF_PAIR;
+
+        assert_se(sd_event_default(&e) >= 0);
+
+        assert_se(pipe2(pfd_a, O_CLOEXEC) >= 0);
+        assert_se(pipe2(pfd_b, O_CLOEXEC) >= 0);
+
+        assert_se(sd_event_add_io(e, &s, pfd_a[0], EPOLLIN, NULL, INT_TO_PTR(-ENOANO)) >= 0);
+        assert_se(sd_event_source_set_io_fd_own(s, true) >= 0);
+        TAKE_FD(pfd_a[0]);
+
+        assert_se(sd_event_source_set_io_fd(s, pfd_b[0]) >= 0);
+        TAKE_FD(pfd_b[0]);
 }
 
 static int hup_callback(sd_event_source *s, int fd, uint32_t revents, void *userdata) {

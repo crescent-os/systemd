@@ -26,14 +26,9 @@ static bool ignore_dirent(const struct dirent *de, RecurseDirFlags flags) {
                 dot_or_dot_dot(de->d_name);
 }
 
-int readdir_all(int dir_fd,
-                RecurseDirFlags flags,
-                DirectoryEntries **ret) {
-
+int readdir_all(int dir_fd, RecurseDirFlags flags, DirectoryEntries **ret) {
         _cleanup_free_ DirectoryEntries *de = NULL;
-        struct dirent *entry;
         DirectoryEntries *nde;
-        size_t add, sz, j;
         int r;
 
         assert(dir_fd >= 0);
@@ -77,11 +72,11 @@ int readdir_all(int dir_fd,
                 nde = realloc(de, bs);
                 if (!nde)
                         return -ENOMEM;
-
                 de = nde;
         }
 
         de->n_entries = 0;
+        struct dirent *entry;
         FOREACH_DIRENT_IN_BUFFER(entry, de->buffer, de->buffer_size) {
                 if (ignore_dirent(entry, flags))
                         continue;
@@ -98,16 +93,17 @@ int readdir_all(int dir_fd,
                 de->n_entries++;
         }
 
+        size_t sz, j;
+
         sz = ALIGN(offsetof(DirectoryEntries, buffer) + de->buffer_size);
-        add = sizeof(struct dirent*) * de->n_entries;
-        if (add > SIZE_MAX - add)
+        if (!INC_SAFE(&sz, sizeof(struct dirent*) * de->n_entries))
                 return -ENOMEM;
 
-        nde = realloc(de, sz + add);
+        nde = realloc(de, sz);
         if (!nde)
                 return -ENOMEM;
-
         de = nde;
+
         de->entries = (struct dirent**) ((uint8_t*) de + ALIGN(offsetof(DirectoryEntries, buffer) + de->buffer_size));
 
         j = 0;
@@ -388,7 +384,7 @@ int recurse_dir(
                                 if (sx_valid && FLAGS_SET(sx.stx_attributes_mask, STATX_ATTR_MOUNT_ROOT))
                                         is_mount = FLAGS_SET(sx.stx_attributes, STATX_ATTR_MOUNT_ROOT);
                                 else {
-                                        r = fd_is_mount_point(dir_fd, de->entries[i]->d_name, 0);
+                                        r = is_mount_point_at(dir_fd, de->entries[i]->d_name, 0);
                                         if (r < 0)
                                                 log_debug_errno(r, "Failed to determine whether %s is a submount, assuming not: %m", p);
 
@@ -470,7 +466,6 @@ int recurse_dir(
                                  de->entries[i],
                                  statx_mask != 0 ? &sx : NULL, /* only pass sx if user asked for it */
                                  userdata);
-
 
                 if (r == RECURSE_DIR_LEAVE_DIRECTORY)
                         break;

@@ -14,6 +14,7 @@
 #include "mkdir.h"
 #include "netif-util.h"
 #include "parse-util.h"
+#include "resolved-dns-scope.h"
 #include "resolved-link.h"
 #include "resolved-llmnr.h"
 #include "resolved-mdns.h"
@@ -299,6 +300,9 @@ static int link_update_dns_servers(Link *l) {
         }
 
         dns_server_unlink_marked(l->dns_servers);
+
+        dns_server_reset_accessible_all(l->dns_servers);
+
         return 0;
 
 clear:
@@ -319,7 +323,7 @@ static int link_update_default_route(Link *l) {
         if (r < 0)
                 goto clear;
 
-        l->default_route = r > 0;
+        link_set_default_route(l, r > 0);
         return 0;
 
 clear:
@@ -766,6 +770,20 @@ void link_next_dns_server(Link *l, DnsServer *if_current) {
         link_set_dns_server(l, l->dns_servers);
 }
 
+void link_set_default_route(Link *l, bool b) {
+        assert(l);
+
+        if (l->default_route == b)
+                return;
+
+        l->default_route = b;
+
+        /* If we are currently using the fallback servers, changing a link to be default-route means
+         * we should reconsider whether or not the fallback servers are necessary. */
+        if (b && dns_server_is_fallback(l->manager->current_dns_server))
+                manager_set_dns_server(l->manager, NULL);
+}
+
 DnsOverTlsMode link_get_dns_over_tls_mode(Link *l) {
         assert(l);
 
@@ -815,6 +833,20 @@ ResolveSupport link_get_mdns_support(Link *link) {
         /* This provides the effective mDNS support level for the link, instead of the 'internal' per-link setting. */
 
         return MIN(link->mdns_support, link->manager->mdns_support);
+}
+
+bool link_get_default_route(Link *l) {
+        assert(l);
+
+        /* Return what is configured, if there's something configured */
+        if (l->default_route >= 0)
+                return l->default_route;
+
+        /* Otherwise report what is in effect */
+        if (l->unicast_scope)
+                return dns_scope_is_default_route(l->unicast_scope);
+
+        return false;
 }
 
 int link_address_new(Link *l,

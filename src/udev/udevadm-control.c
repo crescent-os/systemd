@@ -1,15 +1,4 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- */
 
 #include <errno.h>
 #include <getopt.h>
@@ -19,6 +8,9 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "creds-util.h"
+#include "errno-util.h"
+#include "parse-argument.h"
 #include "parse-util.h"
 #include "process-util.h"
 #include "static-destruct.h"
@@ -27,6 +19,8 @@
 #include "time-util.h"
 #include "udevadm.h"
 #include "udev-ctrl.h"
+#include "udev-varlink.h"
+#include "varlink-util.h"
 #include "virt.h"
 
 static char **arg_env = NULL;
@@ -37,8 +31,22 @@ static bool arg_exit = false;
 static int arg_max_children = -1;
 static int arg_log_level = -1;
 static int arg_start_exec_queue = -1;
+static int arg_trace = -1;
+static bool arg_load_credentials = false;
 
 STATIC_DESTRUCTOR_REGISTER(arg_env, strv_freep);
+
+static bool arg_has_control_commands(void) {
+        return
+                arg_exit ||
+                arg_log_level >= 0 ||
+                arg_start_exec_queue >= 0 ||
+                arg_reload ||
+                !strv_isempty(arg_env) ||
+                arg_max_children >= 0 ||
+                arg_ping ||
+                arg_trace >= 0;
+}
 
 static int help(void) {
         printf("%s control OPTION\n\n"
@@ -53,7 +61,9 @@ static int help(void) {
                "  -p --property=KEY=VALUE  Set a global property for all events\n"
                "  -m --children-max=N      Maximum number of children\n"
                "     --ping                Wait for udev to respond to a ping message\n"
-               "  -t --timeout=SECONDS     Maximum time to block for a reply\n",
+               "     --trace=BOOL          Enable/disable trace logging\n"
+               "  -t --timeout=SECONDS     Maximum time to block for a reply\n"
+               "     --load-credentials    Load udev rules from credentials\n",
                program_invocation_short_name);
 
         return 0;
@@ -62,23 +72,27 @@ static int help(void) {
 static int parse_argv(int argc, char *argv[]) {
         enum {
                 ARG_PING = 0x100,
+                ARG_TRACE,
+                ARG_LOAD_CREDENTIALS,
         };
 
         static const struct option options[] = {
-                { "exit",             no_argument,       NULL, 'e'      },
-                { "log-level",        required_argument, NULL, 'l'      },
-                { "log-priority",     required_argument, NULL, 'l'      }, /* for backward compatibility */
-                { "stop-exec-queue",  no_argument,       NULL, 's'      },
-                { "start-exec-queue", no_argument,       NULL, 'S'      },
-                { "reload",           no_argument,       NULL, 'R'      },
-                { "reload-rules",     no_argument,       NULL, 'R'      }, /* alias for -R */
-                { "property",         required_argument, NULL, 'p'      },
-                { "env",              required_argument, NULL, 'p'      }, /* alias for -p */
-                { "children-max",     required_argument, NULL, 'm'      },
-                { "ping",             no_argument,       NULL, ARG_PING },
-                { "timeout",          required_argument, NULL, 't'      },
-                { "version",          no_argument,       NULL, 'V'      },
-                { "help",             no_argument,       NULL, 'h'      },
+                { "exit",             no_argument,       NULL, 'e'                  },
+                { "log-level",        required_argument, NULL, 'l'                  },
+                { "log-priority",     required_argument, NULL, 'l'                  }, /* for backward compatibility */
+                { "stop-exec-queue",  no_argument,       NULL, 's'                  },
+                { "start-exec-queue", no_argument,       NULL, 'S'                  },
+                { "reload",           no_argument,       NULL, 'R'                  },
+                { "reload-rules",     no_argument,       NULL, 'R'                  }, /* alias for -R */
+                { "property",         required_argument, NULL, 'p'                  },
+                { "env",              required_argument, NULL, 'p'                  }, /* alias for -p */
+                { "children-max",     required_argument, NULL, 'm'                  },
+                { "ping",             no_argument,       NULL, ARG_PING             },
+                { "trace",            required_argument, NULL, ARG_TRACE            },
+                { "timeout",          required_argument, NULL, 't'                  },
+                { "load-credentials", no_argument,       NULL, ARG_LOAD_CREDENTIALS },
+                { "version",          no_argument,       NULL, 'V'                  },
+                { "help",             no_argument,       NULL, 'h'                  },
                 {}
         };
 
@@ -86,10 +100,6 @@ static int parse_argv(int argc, char *argv[]) {
 
         assert(argc >= 0);
         assert(argv);
-
-        if (argc <= 1)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
-                                       "This command expects one or more options.");
 
         while ((c = getopt_long(argc, argv, "el:sSRp:m:t:Vh", options, NULL)) >= 0)
                 switch (c) {
@@ -139,10 +149,22 @@ static int parse_argv(int argc, char *argv[]) {
                         arg_ping = true;
                         break;
 
+                case ARG_TRACE:
+                        r = parse_boolean_argument("--trace=", optarg, NULL);
+                        if (r < 0)
+                                return r;
+
+                        arg_trace = r;
+                        break;
+
                 case 't':
                         r = parse_sec(optarg, &arg_timeout);
                         if (r < 0)
                                 return log_error_errno(r, "Failed to parse timeout value '%s': %m", optarg);
+                        break;
+
+                case ARG_LOAD_CREDENTIALS:
+                        arg_load_credentials = true;
                         break;
 
                 case 'V':
@@ -158,6 +180,10 @@ static int parse_argv(int argc, char *argv[]) {
                         assert_not_reached();
                 }
 
+        if (!arg_has_control_commands() && !arg_load_credentials)
+                return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
+                                       "No control command option is specified.");
+
         if (optind < argc)
                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                        "Extraneous argument: %s", argv[optind]);
@@ -165,18 +191,9 @@ static int parse_argv(int argc, char *argv[]) {
         return 1;
 }
 
-int control_main(int argc, char *argv[], void *userdata) {
+static int send_control_commands_via_ctrl(void) {
         _cleanup_(udev_ctrl_unrefp) UdevCtrl *uctrl = NULL;
         int r;
-
-        if (running_in_chroot() > 0) {
-                log_info("Running in chroot, ignoring request.");
-                return 0;
-        }
-
-        r = parse_argv(argc, argv);
-        if (r <= 0)
-                return r;
 
         r = udev_ctrl_new(&uctrl);
         if (r < 0)
@@ -234,6 +251,102 @@ int control_main(int argc, char *argv[], void *userdata) {
         r = udev_ctrl_wait(uctrl, arg_timeout);
         if (r < 0)
                 return log_error_errno(r, "Failed to wait for daemon to reply: %m");
+
+        return 0;
+}
+
+static int send_control_commands(void) {
+        _cleanup_(sd_varlink_flush_close_unrefp) sd_varlink *link = NULL;
+        int r;
+
+        r = udev_varlink_connect(&link, arg_timeout);
+        if (ERRNO_IS_NEG_DISCONNECT(r) || r == -ENOENT) {
+                log_debug_errno(r, "Failed to connect to udev via varlink, falling back to use legacy control socket, ignoring: %m");
+                return send_control_commands_via_ctrl();
+        }
+        if (r < 0)
+                return log_error_errno(r, "Failed to connect to udev via varlink: %m");
+
+        if (arg_exit)
+                return varlink_call_and_log(link, "io.systemd.Udev.Exit", /* parameters = */ NULL, /* reply = */ NULL);
+
+        if (arg_log_level >= 0) {
+                r = varlink_callbo_and_log(link, "io.systemd.service.SetLogLevel", /* reply = */ NULL,
+                                           SD_JSON_BUILD_PAIR_INTEGER("level", arg_log_level));
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_start_exec_queue >= 0) {
+                r = varlink_call_and_log(link, arg_start_exec_queue ? "io.systemd.Udev.StartExecQueue" : "io.systemd.Udev.StopExecQueue",
+                                         /* parameters = */ NULL, /* reply = */ NULL);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_reload) {
+                r = varlink_call_and_log(link, "io.systemd.service.Reload", /* parameters = */ NULL, /* reply = */ NULL);
+                if (r < 0)
+                        return r;
+        }
+
+        if (!strv_isempty(arg_env)) {
+                r = varlink_callbo_and_log(link, "io.systemd.Udev.SetEnvironment", /* reply = */ NULL,
+                                           SD_JSON_BUILD_PAIR_STRV("assignments", arg_env));
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_max_children >= 0) {
+                r = varlink_callbo_and_log(link, "io.systemd.Udev.SetChildrenMax", /* reply = */ NULL,
+                                           SD_JSON_BUILD_PAIR_UNSIGNED("number", arg_max_children));
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_ping) {
+                r = varlink_call_and_log(link, "io.systemd.service.Ping", /* parameters = */ NULL, /* reply = */ NULL);
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_trace >= 0) {
+                r = varlink_callbo_and_log(link, "io.systemd.Udev.SetTrace", /* reply = */ NULL,
+                                           SD_JSON_BUILD_PAIR_BOOLEAN("enable", arg_trace));
+                if (r < 0)
+                        return r;
+        }
+
+        return 0;
+}
+
+int control_main(int argc, char *argv[], void *userdata) {
+        int r;
+
+        if (running_in_chroot() > 0) {
+                log_info("Running in chroot, ignoring request.");
+                return 0;
+        }
+
+        r = parse_argv(argc, argv);
+        if (r <= 0)
+                return r;
+
+        if (arg_load_credentials) {
+                static const PickUpCredential table[] = {
+                        { "udev.conf.",  "/run/udev/udev.conf.d/", ".conf"  },
+                        { "udev.rules.", "/run/udev/rules.d/",     ".rules" },
+                };
+                r = pick_up_credentials(table, ELEMENTSOF(table));
+                if (r < 0)
+                        return r;
+        }
+
+        if (arg_has_control_commands()) {
+                r = send_control_commands();
+                if (r < 0)
+                        return r;
+        }
 
         return 0;
 }

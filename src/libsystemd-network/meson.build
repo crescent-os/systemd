@@ -23,13 +23,16 @@ sources = files(
         'sd-dhcp-server.c',
         'sd-dhcp6-client.c',
         'sd-dhcp6-lease.c',
+        'sd-dns-resolver.c',
         'sd-ipv4acd.c',
         'sd-ipv4ll.c',
         'sd-lldp-rx.c',
         'sd-lldp-tx.c',
         'sd-ndisc.c',
         'sd-ndisc-neighbor.c',
+        'sd-ndisc-redirect.c',
         'sd-ndisc-router.c',
+        'sd-ndisc-router-solicit.c',
         'sd-radv.c',
 )
 
@@ -89,14 +92,18 @@ executables += [
         network_test_template + {
                 'sources' : files(
                         'test-ndisc-ra.c',
-                        'icmp6-util-unix.c',
+                        'icmp6-test-util.c',
                 ),
         },
         network_test_template + {
                 'sources' : files(
                         'test-ndisc-rs.c',
-                        'icmp6-util-unix.c',
+                        'icmp6-test-util.c',
                 ),
+        },
+        network_test_template + {
+                'sources' : files('test-ndisc-send.c'),
+                'type' : 'manual',
         },
         network_test_template + {
                 'sources' : files('test-sd-dhcp-lease.c'),
@@ -119,7 +126,7 @@ executables += [
         network_fuzz_template + {
                 'sources' : files(
                         'fuzz-ndisc-rs.c',
-                        'icmp6-util-unix.c',
+                        'icmp6-test-util.c',
                 ),
         },
 ]

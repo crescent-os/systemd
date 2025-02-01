@@ -89,9 +89,8 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
         int r;
 
         assert(!FLAGS_SET(flags, CHASE_PREFIX_ROOT));
+        assert(!FLAGS_SET(flags, CHASE_MUST_BE_DIRECTORY|CHASE_MUST_BE_REGULAR));
         assert(!FLAGS_SET(flags, CHASE_STEP|CHASE_EXTRACT_FILENAME));
-        assert(!FLAGS_SET(flags, CHASE_TRAIL_SLASH|CHASE_EXTRACT_FILENAME));
-        assert(!FLAGS_SET(flags, CHASE_MKDIR_0755) || (flags & (CHASE_NONEXISTENT | CHASE_PARENT)) != 0);
         assert(dir_fd >= 0 || dir_fd == AT_FDCWD);
 
         /* Either the file may be missing, or we return an fd to the final object, but both make no sense */
@@ -192,7 +191,7 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
 
         if (!(flags &
               (CHASE_AT_RESOLVE_IN_ROOT|CHASE_NONEXISTENT|CHASE_NO_AUTOFS|CHASE_SAFE|CHASE_STEP|
-               CHASE_PROHIBIT_SYMLINKS|CHASE_MKDIR_0755)) &&
+               CHASE_PROHIBIT_SYMLINKS|CHASE_MKDIR_0755|CHASE_PARENT)) &&
             !ret_path && ret_fd) {
 
                 /* Shortcut the ret_fd case if the caller isn't interested in the actual path and has no root
@@ -244,8 +243,15 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
         if (root_fd < 0)
                 return -errno;
 
-        if (FLAGS_SET(flags, CHASE_TRAIL_SLASH))
-                append_trail_slash = ENDSWITH_SET(buffer, "/", "/.");
+        if (ENDSWITH_SET(buffer, "/", "/.")) {
+                flags |= CHASE_MUST_BE_DIRECTORY;
+                if (FLAGS_SET(flags, CHASE_TRAIL_SLASH))
+                        append_trail_slash = true;
+        } else if (dot_or_dot_dot(buffer) || endswith(buffer, "/.."))
+                flags |= CHASE_MUST_BE_DIRECTORY;
+
+        if (FLAGS_SET(flags, CHASE_PARENT))
+                flags |= CHASE_MUST_BE_DIRECTORY;
 
         for (todo = buffer;;) {
                 _cleanup_free_ char *first = NULL;
@@ -256,19 +262,15 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                 r = path_find_first_component(&todo, /* accept_dot_dot= */ true, &e);
                 if (r < 0)
                         return r;
-                if (r == 0) { /* We reached the end. */
-                        if (append_trail_slash)
-                                if (!strextend(&done, "/"))
-                                        return -ENOMEM;
+                if (r == 0) /* We reached the end. */
                         break;
-                }
 
                 first = strndup(e, r);
                 if (!first)
                         return -ENOMEM;
 
                 /* Two dots? Then chop off the last bit of what we already found out. */
-                if (path_equal(first, "..")) {
+                if (streq(first, "..")) {
                         _cleanup_free_ char *parent = NULL;
                         _cleanup_close_ int fd_parent = -EBADF;
                         struct stat st_parent;
@@ -370,13 +372,13 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                         if (r != -ENOENT)
                                 return r;
 
-                        if (!isempty(todo) && !path_is_safe(todo))
+                        if (!isempty(todo) && !path_is_safe(todo)) /* Refuse parent/mkdir handling if suffix contains ".." or something weird */
                                 return r;
 
-                        if (FLAGS_SET(flags, CHASE_MKDIR_0755) && !isempty(todo)) {
+                        if (FLAGS_SET(flags, CHASE_MKDIR_0755) && (!isempty(todo) || !(flags & (CHASE_PARENT|CHASE_NONEXISTENT)))) {
                                 child = xopenat_full(fd,
                                                      first,
-                                                     O_DIRECTORY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC,
+                                                     O_DIRECTORY|O_CREAT|O_EXCL|O_NOFOLLOW|O_PATH|O_CLOEXEC,
                                                      /* xopen_flags = */ 0,
                                                      0755);
                                 if (child < 0)
@@ -477,8 +479,14 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
                 close_and_replace(fd, child);
         }
 
-        if (FLAGS_SET(flags, CHASE_PARENT)) {
+        if (FLAGS_SET(flags, CHASE_MUST_BE_DIRECTORY)) {
                 r = stat_verify_directory(&st);
+                if (r < 0)
+                        return r;
+        }
+
+        if (FLAGS_SET(flags, CHASE_MUST_BE_REGULAR)) {
+                r = stat_verify_regular(&st);
                 if (r < 0)
                         return r;
         }
@@ -497,10 +505,14 @@ int chaseat(int dir_fd, const char *path, ChaseFlags flags, char **ret_path, int
 
                 if (!done) {
                         assert(!need_absolute || FLAGS_SET(flags, CHASE_EXTRACT_FILENAME));
-                        done = strdup(append_trail_slash ? "./" : ".");
+                        done = strdup(".");
                         if (!done)
                                 return -ENOMEM;
                 }
+
+                if (append_trail_slash)
+                        if (!strextend(&done, "/"))
+                                return -ENOMEM;
 
                 *ret_path = TAKE_PTR(done);
         }
@@ -641,8 +653,8 @@ int chase(const char *path, const char *root, ChaseFlags flags, char **ret_path,
                          * absolute, hence it is not necessary to prefix with the root. When "root" points to
                          * a non-root directory, the result path is always normalized and relative, hence
                          * we can simply call path_join() and not necessary to call path_simplify().
-                         * Note that the result of chaseat() may start with "." (more specifically, it may be
-                         * "." or "./"), and we need to drop "." in that case. */
+                         * As a special case, chaseat() may return "." or "./", which are normalized too,
+                         * but we need to drop "." before merging with root. */
 
                         if (empty_or_root(root))
                                 assert(path_is_absolute(p));
@@ -651,7 +663,7 @@ int chase(const char *path, const char *root, ChaseFlags flags, char **ret_path,
 
                                 assert(!path_is_absolute(p));
 
-                                q = path_join(root, p + (*p == '.'));
+                                q = path_join(root, p + STR_IN_SET(p, ".", "./"));
                                 if (!q)
                                         return -ENOMEM;
 
@@ -744,10 +756,15 @@ int chase_extract_filename(const char *path, const char *root, char **ret) {
         return strdup_to(ret, ".");
 }
 
-int chase_and_open(const char *path, const char *root, ChaseFlags chase_flags, int open_flags, char **ret_path) {
+int chase_and_open(
+                const char *path,
+                const char *root,
+                ChaseFlags chase_flags,
+                int open_flags,
+                char **ret_path) {
+
         _cleanup_close_ int path_fd = -EBADF;
         _cleanup_free_ char *p = NULL, *fname = NULL;
-        mode_t mode = open_flags & O_DIRECTORY ? 0755 : 0644;
         int r;
 
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
@@ -758,7 +775,7 @@ int chase_and_open(const char *path, const char *root, ChaseFlags chase_flags, i
                 return xopenat_full(AT_FDCWD, path,
                                     open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
                                     /* xopen_flags = */ 0,
-                                    mode);
+                                    MODE_INVALID);
 
         r = chase(path, root, CHASE_PARENT|chase_flags, &p, &path_fd);
         if (r < 0)
@@ -772,7 +789,7 @@ int chase_and_open(const char *path, const char *root, ChaseFlags chase_flags, i
                         return r;
         }
 
-        r = xopenat_full(path_fd, strempty(fname), open_flags|O_NOFOLLOW, /* xopen_flags = */ 0, mode);
+        r = xopenat_full(path_fd, strempty(fname), open_flags|O_NOFOLLOW, /* xopen_flags = */ 0, MODE_INVALID);
         if (r < 0)
                 return r;
 
@@ -948,10 +965,15 @@ int chase_and_open_parent(const char *path, const char *root, ChaseFlags chase_f
         return pfd;
 }
 
-int chase_and_openat(int dir_fd, const char *path, ChaseFlags chase_flags, int open_flags, char **ret_path) {
+int chase_and_openat(
+                int dir_fd,
+                const char *path,
+                ChaseFlags chase_flags,
+                int open_flags,
+                char **ret_path) {
+
         _cleanup_close_ int path_fd = -EBADF;
         _cleanup_free_ char *p = NULL, *fname = NULL;
-        mode_t mode = open_flags & O_DIRECTORY ? 0755 : 0644;
         int r;
 
         assert(!(chase_flags & (CHASE_NONEXISTENT|CHASE_STEP)));
@@ -962,7 +984,7 @@ int chase_and_openat(int dir_fd, const char *path, ChaseFlags chase_flags, int o
                 return xopenat_full(dir_fd, path,
                                     open_flags | (FLAGS_SET(chase_flags, CHASE_NOFOLLOW) ? O_NOFOLLOW : 0),
                                     /* xopen_flags = */ 0,
-                                    mode);
+                                    MODE_INVALID);
 
         r = chaseat(dir_fd, path, chase_flags|CHASE_PARENT, &p, &path_fd);
         if (r < 0)
@@ -974,7 +996,7 @@ int chase_and_openat(int dir_fd, const char *path, ChaseFlags chase_flags, int o
                         return r;
         }
 
-        r = xopenat_full(path_fd, strempty(fname), open_flags|O_NOFOLLOW, /* xopen_flags = */ 0, mode);
+        r = xopenat_full(path_fd, strempty(fname), open_flags|O_NOFOLLOW, /* xopen_flags= */ 0, MODE_INVALID);
         if (r < 0)
                 return r;
 

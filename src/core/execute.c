@@ -20,12 +20,12 @@
 #include "af-list.h"
 #include "alloc-util.h"
 #include "async.h"
+#include "bitfield.h"
 #include "cap-list.h"
 #include "capability-util.h"
 #include "cgroup-setup.h"
 #include "constants.h"
 #include "cpu-set-util.h"
-#include "dev-setup.h"
 #include "env-file.h"
 #include "env-util.h"
 #include "errno-list.h"
@@ -87,7 +87,7 @@ static bool is_terminal_output(ExecOutput o) {
                       EXEC_OUTPUT_JOURNAL_AND_CONSOLE);
 }
 
-const char *exec_context_tty_path(const ExecContext *context) {
+const char* exec_context_tty_path(const ExecContext *context) {
         assert(context);
 
         if (context->stdio_as_fds)
@@ -99,56 +99,65 @@ const char *exec_context_tty_path(const ExecContext *context) {
         return "/dev/console";
 }
 
-static void exec_context_determine_tty_size(
+int exec_context_apply_tty_size(
                 const ExecContext *context,
-                const char *tty_path,
-                unsigned *ret_rows,
-                unsigned *ret_cols) {
+                int input_fd,
+                int output_fd,
+                const char *tty_path) {
 
         unsigned rows, cols;
+        int r;
 
         assert(context);
-        assert(ret_rows);
-        assert(ret_cols);
+        assert(input_fd >= 0);
+        assert(output_fd >= 0);
+
+        if (!isatty_safe(output_fd))
+                return 0;
 
         if (!tty_path)
                 tty_path = exec_context_tty_path(context);
 
+        /* Preferably use explicitly configured data */
         rows = context->tty_rows;
         cols = context->tty_cols;
 
+        /* Fill in data from kernel command line if anything is unspecified */
         if (tty_path && (rows == UINT_MAX || cols == UINT_MAX))
                 (void) proc_cmdline_tty_size(
                                 tty_path,
                                 rows == UINT_MAX ? &rows : NULL,
                                 cols == UINT_MAX ? &cols : NULL);
 
-        *ret_rows = rows;
-        *ret_cols = cols;
+        /* If we got nothing so far and we are talking to a physical device, and the TTY reset logic is on,
+         * then let's query dimensions from the ANSI driver. */
+        if (rows == UINT_MAX && cols == UINT_MAX &&
+            context->tty_reset &&
+            terminal_is_pty_fd(output_fd) == 0 &&
+            isatty_safe(input_fd)) {
+                r = terminal_get_size_by_dsr(input_fd, output_fd, &rows, &cols);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to get terminal size by DSR, ignoring: %m");
+        }
+
+        return terminal_set_size_fd(output_fd, tty_path, rows, cols);
 }
-
-int exec_context_apply_tty_size(
-                const ExecContext *context,
-                int tty_fd,
-                const char *tty_path) {
-
-        unsigned rows, cols;
-
-        exec_context_determine_tty_size(context, tty_path, &rows, &cols);
-
-        return terminal_set_size_fd(tty_fd, tty_path, rows, cols);
- }
 
 void exec_context_tty_reset(const ExecContext *context, const ExecParameters *p) {
         _cleanup_close_ int _fd = -EBADF, lock_fd = -EBADF;
-        int fd;
+        int fd, r;
 
         assert(context);
 
+        /* Note that this is potentially a "destructive" reset of a TTY device. It's about getting rid of the
+         * remains of previous uses of the TTY. It's *not* about getting things set up for coming uses. We'll
+         * potentially invalidate the TTY here through hangups or VT disallocations, and hence do not keep a
+         * continuous fd open. */
+
         const char *path = exec_context_tty_path(context);
 
-        if (p && p->stdin_fd >= 0 && isatty_safe(p->stdin_fd))
-                fd = p->stdin_fd;
+        if (p && p->stdout_fd >= 0 && isatty_safe(p->stdout_fd))
+                fd = p->stdout_fd;
         else if (path && (context->tty_path || is_terminal_input(context->std_input) ||
                         is_terminal_output(context->std_output) || is_terminal_output(context->std_error))) {
                 fd = _fd = open_terminal(path, O_RDWR|O_NOCTTY|O_CLOEXEC|O_NONBLOCK);
@@ -162,19 +171,25 @@ void exec_context_tty_reset(const ExecContext *context, const ExecParameters *p)
          * that will be closed automatically, and operate on it for convenience. */
         lock_fd = lock_dev_console();
         if (ERRNO_IS_NEG_PRIVILEGE(lock_fd))
-                log_debug_errno(lock_fd, "No privileges to lock /dev/console, proceeding without: %m");
+                log_debug_errno(lock_fd, "No privileges to lock /dev/console, proceeding without lock: %m");
         else if (ERRNO_IS_NEG_DEVICE_ABSENT(lock_fd))
-                log_debug_errno(lock_fd, "Device /dev/console does not exist, proceeding without locking it: %m");
+                log_debug_errno(lock_fd, "Device /dev/console does not exist, proceeding without lock: %m");
         else if (lock_fd < 0)
-                return (void) log_debug_errno(lock_fd, "Failed to lock /dev/console: %m");
+                log_warning_errno(lock_fd, "Failed to lock /dev/console, proceeding without lock: %m");
+
+        if (context->tty_reset)
+                (void) terminal_reset_defensive(fd, /* switch_to_text= */ true);
+
+        r = exec_context_apply_tty_size(context, fd, fd, path);
+        if (r < 0)
+                log_debug_errno(r, "Failed to configure TTY dimensions, ignoring: %m");
 
         if (context->tty_vhangup)
                 (void) terminal_vhangup_fd(fd);
 
-        if (context->tty_reset)
-                (void) reset_terminal_fd(fd, /* switch_to_text= */ true);
-
-        (void) exec_context_apply_tty_size(context, fd, path);
+        /* We don't need the fd anymore now, and it potentially points to a hungup TTY anyway, let's close it
+         * hence. */
+        _fd = safe_close(_fd);
 
         if (context->tty_vt_disallocate && path)
                 (void) vt_disallocate(path);
@@ -194,6 +209,56 @@ bool exec_needs_ipc_namespace(const ExecContext *context) {
         assert(context);
 
         return context->private_ipc || context->ipc_namespace_path;
+}
+
+static bool can_apply_cgroup_namespace(const ExecContext *context, const ExecParameters *params) {
+        return cg_all_unified() > 0 && ns_type_supported(NAMESPACE_CGROUP);
+}
+
+static bool needs_cgroup_namespace(ProtectControlGroups i) {
+        return IN_SET(i, PROTECT_CONTROL_GROUPS_PRIVATE, PROTECT_CONTROL_GROUPS_STRICT);
+}
+
+ProtectControlGroups exec_get_protect_control_groups(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        /* If cgroup namespace is configured via ProtectControlGroups=private or strict but we can't actually
+         * use cgroup namespace, either from not having unified hierarchy or kernel support, we ignore the
+         * setting and do not unshare the namespace. ProtectControlGroups=private and strict get downgraded
+         * to no and yes respectively. This ensures that strict always gets a read-only mount of /sys/fs/cgroup.
+         *
+         * TODO: Remove fallback once cgroupv1 support is removed in v258. */
+        if (needs_cgroup_namespace(context->protect_control_groups) && !can_apply_cgroup_namespace(context, params)) {
+                if (context->protect_control_groups == PROTECT_CONTROL_GROUPS_PRIVATE)
+                        return PROTECT_CONTROL_GROUPS_NO;
+                if (context->protect_control_groups == PROTECT_CONTROL_GROUPS_STRICT)
+                        return PROTECT_CONTROL_GROUPS_YES;
+        }
+        return context->protect_control_groups;
+}
+
+bool exec_needs_cgroup_namespace(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return needs_cgroup_namespace(exec_get_protect_control_groups(context, params));
+}
+
+bool exec_needs_cgroup_mount(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return exec_get_protect_control_groups(context, params) != PROTECT_CONTROL_GROUPS_NO;
+}
+
+bool exec_is_cgroup_mount_read_only(const ExecContext *context, const ExecParameters *params) {
+        assert(context);
+
+        return IN_SET(exec_get_protect_control_groups(context, params), PROTECT_CONTROL_GROUPS_YES, PROTECT_CONTROL_GROUPS_STRICT);
+}
+
+bool exec_needs_pid_namespace(const ExecContext *context) {
+        assert(context);
+
+        return context->private_pids != PRIVATE_PIDS_NO && ns_type_supported(NAMESPACE_PID);
 }
 
 bool exec_needs_mount_namespace(
@@ -231,7 +296,10 @@ bool exec_needs_mount_namespace(
         if (!IN_SET(context->mount_propagation_flag, 0, MS_SHARED))
                 return true;
 
-        if (context->private_tmp && runtime && runtime->shared && (runtime->shared->tmp_dir || runtime->shared->var_tmp_dir))
+        if (context->private_tmp == PRIVATE_TMP_DISCONNECTED)
+                return true;
+
+        if (context->private_tmp == PRIVATE_TMP_CONNECTED && runtime && runtime->shared && (runtime->shared->tmp_dir || runtime->shared->var_tmp_dir))
                 return true;
 
         if (context->private_devices ||
@@ -242,10 +310,11 @@ bool exec_needs_mount_namespace(
             context->protect_kernel_tunables ||
             context->protect_kernel_modules ||
             context->protect_kernel_logs ||
-            context->protect_control_groups ||
+            exec_needs_cgroup_mount(context, params) ||
             context->protect_proc != PROTECT_PROC_DEFAULT ||
             context->proc_subset != PROC_SUBSET_ALL ||
-            exec_needs_ipc_namespace(context))
+            exec_needs_ipc_namespace(context) ||
+            exec_needs_pid_namespace(context))
                 return true;
 
         if (context->root_directory) {
@@ -267,10 +336,37 @@ bool exec_needs_mount_namespace(
              context->directories[EXEC_DIRECTORY_LOGS].n_items > 0))
                 return true;
 
-        if (context->log_namespace)
+        if (exec_context_get_effective_bind_log_sockets(context))
                 return true;
 
+        for (ExecDirectoryType t = 0; t < _EXEC_DIRECTORY_TYPE_MAX; t++)
+                FOREACH_ARRAY(i, context->directories[t].items, context->directories[t].n_items)
+                        if (FLAGS_SET(i->flags, EXEC_DIRECTORY_READ_ONLY))
+                                return true;
+
         return false;
+}
+
+const char* exec_get_private_notify_socket_path(const ExecContext *context, const ExecParameters *params, bool needs_sandboxing) {
+        assert(context);
+        assert(params);
+
+        if (!params->notify_socket)
+                return NULL;
+
+        if (!needs_sandboxing)
+                return NULL;
+
+        if (!context->root_directory && !context->root_image)
+                return NULL;
+
+        if (!exec_context_get_effective_mount_apivfs(context))
+                return NULL;
+
+        if (!FLAGS_SET(params->flags, EXEC_APPLY_CHROOT))
+                return NULL;
+
+        return "/run/host/notify";
 }
 
 bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType type) {
@@ -279,7 +375,7 @@ bool exec_directory_is_private(const ExecContext *context, ExecDirectoryType typ
         if (!context->dynamic_user)
                 return false;
 
-        if (type == EXEC_DIRECTORY_CONFIGURATION)
+        if (!EXEC_DIRECTORY_TYPE_SHALL_CHOWN(type))
                 return false;
 
         if (type == EXEC_DIRECTORY_RUNTIME && context->runtime_directory_preserve_mode == EXEC_PRESERVE_NO)
@@ -353,17 +449,16 @@ static void log_command_line(Unit *unit, const char *msg, const char *executable
 
 static int exec_context_load_environment(const Unit *unit, const ExecContext *c, char ***l);
 
-int exec_spawn(Unit *unit,
-               ExecCommand *command,
-               const ExecContext *context,
-               ExecParameters *params,
-               ExecRuntime *runtime,
-               const CGroupContext *cgroup_context,
-               PidRef *ret) {
+int exec_spawn(
+                Unit *unit,
+                ExecCommand *command,
+                const ExecContext *context,
+                ExecParameters *params,
+                ExecRuntime *runtime,
+                const CGroupContext *cgroup_context,
+                PidRef *ret) {
 
-        char serialization_fd_number[DECIMAL_STR_MAX(int) + 1];
         _cleanup_free_ char *subcgroup_path = NULL, *max_log_levels = NULL, *executor_path = NULL;
-        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
         _cleanup_fdset_free_ FDSet *fdset = NULL;
         _cleanup_fclose_ FILE *f = NULL;
         int r;
@@ -375,7 +470,7 @@ int exec_spawn(Unit *unit,
         assert(context);
         assert(params);
         assert(!params->fds || FLAGS_SET(params->flags, EXEC_PASS_FDS));
-        assert(params->fds || (params->n_socket_fds + params->n_storage_fds == 0));
+        assert(params->fds || (params->n_socket_fds + params->n_storage_fds + params->n_extra_fds == 0));
         assert(!params->files_env); /* We fill this field, ensure it comes NULL-initialized to us */
         assert(ret);
 
@@ -422,8 +517,9 @@ int exec_spawn(Unit *unit,
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to serialize parameters: %m");
 
-        if (fseeko(f, 0, SEEK_SET) < 0)
-                return log_unit_error_errno(unit, errno, "Failed to reseek on serialization stream: %m");
+        r = finish_serialization_file(f);
+        if (r < 0)
+                return log_unit_error_errno(unit, r, "Failed to finish serialization stream: %m");
 
         r = fd_cloexec(fileno(f), false);
         if (r < 0)
@@ -444,7 +540,21 @@ int exec_spawn(Unit *unit,
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to get executor path from fd: %m");
 
+        char serialization_fd_number[DECIMAL_STR_MAX(int)];
         xsprintf(serialization_fd_number, "%i", fileno(f));
+
+        _cleanup_(pidref_done) PidRef pidref = PIDREF_NULL;
+        dual_timestamp start_timestamp;
+
+        /* Restore the original ambient capability set the manager was started with to pass it to
+         * sd-executor. */
+        r = capability_ambient_set_apply(unit->manager->saved_ambient_set, /* also_inherit= */ false);
+        if (r < 0)
+                return log_unit_error_errno(unit, r, "Failed to apply the starting ambient set: %m");
+
+        /* Record the start timestamp before we fork so that it is guaranteed to be earlier than the
+         * handoff timestamp. */
+        dual_timestamp_now(&start_timestamp);
 
         /* The executor binary is pinned, to avoid compatibility problems during upgrades. */
         r = posix_spawn_wrapper(
@@ -456,6 +566,15 @@ int exec_spawn(Unit *unit,
                         environ,
                         cg_unified() > 0 ? subcgroup_path : NULL,
                         &pidref);
+
+        /* Drop the ambient set again, so no processes other than sd-executore spawned from the manager inherit it. */
+        (void) capability_ambient_set_apply(0, /* also_inherit= */ false);
+
+        if (r == -EUCLEAN && subcgroup_path)
+                return log_unit_error_errno(unit, r,
+                                            "Failed to spawn process into cgroup '%s', because the cgroup "
+                                            "or one of its parents or siblings is in the threaded mode.",
+                                            subcgroup_path);
         if (r < 0)
                 return log_unit_error_errno(unit, r, "Failed to spawn executor: %m");
         /* We add the new process to the cgroup both in the child (so that we can be sure that no user code is ever
@@ -468,7 +587,7 @@ int exec_spawn(Unit *unit,
         log_unit_debug(unit, "Forked %s as " PID_FMT " (%s CLONE_INTO_CGROUP)",
                        command->path, pidref.pid, r > 0 ? "via" : "without");
 
-        exec_status_start(&command->exec_status, pidref.pid);
+        exec_status_start(&command->exec_status, pidref.pid, &start_timestamp);
 
         *ret = TAKE_PIDREF(pidref);
         return 0;
@@ -499,6 +618,8 @@ void exec_context_init(ExecContext *c) {
                 .tty_rows = UINT_MAX,
                 .tty_cols = UINT_MAX,
                 .private_mounts = -1,
+                .mount_apivfs = -1,
+                .bind_log_sockets = -1,
                 .memory_ksm = -1,
                 .set_login_environment = -1,
         };
@@ -575,6 +696,7 @@ void exec_context_done(ExecContext *c) {
 
         c->syscall_filter = hashmap_free(c->syscall_filter);
         c->syscall_archs = set_free(c->syscall_archs);
+        c->syscall_log = hashmap_free(c->syscall_log);
         c->address_families = set_free(c->address_families);
 
         FOREACH_ARRAY(d, c->directories, _EXEC_DIRECTORY_TYPE_MAX)
@@ -586,8 +708,7 @@ void exec_context_done(ExecContext *c) {
         c->log_filter_allowed_patterns = set_free_free(c->log_filter_allowed_patterns);
         c->log_filter_denied_patterns = set_free_free(c->log_filter_denied_patterns);
 
-        c->log_ratelimit_interval_usec = 0;
-        c->log_ratelimit_burst = 0;
+        c->log_ratelimit = (RateLimit) {};
 
         c->stdin_data = mfree(c->stdin_data);
         c->stdin_data_size = 0;
@@ -599,11 +720,13 @@ void exec_context_done(ExecContext *c) {
 
         c->load_credentials = hashmap_free(c->load_credentials);
         c->set_credentials = hashmap_free(c->set_credentials);
-        c->import_credentials = set_free_free(c->import_credentials);
+        c->import_credentials = ordered_set_free(c->import_credentials);
 
         c->root_image_policy = image_policy_free(c->root_image_policy);
         c->mount_image_policy = image_policy_free(c->mount_image_policy);
         c->extension_image_policy = image_policy_free(c->extension_image_policy);
+
+        c->private_hostname = mfree(c->private_hostname);
 }
 
 int exec_context_destroy_runtime_directory(const ExecContext *c, const char *runtime_prefix) {
@@ -653,7 +776,7 @@ int exec_context_destroy_mount_ns_dir(Unit *u) {
         if (!p)
                 return -ENOMEM;
 
-        /* This is only filled transiently (see mount_in_namespace()), should be empty or even non-existent*/
+        /* This is only filled transiently (see mount_in_namespace()), should be empty or even non-existent. */
         if (rmdir(p) < 0 && errno != ENOENT)
                 log_unit_debug_errno(u, errno, "Unable to remove propagation dir '%s', ignoring: %m", p);
 
@@ -672,13 +795,19 @@ void exec_command_done_array(ExecCommand *c, size_t n) {
                 exec_command_done(i);
 }
 
+ExecCommand* exec_command_free(ExecCommand *c) {
+        if (!c)
+                return NULL;
+
+        exec_command_done(c);
+        return mfree(c);
+}
+
 ExecCommand* exec_command_free_list(ExecCommand *c) {
         ExecCommand *i;
 
-        while ((i = LIST_POP(command, c))) {
-                exec_command_done(i);
-                free(i);
-        }
+        while ((i = LIST_POP(command, c)))
+                exec_command_free(i);
 
         return NULL;
 }
@@ -882,6 +1011,7 @@ void exec_params_dump(const ExecParameters *p, FILE* f, const char *prefix) {
                 "%sShallConfirmSpawn: %s\n"
                 "%sWatchdogUSec: " USEC_FMT "\n"
                 "%sNotifySocket: %s\n"
+                "%sDebugInvocation: %s\n"
                 "%sFallbackSmackProcessLabel: %s\n",
                 prefix, runtime_scope_to_string(p->runtime_scope),
                 prefix, p->flags,
@@ -894,6 +1024,7 @@ void exec_params_dump(const ExecParameters *p, FILE* f, const char *prefix) {
                 prefix, yes_no(p->shall_confirm_spawn),
                 prefix, p->watchdog_usec,
                 prefix, strempty(p->notify_socket),
+                prefix, yes_no(p->debug_invocation),
                 prefix, strempty(p->fallback_smack_process_label));
 
         strv_dump(f, prefix, "FdNames", p->fd_names);
@@ -929,15 +1060,17 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 "%sProtectControlGroups: %s\n"
                 "%sPrivateNetwork: %s\n"
                 "%sPrivateUsers: %s\n"
+                "%sPrivatePIDs: %s\n"
                 "%sProtectHome: %s\n"
                 "%sProtectSystem: %s\n"
                 "%sMountAPIVFS: %s\n"
+                "%sBindLogSockets: %s\n"
                 "%sIgnoreSIGPIPE: %s\n"
                 "%sMemoryDenyWriteExecute: %s\n"
                 "%sRestrictRealtime: %s\n"
                 "%sRestrictSUIDSGID: %s\n"
                 "%sKeyringMode: %s\n"
-                "%sProtectHostname: %s\n"
+                "%sProtectHostname: %s%s%s\n"
                 "%sProtectProc: %s\n"
                 "%sProcSubset: %s\n",
                 prefix, c->umask,
@@ -945,24 +1078,26 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 prefix, empty_to_root(c->root_directory),
                 prefix, yes_no(c->root_ephemeral),
                 prefix, yes_no(c->non_blocking),
-                prefix, yes_no(c->private_tmp),
+                prefix, private_tmp_to_string(c->private_tmp),
                 prefix, yes_no(c->private_devices),
                 prefix, yes_no(c->protect_kernel_tunables),
                 prefix, yes_no(c->protect_kernel_modules),
                 prefix, yes_no(c->protect_kernel_logs),
                 prefix, yes_no(c->protect_clock),
-                prefix, yes_no(c->protect_control_groups),
+                prefix, protect_control_groups_to_string(c->protect_control_groups),
                 prefix, yes_no(c->private_network),
-                prefix, yes_no(c->private_users),
+                prefix, private_users_to_string(c->private_users),
+                prefix, private_pids_to_string(c->private_pids),
                 prefix, protect_home_to_string(c->protect_home),
                 prefix, protect_system_to_string(c->protect_system),
                 prefix, yes_no(exec_context_get_effective_mount_apivfs(c)),
+                prefix, yes_no(exec_context_get_effective_bind_log_sockets(c)),
                 prefix, yes_no(c->ignore_sigpipe),
                 prefix, yes_no(c->memory_deny_write_execute),
                 prefix, yes_no(c->restrict_realtime),
                 prefix, yes_no(c->restrict_suid_sgid),
                 prefix, exec_keyring_mode_to_string(c->keyring_mode),
-                prefix, yes_no(c->protect_hostname),
+                prefix, protect_hostname_to_string(c->protect_hostname), c->private_hostname ? ":" : "", strempty(c->private_hostname),
                 prefix, protect_proc_to_string(c->protect_proc),
                 prefix, proc_subset_to_string(c->proc_subset));
 
@@ -1024,7 +1159,12 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%s%sMode: %04o\n", prefix, exec_directory_type_to_string(dt), c->directories[dt].mode);
 
                 for (size_t i = 0; i < c->directories[dt].n_items; i++) {
-                        fprintf(f, "%s%s: %s\n", prefix, exec_directory_type_to_string(dt), c->directories[dt].items[i].path);
+                        fprintf(f,
+                                "%s%s: %s%s\n",
+                                prefix,
+                                exec_directory_type_to_string(dt),
+                                c->directories[dt].items[i].path,
+                                FLAGS_SET(c->directories[dt].items[i].flags, EXEC_DIRECTORY_READ_ONLY) ? " (ro)" : "");
 
                         STRV_FOREACH(d, c->directories[dt].items[i].symlinks)
                                 fprintf(f, "%s%s: %s:%s\n", prefix, exec_directory_type_symlink_to_string(dt), c->directories[dt].items[i].path, *d);
@@ -1170,13 +1310,13 @@ void exec_context_dump(const ExecContext *c, FILE* f, const char *prefix) {
                 fprintf(f, "%sLogLevelMax: %s\n", prefix, strna(t));
         }
 
-        if (c->log_ratelimit_interval_usec > 0)
+        if (c->log_ratelimit.interval > 0)
                 fprintf(f,
                         "%sLogRateLimitIntervalSec: %s\n",
-                        prefix, FORMAT_TIMESPAN(c->log_ratelimit_interval_usec, USEC_PER_SEC));
+                        prefix, FORMAT_TIMESPAN(c->log_ratelimit.interval, USEC_PER_SEC));
 
-        if (c->log_ratelimit_burst > 0)
-                fprintf(f, "%sLogRateLimitBurst: %u\n", prefix, c->log_ratelimit_burst);
+        if (c->log_ratelimit.burst > 0)
+                fprintf(f, "%sLogRateLimitBurst: %u\n", prefix, c->log_ratelimit.burst);
 
         if (!set_isempty(c->log_filter_allowed_patterns) || !set_isempty(c->log_filter_denied_patterns)) {
                 fprintf(f, "%sLogFilterPatterns:", prefix);
@@ -1429,11 +1569,32 @@ bool exec_context_get_effective_mount_apivfs(const ExecContext *c) {
         assert(c);
 
         /* Explicit setting wins */
-        if (c->mount_apivfs_set)
-                return c->mount_apivfs;
+        if (c->mount_apivfs >= 0)
+                return c->mount_apivfs > 0;
 
         /* Default to "yes" if root directory or image are specified */
         if (exec_context_with_rootfs(c))
+                return true;
+
+        return false;
+}
+
+bool exec_context_get_effective_bind_log_sockets(const ExecContext *c) {
+        assert(c);
+
+        /* If log namespace is specified, "/run/systemd/journal.namespace/" would be bind mounted to
+         * "/run/systemd/journal/", which effectively means BindLogSockets=yes */
+        if (c->log_namespace)
+                return true;
+
+        if (c->bind_log_sockets >= 0)
+                return c->bind_log_sockets > 0;
+
+        if (exec_context_get_effective_mount_apivfs(c))
+                return true;
+
+        /* When PrivateDevices=yes, /dev/log gets symlinked to /run/systemd/journal/dev-log */
+        if (exec_context_with_rootfs(c) && c->private_devices)
                 return true;
 
         return false;
@@ -1506,7 +1667,7 @@ int exec_context_get_clean_directories(
         assert(ret);
 
         for (ExecDirectoryType t = 0; t < _EXEC_DIRECTORY_TYPE_MAX; t++) {
-                if (!FLAGS_SET(mask, 1U << t))
+                if (!BIT_SET(mask, t))
                         continue;
 
                 if (!prefix[t])
@@ -1524,7 +1685,7 @@ int exec_context_get_clean_directories(
                                 return r;
 
                         /* Also remove private directories unconditionally. */
-                        if (t != EXEC_DIRECTORY_CONFIGURATION) {
+                        if (EXEC_DIRECTORY_TYPE_SHALL_CHOWN(t)) {
                                 j = path_join(prefix[t], "private", i->path);
                                 if (!j)
                                         return -ENOMEM;
@@ -1804,14 +1965,17 @@ char** exec_context_get_restrict_filesystems(const ExecContext *c) {
         return l ? TAKE_PTR(l) : strv_new(NULL);
 }
 
-void exec_status_start(ExecStatus *s, pid_t pid) {
+void exec_status_start(ExecStatus *s, pid_t pid, const dual_timestamp *ts) {
         assert(s);
 
         *s = (ExecStatus) {
                 .pid = pid,
         };
 
-        dual_timestamp_now(&s->start_timestamp);
+        if (ts)
+                s->start_timestamp = *ts;
+        else
+                dual_timestamp_now(&s->start_timestamp);
 }
 
 void exec_status_exit(ExecStatus *s, const ExecContext *context, pid_t pid, int code, int status) {
@@ -1829,6 +1993,19 @@ void exec_status_exit(ExecStatus *s, const ExecContext *context, pid_t pid, int 
 
         if (context && context->utmp_id)
                 (void) utmp_put_dead_process(context->utmp_id, pid, code, status);
+}
+
+void exec_status_handoff(ExecStatus *s, const struct ucred *ucred, const dual_timestamp *ts) {
+        assert(s);
+        assert(ucred);
+        assert(ts);
+
+        if (ucred->pid != s->pid)
+                *s = (ExecStatus) {
+                        .pid = ucred->pid,
+                };
+
+        s->handoff_timestamp = *ts;
 }
 
 void exec_status_reset(ExecStatus *s) {
@@ -1853,19 +2030,45 @@ void exec_status_dump(const ExecStatus *s, FILE *f, const char *prefix) {
         if (dual_timestamp_is_set(&s->start_timestamp))
                 fprintf(f,
                         "%sStart Timestamp: %s\n",
-                        prefix, FORMAT_TIMESTAMP(s->start_timestamp.realtime));
+                        prefix, FORMAT_TIMESTAMP_STYLE(s->start_timestamp.realtime, TIMESTAMP_US));
 
-        if (dual_timestamp_is_set(&s->exit_timestamp))
+        if (dual_timestamp_is_set(&s->handoff_timestamp) && dual_timestamp_is_set(&s->start_timestamp) &&
+            s->handoff_timestamp.monotonic > s->start_timestamp.monotonic)
                 fprintf(f,
-                        "%sExit Timestamp: %s\n"
+                        "%sHandoff Timestamp: %s since start\n",
+                        prefix,
+                        FORMAT_TIMESPAN(usec_sub_unsigned(s->handoff_timestamp.monotonic, s->start_timestamp.monotonic), 1));
+        else
+                fprintf(f,
+                        "%sHandoff Timestamp: %s\n",
+                        prefix, FORMAT_TIMESTAMP_STYLE(s->handoff_timestamp.realtime, TIMESTAMP_US));
+
+        if (dual_timestamp_is_set(&s->exit_timestamp)) {
+
+                if (dual_timestamp_is_set(&s->handoff_timestamp) && s->exit_timestamp.monotonic > s->handoff_timestamp.monotonic)
+                        fprintf(f,
+                                "%sExit Timestamp: %s since handoff\n",
+                                prefix,
+                                FORMAT_TIMESPAN(usec_sub_unsigned(s->exit_timestamp.monotonic, s->handoff_timestamp.monotonic), 1));
+                else if (dual_timestamp_is_set(&s->start_timestamp) && s->exit_timestamp.monotonic > s->start_timestamp.monotonic)
+                        fprintf(f,
+                                "%sExit Timestamp: %s since start\n",
+                                prefix,
+                                FORMAT_TIMESPAN(usec_sub_unsigned(s->exit_timestamp.monotonic, s->start_timestamp.monotonic), 1));
+                else
+                        fprintf(f,
+                                "%sExit Timestamp: %s\n",
+                                prefix, FORMAT_TIMESTAMP_STYLE(s->exit_timestamp.realtime, TIMESTAMP_US));
+
+                fprintf(f,
                         "%sExit Code: %s\n"
                         "%sExit Status: %i\n",
-                        prefix, FORMAT_TIMESTAMP(s->exit_timestamp.realtime),
                         prefix, sigchld_code_to_string(s->code),
                         prefix, s->status);
+        }
 }
 
-static void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix) {
+void exec_command_dump(ExecCommand *c, FILE *f, const char *prefix) {
         _cleanup_free_ char *cmd = NULL;
         const char *prefix2;
 
@@ -1933,7 +2136,7 @@ int exec_command_set(ExecCommand *c, const char *path, ...) {
 }
 
 int exec_command_append(ExecCommand *c, const char *path, ...) {
-        _cleanup_strv_free_ char **l = NULL;
+        char **l;
         va_list ap;
         int r;
 
@@ -1947,7 +2150,7 @@ int exec_command_append(ExecCommand *c, const char *path, ...) {
         if (!l)
                 return -ENOMEM;
 
-        r = strv_extend_strv(&c->argv, l, false);
+        r = strv_extend_strv_consume(&c->argv, l, /* filter_duplicates = */ false);
         if (r < 0)
                 return r;
 
@@ -2094,12 +2297,12 @@ static int exec_shared_runtime_make(
         assert(id);
 
         /* It is not necessary to create ExecSharedRuntime object. */
-        if (!exec_needs_network_namespace(c) && !exec_needs_ipc_namespace(c) && !c->private_tmp) {
+        if (!exec_needs_network_namespace(c) && !exec_needs_ipc_namespace(c) && c->private_tmp != PRIVATE_TMP_CONNECTED) {
                 *ret = NULL;
                 return 0;
         }
 
-        if (c->private_tmp &&
+        if (c->private_tmp == PRIVATE_TMP_CONNECTED &&
             !(prefixed_path_strv_contains(c->inaccessible_paths, "/tmp") &&
               (prefixed_path_strv_contains(c->inaccessible_paths, "/var/tmp") ||
                prefixed_path_strv_contains(c->inaccessible_paths, "/var")))) {
@@ -2519,7 +2722,7 @@ void exec_params_deep_clear(ExecParameters *p) {
          * to be fully cleaned up to make sanitizers and analyzers happy, as opposed as the shallow clean
          * function above. */
 
-        close_many_unset(p->fds, p->n_socket_fds + p->n_storage_fds);
+        close_many_unset(p->fds, p->n_socket_fds + p->n_storage_fds + p->n_extra_fds);
 
         p->cgroup_path = mfree(p->cgroup_path);
 
@@ -2574,7 +2777,7 @@ static ExecDirectoryItem *exec_directory_find(ExecDirectory *d, const char *path
         return NULL;
 }
 
-int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) {
+int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink, ExecDirectoryFlags flags) {
         _cleanup_strv_free_ char **s = NULL;
         _cleanup_free_ char *p = NULL;
         ExecDirectoryItem *existing;
@@ -2588,6 +2791,8 @@ int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) 
                 r = strv_extend(&existing->symlinks, symlink);
                 if (r < 0)
                         return r;
+
+                existing->flags |= flags;
 
                 return 0; /* existing item is updated */
         }
@@ -2608,6 +2813,7 @@ int exec_directory_add(ExecDirectory *d, const char *path, const char *symlink) 
         d->items[d->n_items++] = (ExecDirectoryItem) {
                 .path = TAKE_PTR(p),
                 .symlinks = TAKE_PTR(s),
+                .flags = flags,
         };
 
         return 1; /* new item is added */
@@ -2625,7 +2831,7 @@ void exec_directory_sort(ExecDirectory *d) {
 
         /* Sort the exec directories to make always parent directories processed at first in
          * setup_exec_directory(), e.g., even if StateDirectory=foo/bar foo, we need to create foo at first,
-         * then foo/bar. Also, set .only_create flag if one of the parent directories is contained in the
+         * then foo/bar. Also, set the ONLY_CREATE flag if one of the parent directories is contained in the
          * list. See also comments in setup_exec_directory() and issue #24783. */
 
         if (d->n_items <= 1)
@@ -2636,7 +2842,7 @@ void exec_directory_sort(ExecDirectory *d) {
         for (size_t i = 1; i < d->n_items; i++)
                 for (size_t j = 0; j < i; j++)
                         if (path_startswith(d->items[i].path, d->items[j].path)) {
-                                d->items[i].only_create = true;
+                                d->items[i].flags |= EXEC_DIRECTORY_ONLY_CREATE;
                                 break;
                         }
 }

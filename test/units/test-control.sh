@@ -91,6 +91,13 @@ run_subtests_with_signals() {
             continue
         fi
 
+        for skip in ${TEST_SKIP_SUBTESTS:-}; do
+            if [[ "$subtest" =~ $skip ]]; then
+                echo "Skipping $subtest (matching '$skip')"
+                continue 2
+            fi
+        done
+
         : "--- $subtest BEGIN ---"
         SECONDS=0
         "./$subtest" &
@@ -107,7 +114,7 @@ run_subtests_with_signals() {
     _show_summary
 }
 
-# Run all subtests (i.e. files named as testsuite-<testid>.<subtest_name>.sh)
+# Run all subtests (i.e. files named as $TESTNAME.<subtest_name>.sh)
 run_subtests() {
     local subtests=("${0%.sh}".*.sh)
     local subtest
@@ -122,6 +129,13 @@ run_subtests() {
             echo "Skipping $subtest (not matching '$TEST_MATCH_SUBTEST')"
             continue
         fi
+
+        for skip in ${TEST_SKIP_SUBTESTS:-}; do
+            if [[ "$subtest" =~ $skip ]]; then
+                echo "Skipping $subtest (matching '$skip')"
+                continue 2
+            fi
+        done
 
         : "--- $subtest BEGIN ---"
         SECONDS=0
@@ -154,6 +168,13 @@ run_testcases() {
             echo "Skipping $testcase (not matching '$TEST_MATCH_TESTCASE')"
             continue
         fi
+
+        for skip in ${TEST_SKIP_TESTCASES:-}; do
+            if [[ "$testcase" =~ $skip ]]; then
+                echo "Skipping $testcase (matching '$skip')"
+                continue 2
+            fi
+        done
 
         : "+++ $testcase BEGIN +++"
         # Note: the subshell here is used purposefully, otherwise we might

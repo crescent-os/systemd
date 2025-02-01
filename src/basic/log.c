@@ -16,6 +16,7 @@
 #include "sd-messages.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
 #include "argv-util.h"
 #include "env-util.h"
 #include "errno-util.h"
@@ -256,7 +257,7 @@ fail:
         return r;
 }
 
-static bool stderr_is_journal(void) {
+bool stderr_is_journal(void) {
         _cleanup_free_ char *w = NULL;
         const char *e;
         uint64_t dev, ino;
@@ -395,9 +396,10 @@ void log_forget_fds(void) {
         console_fd_is_tty = -1;
 }
 
-void log_set_max_level(int level) {
-        assert(level == LOG_NULL || (level & LOG_PRIMASK) == level);
+int log_set_max_level(int level) {
+        assert(level == LOG_NULL || log_level_is_valid(level));
 
+        int old = log_max_level;
         log_max_level = level;
 
         /* Also propagate max log level to libc's syslog(), just in case some other component loaded into our
@@ -410,6 +412,8 @@ void log_set_max_level(int level) {
 
         /* Ensure that our own LOG_NULL define maps sanely to the log mask */
         assert_cc(LOG_UPTO(LOG_NULL) == 0);
+
+        return old;
 }
 
 void log_set_facility(int facility) {
@@ -434,6 +438,8 @@ static int write_to_console(
                 const char *func,
                 const char *buffer) {
 
+        static int dumb = -1;
+
         char location[256],
              header_time[FORMAT_TIMESTAMP_MAX],
              prefix[1 + DECIMAL_STR_MAX(int) + 2],
@@ -444,6 +450,9 @@ static int write_to_console(
 
         if (console_fd < 0)
                 return 0;
+
+        if (dumb < 0)
+                dumb = getenv_terminal_is_dumb();
 
         if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_CONSOLE])
                 return 0;
@@ -491,8 +500,9 @@ static int write_to_console(
         /* When writing to a TTY we output an extra '\r' (i.e. CR) first, to generate CRNL rather than just
          * NL. This is a robustness thing in case the TTY is currently in raw mode (specifically: has the
          * ONLCR flag off). We want that subsequent output definitely starts at the beginning of the line
-         * again, after all. If the TTY is not in raw mode the extra CR should not hurt. */
-        iovec[n++] = IOVEC_MAKE_STRING(check_console_fd_is_tty() ? "\r\n" : "\n");
+         * again, after all. If the TTY is not in raw mode the extra CR should not hurt. If we're writing to
+         * a dumb terminal, only write NL as CRNL might be interpreted as a double newline. */
+        iovec[n++] = IOVEC_MAKE_STRING(check_console_fd_is_tty() && !dumb ? "\r\n" : "\n");
 
         if (writev(console_fd, iovec, n) < 0) {
 
@@ -526,8 +536,8 @@ static int write_to_syslog(
         char header_priority[2 + DECIMAL_STR_MAX(int) + 1],
              header_time[64],
              header_pid[4 + DECIMAL_STR_MAX(pid_t) + 1];
-        time_t t;
         struct tm tm;
+        int r;
 
         if (syslog_fd < 0)
                 return 0;
@@ -537,9 +547,9 @@ static int write_to_syslog(
 
         xsprintf(header_priority, "<%i>", level);
 
-        t = (time_t) (now(CLOCK_REALTIME) / USEC_PER_SEC);
-        if (!localtime_r(&t, &tm))
-                return -EINVAL;
+        r = localtime_or_gmtime_usec(now(CLOCK_REALTIME), /* utc= */ false, &tm);
+        if (r < 0)
+                return r;
 
         if (strftime(header_time, sizeof(header_time), "%h %e %T ", &tm) <= 0)
                 return -EINVAL;
@@ -671,10 +681,10 @@ static int log_do_header(
                      error ? "ERRNO=" : "",
                      error ? 1 : 0, error,
                      error ? "\n" : "",
-                     isempty(object) ? "" : object_field,
+                     isempty(object) ? "" : ASSERT_PTR(object_field),
                      isempty(object) ? "" : object,
                      isempty(object) ? "" : "\n",
-                     isempty(extra) ? "" : extra_field,
+                     isempty(extra) ? "" : ASSERT_PTR(extra_field),
                      isempty(extra) ? "" : extra,
                      isempty(extra) ? "" : "\n",
                      program_invocation_short_name);
@@ -737,7 +747,7 @@ static int write_to_journal(
         if (LOG_PRI(level) > log_target_max_level[LOG_TARGET_JOURNAL])
                 return 0;
 
-        iovec_len = MIN(6 + _log_context_num_fields * 2, IOVEC_MAX);
+        iovec_len = MIN(6 + _log_context_num_fields * 3, IOVEC_MAX);
         iovec = newa(struct iovec, iovec_len);
 
         log_do_header(header, sizeof(header), level, error, file, line, func, object_field, object, extra_field, extra);
@@ -782,7 +792,7 @@ int log_dispatch_internal(
                 return -ERRNO_VALUE(error);
 
         /* Patch in LOG_DAEMON facility if necessary */
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (open_when_needed)
@@ -1071,7 +1081,7 @@ int log_struct_internal(
             log_target == LOG_TARGET_NULL)
                 return -ERRNO_VALUE(error);
 
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (IN_SET(log_target,
@@ -1089,7 +1099,7 @@ int log_struct_internal(
                         int r;
                         bool fallback = false;
 
-                        iovec_len = MIN(17 + _log_context_num_fields * 2, IOVEC_MAX);
+                        iovec_len = MIN(17 + _log_context_num_fields * 3, IOVEC_MAX);
                         iovec = newa(struct iovec, iovec_len);
 
                         /* If the journal is available do structured logging.
@@ -1174,7 +1184,7 @@ int log_struct_iovec_internal(
             log_target == LOG_TARGET_NULL)
                 return -ERRNO_VALUE(error);
 
-        if ((level & LOG_FACMASK) == 0)
+        if (LOG_FAC(level) == 0)
                 level |= log_facility;
 
         if (IN_SET(log_target, LOG_TARGET_AUTO,
@@ -1186,7 +1196,7 @@ int log_struct_iovec_internal(
                 struct iovec *iovec;
                 size_t n = 0, iovec_len;
 
-                iovec_len = MIN(1 + n_input_iovec * 2 + _log_context_num_fields * 2, IOVEC_MAX);
+                iovec_len = MIN(1 + n_input_iovec * 2 + _log_context_num_fields * 3, IOVEC_MAX);
                 iovec = newa(struct iovec, iovec_len);
 
                 log_do_header(header, sizeof(header), level, error, file, line, func, NULL, NULL, NULL, NULL);
@@ -1396,14 +1406,29 @@ static bool should_parse_proc_cmdline(void) {
 
 void log_parse_environment_variables(void) {
         const char *e;
+        int r;
 
         e = getenv("SYSTEMD_LOG_TARGET");
         if (e && log_set_target_from_string(e) < 0)
                 log_warning("Failed to parse log target '%s', ignoring.", e);
 
         e = getenv("SYSTEMD_LOG_LEVEL");
-        if (e && log_set_max_level_from_string(e) < 0)
-                log_warning("Failed to parse log level '%s', ignoring.", e);
+        if (e) {
+                r = log_set_max_level_from_string(e);
+                if (r < 0)
+                        log_warning_errno(r, "Failed to parse log level '%s', ignoring: %m", e);
+        } else {
+                /* If no explicit log level is specified then let's see if this is a debug invocation, and if
+                 * so raise the log level to debug too. Note that this is not symmetric: just because
+                 * DEBUG_INVOCATION is explicitly set to 0 we won't lower the log level below debug. This
+                 * follows the logic that debug logging is an opt-in thing anyway, and if there's any reason
+                 * to enable it we should not disable it here automatically. */
+                r = getenv_bool("DEBUG_INVOCATION");
+                if (r < 0 && r != -ENXIO)
+                        log_warning_errno(r, "Failed to parse $DEBUG_INVOCATION value, ignoring: %m");
+                else if (r > 0)
+                        log_set_max_level(LOG_DEBUG);
+        }
 
         e = getenv("SYSTEMD_LOG_COLOR");
         if (e && log_show_color_from_string(e) < 0)
@@ -1669,6 +1694,7 @@ int log_syntax_invalid_utf8_internal(
                 const char *func,
                 const char *rvalue) {
 
+        PROTECT_ERRNO;
         _cleanup_free_ char *p = NULL;
 
         if (rvalue)
@@ -1677,6 +1703,44 @@ int log_syntax_invalid_utf8_internal(
         return log_syntax_internal(unit, level, config_file, config_line,
                                    SYNTHETIC_ERRNO(EINVAL), file, line, func,
                                    "String is not UTF-8 clean, ignoring assignment: %s", strna(p));
+}
+
+int log_syntax_parse_error_internal(
+                const char *unit,
+                const char *config_file,
+                unsigned config_line,
+                int error,
+                bool critical,
+                const char *file,
+                int line,
+                const char *func,
+                const char *lvalue,
+                const char *rvalue) {
+
+        PROTECT_ERRNO;
+        _cleanup_free_ char *escaped = NULL;
+
+        /* OOM is always handled as critical. */
+        if (ERRNO_VALUE(error) == ENOMEM)
+                return log_oom_internal(LOG_ERR, file, line, func);
+
+        if (rvalue && !utf8_is_valid(rvalue)) {
+                escaped = utf8_escape_invalid(rvalue);
+                if (!escaped)
+                        rvalue = "(oom)";
+                else
+                        rvalue = " (escaped)";
+        }
+
+        log_syntax_internal(unit, critical ? LOG_ERR : LOG_WARNING, config_file, config_line, error,
+                            file, line, func,
+                            "Failed to parse %s=%s%s%s%s%s",
+                            strna(lvalue), strempty(escaped), strempty(rvalue),
+                            critical ? "" : ", ignoring",
+                            error == 0 ? "." : ": ",
+                            error == 0 ? "" : STRERROR(error));
+
+        return critical ? -ERRNO_VALUE(error) : 0;
 }
 
 void log_set_upgrade_syslog_to_journal(bool b) {
@@ -1735,7 +1799,7 @@ void log_setup(void) {
                 log_show_color(true);
 }
 
-const char *_log_set_prefix(const char *prefix, bool force) {
+const char* _log_set_prefix(const char *prefix, bool force) {
         const char *old = log_prefix;
 
         if (prefix || force)

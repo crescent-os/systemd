@@ -291,7 +291,7 @@ JournalFile* journal_file_close(JournalFile *f) {
                 safe_close(f->fd);
         free(f->path);
 
-        ordered_hashmap_free_free(f->chain_cache);
+        ordered_hashmap_free(f->chain_cache);
 
 #if HAVE_COMPRESSION
         free(f->compress_buffer);
@@ -2341,7 +2341,7 @@ static int journal_file_append_entry_internal(
                 if (sd_id128_is_null(*seqnum_id))
                         *seqnum_id = f->header->seqnum_id; /* Caller has none assigned, then copy the one from the file */
                 else if (!sd_id128_equal(*seqnum_id, f->header->seqnum_id)) {
-                        /* Different seqnum IDs? We can't allow entries from multiple IDs end up in the same journal.*/
+                        /* Different seqnum IDs? We can't allow entries from multiple IDs end up in the same journal. */
                         if (le64toh(f->header->n_entries) == 0)
                                 f->header->seqnum_id = *seqnum_id; /* Caller has one, and file so far has no entries, then copy the one from the caller */
                         else
@@ -2646,7 +2646,7 @@ typedef struct ChainCacheItem {
 } ChainCacheItem;
 
 static void chain_cache_put(
-                OrderedHashmap *h,
+                JournalFile *f,
                 ChainCacheItem *ci,
                 uint64_t first,
                 uint64_t array,
@@ -2654,7 +2654,7 @@ static void chain_cache_put(
                 uint64_t total,
                 uint64_t last_index) {
 
-        assert(h);
+        assert(f);
 
         if (!ci) {
                 /* If the chain item to cache for this chain is the
@@ -2662,8 +2662,8 @@ static void chain_cache_put(
                 if (array == first)
                         return;
 
-                if (ordered_hashmap_size(h) >= CHAIN_CACHE_MAX) {
-                        ci = ordered_hashmap_steal_first(h);
+                if (ordered_hashmap_size(f->chain_cache) >= CHAIN_CACHE_MAX) {
+                        ci = ordered_hashmap_steal_first(f->chain_cache);
                         assert(ci);
                 } else {
                         ci = new(ChainCacheItem, 1);
@@ -2673,7 +2673,7 @@ static void chain_cache_put(
 
                 ci->first = first;
 
-                if (ordered_hashmap_put(h, &ci->first, ci) < 0) {
+                if (ordered_hashmap_ensure_put(&f->chain_cache, &uint64_hash_ops_value_free, &ci->first, ci) < 0) {
                         free(ci);
                         return;
                 }
@@ -2847,7 +2847,7 @@ static int generic_array_get(
                         r = journal_file_move_to_object(f, OBJECT_ENTRY, p, ret_object);
                         if (r >= 0) {
                                 /* Let's cache this item for the next invocation */
-                                chain_cache_put(f->chain_cache, ci, first, a, journal_file_entry_array_item(f, o, 0), t, i);
+                                chain_cache_put(f, ci, first, a, journal_file_entry_array_item(f, o, 0), t, i);
 
                                 if (ret_offset)
                                         *ret_offset = p;
@@ -3187,7 +3187,7 @@ found:
                 return -EBADMSG;
 
         /* Let's cache this item for the next invocation */
-        chain_cache_put(f->chain_cache, ci, first, a, p, t, i);
+        chain_cache_put(f, ci, first, a, p, t, i);
 
         p = journal_file_entry_array_item(f, array, i);
         if (p == 0)
@@ -3255,7 +3255,7 @@ static int generic_array_bisect_for_data(
 
         } else {
                 /* If we are going upwards, then we need to return the last object that passes the test.
-                 * When there is no object that passes the test, we need to return the the last object that
+                 * When there is no object that passes the test, we need to return the last object that
                  * test_object() returns TEST_LEFT for. */
                 if (r == TEST_RIGHT)
                         return 0; /* Not only the 'extra' object, but also all objects in the chained arrays
@@ -3801,35 +3801,35 @@ void journal_file_dump(JournalFile *f) {
                 case OBJECT_ENTRY:
                         assert(s);
 
-                        printf("Type: %s seqnum=%"PRIu64" monotonic=%"PRIu64" realtime=%"PRIu64"\n",
-                               s,
-                               le64toh(o->entry.seqnum),
-                               le64toh(o->entry.monotonic),
-                               le64toh(o->entry.realtime));
+                        log_info("Type: %s seqnum=%"PRIu64" monotonic=%"PRIu64" realtime=%"PRIu64"\n",
+                                 s,
+                                 le64toh(o->entry.seqnum),
+                                 le64toh(o->entry.monotonic),
+                                 le64toh(o->entry.realtime));
                         break;
 
                 case OBJECT_TAG:
                         assert(s);
 
-                        printf("Type: %s seqnum=%"PRIu64" epoch=%"PRIu64"\n",
-                               s,
-                               le64toh(o->tag.seqnum),
-                               le64toh(o->tag.epoch));
+                        log_info("Type: %s seqnum=%"PRIu64" epoch=%"PRIu64"\n",
+                                 s,
+                                 le64toh(o->tag.seqnum),
+                                 le64toh(o->tag.epoch));
                         break;
 
                 default:
                         if (s)
-                                printf("Type: %s \n", s);
+                                log_info("Type: %s \n", s);
                         else
-                                printf("Type: unknown (%i)", o->object.type);
+                                log_info("Type: unknown (%i)", o->object.type);
 
                         break;
                 }
 
                 c = COMPRESSION_FROM_OBJECT(o);
                 if (c > COMPRESSION_NONE)
-                        printf("Flags: %s\n",
-                               compression_to_string(c));
+                        log_info("Flags: %s\n",
+                                 compression_to_string(c));
 
                 if (p == le64toh(f->header->tail_object_offset))
                         p = 0;
@@ -4113,12 +4113,6 @@ int journal_file_open(
                         r = -ENOMEM;
                         goto fail;
                 }
-        }
-
-        f->chain_cache = ordered_hashmap_new(&uint64_hash_ops);
-        if (!f->chain_cache) {
-                r = -ENOMEM;
-                goto fail;
         }
 
         if (f->fd < 0) {

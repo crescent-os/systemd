@@ -31,16 +31,36 @@ int parse_boolean_argument(const char *optname, const char *s, bool *ret) {
         }
 }
 
-int parse_json_argument(const char *s, JsonFormatFlags *ret) {
+int parse_tristate_argument(const char *optname, const char *s, int *ret) {
+        int r;
+
+        if (s) {
+                r = parse_boolean(s);
+                if (r < 0)
+                        return log_error_errno(r, "Failed to parse boolean argument to %s: %s.", optname, s);
+
+                if (ret)
+                        *ret = r;
+
+                return r;
+        } else {
+                if (ret)
+                        *ret = -1;
+
+                return 0;
+        }
+}
+
+int parse_json_argument(const char *s, sd_json_format_flags_t *ret) {
         assert(s);
         assert(ret);
 
         if (streq(s, "pretty"))
-                *ret = JSON_FORMAT_PRETTY|JSON_FORMAT_COLOR_AUTO;
+                *ret = SD_JSON_FORMAT_PRETTY|SD_JSON_FORMAT_COLOR_AUTO;
         else if (streq(s, "short"))
-                *ret = JSON_FORMAT_NEWLINE;
+                *ret = SD_JSON_FORMAT_NEWLINE;
         else if (streq(s, "off"))
-                *ret = JSON_FORMAT_OFF;
+                *ret = SD_JSON_FORMAT_OFF;
         else if (streq(s, "help")) {
                 puts("pretty\n"
                      "short\n"

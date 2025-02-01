@@ -17,6 +17,8 @@
 #include "sd-event.h"
 
 #include "alloc-util.h"
+#include "ansi-color.h"
+#include "env-util.h"
 #include "errno-util.h"
 #include "extract-word.h"
 #include "fd-util.h"
@@ -34,11 +36,15 @@ typedef enum AnsiColorState  {
         ANSI_COLOR_STATE_ESC,
         ANSI_COLOR_STATE_CSI_SEQUENCE,
         ANSI_COLOR_STATE_OSC_SEQUENCE,
-        ANSI_COLOR_STATE_NEWLINE,
-        ANSI_COLOR_STATE_CARRIAGE_RETURN,
+        ANSI_COLOR_STATE_OSC_SEQUENCE_TERMINATING,
         _ANSI_COLOR_STATE_MAX,
         _ANSI_COLOR_STATE_INVALID = -EINVAL,
 } AnsiColorState;
+
+#define ANSI_SEQUENCE_LENGTH_MAX 192U
+#define ANSI_SEQUENCE_WINDOW_TITLE_MAX 128U
+
+assert_cc(ANSI_SEQUENCE_LENGTH_MAX > ANSI_SEQUENCE_WINDOW_TITLE_MAX);
 
 struct PTYForward {
         sd_event *event;
@@ -52,8 +58,8 @@ struct PTYForward {
         sd_event_source *stdin_event_source;
         sd_event_source *stdout_event_source;
         sd_event_source *master_event_source;
-
         sd_event_source *sigwinch_event_source;
+        sd_event_source *exit_event_source;
 
         struct termios saved_stdin_attr;
         struct termios saved_stdout_attr;
@@ -79,10 +85,13 @@ struct PTYForward {
 
         bool last_char_set:1;
         char last_char;
+        char last_char_safe;
 
         char in_buffer[LINE_MAX], *out_buffer;
         size_t out_buffer_size;
         size_t in_buffer_full, out_buffer_full;
+        size_t out_buffer_write_len; /* The length of the output in the buffer except for the trailing
+                                      * truncated OSC, CSI, or some (but not all) ESC sequence. */
 
         usec_t escape_timestamp;
         unsigned escape_counter;
@@ -108,9 +117,9 @@ static void pty_forward_disconnect(PTYForward *f) {
 
         f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
         f->stdout_event_source = sd_event_source_unref(f->stdout_event_source);
-
         f->master_event_source = sd_event_source_unref(f->master_event_source);
         f->sigwinch_event_source = sd_event_source_unref(f->sigwinch_event_source);
+        f->exit_event_source = sd_event_source_unref(f->exit_event_source);
         f->event = sd_event_unref(f->event);
 
         if (f->output_fd >= 0) {
@@ -125,6 +134,19 @@ static void pty_forward_disconnect(PTYForward *f) {
 
                         if (f->title)
                                 (void) loop_write(f->output_fd, ANSI_WINDOW_TITLE_POP, SIZE_MAX);
+                }
+
+                if (f->last_char_set && f->last_char != '\n') {
+                        const char *s;
+
+                        if (isatty_safe(f->output_fd) && f->last_char != '\r')
+                                s = "\r\n";
+                        else
+                                s = "\n";
+                        (void) loop_write(f->output_fd, s, SIZE_MAX);
+
+                        f->last_char_set = true;
+                        f->last_char = '\n';
                 }
 
                 if (f->close_output_fd)
@@ -145,6 +167,7 @@ static void pty_forward_disconnect(PTYForward *f) {
         f->out_buffer = mfree(f->out_buffer);
         f->out_buffer_size = 0;
         f->out_buffer_full = 0;
+        f->out_buffer_write_len = 0;
         f->in_buffer_full = 0;
 
         f->csi_sequence = mfree(f->csi_sequence);
@@ -218,6 +241,9 @@ static bool drained(PTYForward *f) {
 
         assert(f);
 
+        if (f->done)
+                return true;
+
         if (f->out_buffer_full > 0)
                 return false;
 
@@ -237,7 +263,7 @@ static bool drained(PTYForward *f) {
         return true;
 }
 
-static char *background_color_sequence(PTYForward *f) {
+static char* background_color_sequence(PTYForward *f) {
         assert(f);
         assert(f->background_color);
 
@@ -270,6 +296,9 @@ static int insert_background_color(PTYForward *f, size_t offset) {
         _cleanup_free_ char *s = NULL;
 
         assert(f);
+
+        if (FLAGS_SET(f->flags, PTY_FORWARD_DUMB_TERMINAL))
+                return 0;
 
         if (!f->background_color)
                 return 0;
@@ -353,6 +382,9 @@ static int is_csi_background_reset_sequence(const char *seq) {
 static int insert_background_fix(PTYForward *f, size_t offset) {
         assert(f);
 
+        if (FLAGS_SET(f->flags, PTY_FORWARD_DUMB_TERMINAL))
+                return 0;
+
         if (!f->background_color)
                 return 0;
 
@@ -367,8 +399,26 @@ static int insert_background_fix(PTYForward *f, size_t offset) {
         return insert_string(f, offset, s);
 }
 
+bool shall_set_terminal_title(void) {
+        static int cache = -1;
+
+        if (cache >= 0)
+                return cache;
+
+        cache = getenv_bool("SYSTEMD_ADJUST_TERMINAL_TITLE");
+        if (cache == -ENXIO)
+                return (cache = true);
+        if (cache < 0)
+                log_debug_errno(cache, "Failed to parse $SYSTEMD_ADJUST_TERMINAL_TITLE, leaving terminal title setting enabled: %m");
+
+        return cache != 0;
+}
+
 static int insert_window_title_fix(PTYForward *f, size_t offset) {
         assert(f);
+
+        if (FLAGS_SET(f->flags, PTY_FORWARD_DUMB_TERMINAL))
+                return 0;
 
         if (!f->title_prefix)
                 return 0;
@@ -376,11 +426,11 @@ static int insert_window_title_fix(PTYForward *f, size_t offset) {
         if (!f->osc_sequence)
                 return 0;
 
-        const char *t = startswith(f->osc_sequence, "0;"); /* Set window title OSC sequence*/
+        const char *t = startswith(f->osc_sequence, "0;"); /* Set window title OSC sequence */
         if (!t)
                 return 0;
 
-        _cleanup_free_ char *joined = strjoin("\x1b]0;", f->title_prefix, t, "\a");
+        _cleanup_free_ char *joined = strjoin(ANSI_OSC "0;", f->title_prefix, t, ANSI_ST);
         if (!joined)
                 return -ENOMEM;
 
@@ -393,41 +443,42 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
         assert(f);
         assert(offset <= f->out_buffer_full);
 
-        if (!f->background_color && !f->title_prefix)
-                return 0;
-
-        if (FLAGS_SET(f->flags, PTY_FORWARD_DUMB_TERMINAL))
-                return 0;
-
         for (size_t i = offset; i < f->out_buffer_full; i++) {
                 char c = f->out_buffer[i];
 
                 switch (f->ansi_color_state) {
 
                 case ANSI_COLOR_STATE_TEXT:
-                        break;
-
-                case ANSI_COLOR_STATE_NEWLINE:
-                case ANSI_COLOR_STATE_CARRIAGE_RETURN:
-                        /* Immediately after a newline (ASCII 10) or carriage return (ASCII 13) insert an
-                         * ANSI sequence set the background color back. */
-
-                        r = insert_background_color(f, i);
-                        if (r < 0)
-                                return r;
-
-                        i += r;
+                        if (IN_SET(c, '\n', '\r')) {
+                                /* Immediately after a newline (ASCII 10) or carriage return (ASCII 13) insert an
+                                 * ANSI sequence set the background color back. */
+                                r = insert_background_color(f, i+1);
+                                if (r < 0)
+                                        return r;
+                                i += r;
+                                f->last_char_safe = c;
+                        } else if (c == 0x1B) /* ESC */
+                                f->ansi_color_state = ANSI_COLOR_STATE_ESC;
+                        else if (!char_is_cc(c))
+                                f->last_char_safe = c;
                         break;
 
                 case ANSI_COLOR_STATE_ESC:
 
-                        if (c == '[') {
+                        if (c == '[')
                                 f->ansi_color_state = ANSI_COLOR_STATE_CSI_SEQUENCE;
-                                continue;
-                        } else if (c == ']') {
+                        else if (c == ']')
                                 f->ansi_color_state = ANSI_COLOR_STATE_OSC_SEQUENCE;
-                                continue;
-                        }
+                        else if (c == 'c') {
+                                /* "Full reset" aka "Reset to initial state" */
+                                r = insert_background_color(f, i+1);
+                                if (r < 0)
+                                        return r;
+
+                                i += r;
+                                f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
+                        } else
+                                f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                         break;
 
                 case ANSI_COLOR_STATE_CSI_SEQUENCE:
@@ -436,17 +487,25 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                 /* If this is a "parameter" or "intermediary" byte (i.e. ranges 0x20…0x2F and
                                  * 0x30…0x3F) then we are still in the CSI sequence */
 
-                                if (strlen_ptr(f->csi_sequence) >= 64) {
+                                if (strlen_ptr(f->csi_sequence) >= ANSI_SEQUENCE_LENGTH_MAX) {
                                         /* Safety check: lets not accept unbounded CSI sequences */
 
                                         f->csi_sequence = mfree(f->csi_sequence);
-                                        break;
+                                        f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                                 } else if (!strextend(&f->csi_sequence, CHAR_TO_STR(c)))
                                         return -ENOMEM;
                         } else {
                                 /* Otherwise, the CSI sequence is over */
 
-                                if (c == 'm') {
+                                if (c == 'p' && streq_ptr(f->csi_sequence, "!")) {
+
+                                        /* CSI ! p → "Soft Reset", let's immediately fix our bg color again */
+                                        r = insert_background_color(f, i+1);
+                                        if (r < 0)
+                                                return r;
+
+                                        i += r;
+                                } else if (c == 'm') {
                                         /* This is an "SGR" (Select Graphic Rendition) sequence. Patch in our background color. */
                                         r = insert_background_fix(f, i);
                                         if (r < 0)
@@ -458,51 +517,63 @@ static int pty_forward_ansi_process(PTYForward *f, size_t offset) {
                                 f->csi_sequence = mfree(f->csi_sequence);
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                         }
-                        continue;
+                        break;
 
                 case ANSI_COLOR_STATE_OSC_SEQUENCE:
 
                         if ((uint8_t) c >= ' ') {
-                                if (strlen_ptr(f->osc_sequence) >= 64) {
+                                if (strlen_ptr(f->osc_sequence) >= ANSI_SEQUENCE_LENGTH_MAX) {
                                         /* Safety check: lets not accept unbounded OSC sequences */
                                         f->osc_sequence = mfree(f->osc_sequence);
-                                        break;
+                                        f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                                 } else if (!strextend(&f->osc_sequence, CHAR_TO_STR(c)))
                                         return -ENOMEM;
-                        } else {
+                        } else if (c == '\x07') {
                                 /* Otherwise, the OSC sequence is over
                                  *
-                                 * There are two allowed ways to end an OSC sequence:
-                                 * BEL '\x07'
-                                 * String Terminator (ST): <Esc>\ - "\x1b\x5c"
-                                 * since we cannot lookahead to see if the Esc is followed by a \
-                                 * we cut a corner here and assume it will be \. */
+                                 * There are three documented ways to end an OSC sequence:
+                                 *     1. BEL aka ^G aka \x07
+                                 *     2. \x9c
+                                 *     3. \x1b\x5c
+                                 * Note that we do not support \x9c here, because that's also a valid UTF8
+                                 * codepoint, and that would create ambiguity. Various terminal emulators
+                                 * similar do not support it. */
 
-                                if (IN_SET(c, '\x07', '\x1b')) {
-                                        r = insert_window_title_fix(f, i+1);
-                                        if (r < 0)
-                                                return r;
-
-                                        i += r;
-                                }
+                                r = insert_window_title_fix(f, i+1);
+                                if (r < 0)
+                                        return r;
+                                i += r;
 
                                 f->osc_sequence = mfree(f->osc_sequence);
                                 f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
+                        } else if (c == '\x1b')
+                                /* See the comment above. */
+                                f->ansi_color_state = ANSI_COLOR_STATE_OSC_SEQUENCE_TERMINATING;
+                        else {
+                                /* Unexpected or unsupported OSC sequence. */
+                                f->osc_sequence = mfree(f->osc_sequence);
+                                f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
                         }
-                        continue;
+                        break;
+
+                case ANSI_COLOR_STATE_OSC_SEQUENCE_TERMINATING:
+                        if (c == '\x5c') {
+                                r = insert_window_title_fix(f, i+1);
+                                if (r < 0)
+                                        return r;
+                                i += r;
+                        }
+
+                        f->osc_sequence = mfree(f->osc_sequence);
+                        f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
+                        break;
 
                 default:
                         assert_not_reached();
                 }
 
-                if (c == '\n')
-                        f->ansi_color_state = ANSI_COLOR_STATE_NEWLINE;
-                else if (c == '\r')
-                        f->ansi_color_state = ANSI_COLOR_STATE_CARRIAGE_RETURN;
-                else if (c == 0x1B) /* ESC */
-                        f->ansi_color_state = ANSI_COLOR_STATE_ESC;
-                else
-                        f->ansi_color_state = ANSI_COLOR_STATE_TEXT;
+                if (f->ansi_color_state == ANSI_COLOR_STATE_TEXT)
+                        f->out_buffer_write_len = i + 1;
         }
 
         return 0;
@@ -532,12 +603,12 @@ static int do_shovel(PTYForward *f) {
                 if (f->title) {
                         if (!strextend(&f->out_buffer,
                                        ANSI_WINDOW_TITLE_PUSH
-                                       "\x1b]2;", f->title, "\a"))
+                                       ANSI_OSC "2;", f->title, ANSI_ST))
                                 return log_oom();
                 }
 
                 if (f->out_buffer) {
-                        f->out_buffer_full = strlen(f->out_buffer);
+                        f->out_buffer_full = f->out_buffer_write_len = strlen(f->out_buffer);
                         f->out_buffer_size = MALLOC_SIZEOF_SAFE(f->out_buffer);
                 }
         }
@@ -552,10 +623,8 @@ static int do_shovel(PTYForward *f) {
                 f->out_buffer_size = MALLOC_SIZEOF_SAFE(p);
         }
 
-        while ((f->stdin_readable && f->in_buffer_full <= 0) ||
-               (f->master_writable && f->in_buffer_full > 0) ||
-               (f->master_readable && f->out_buffer_full <= 0) ||
-               (f->stdout_writable && f->out_buffer_full > 0)) {
+        for (;;) {
+                bool did_something = false;
 
                 if (f->stdin_readable && f->in_buffer_full < LINE_MAX) {
 
@@ -570,7 +639,7 @@ static int do_shovel(PTYForward *f) {
 
                                         f->stdin_event_source = sd_event_source_unref(f->stdin_event_source);
                                 } else
-                                        return log_error_errno(errno, "read(): %m");
+                                        return log_error_errno(errno, "Failed to read from pty input fd: %m");
                         } else if (k == 0) {
                                 /* EOF on stdin */
                                 f->stdin_readable = false;
@@ -585,6 +654,8 @@ static int do_shovel(PTYForward *f) {
 
                                 f->in_buffer_full += (size_t) k;
                         }
+
+                        did_something = true;
                 }
 
                 if (f->master_writable && f->in_buffer_full > 0) {
@@ -606,6 +677,8 @@ static int do_shovel(PTYForward *f) {
                                 memmove(f->in_buffer, f->in_buffer + k, f->in_buffer_full - k);
                                 f->in_buffer_full -= k;
                         }
+
+                        did_something = true;
                 }
 
                 if (f->master_readable && f->out_buffer_full < MIN(f->out_buffer_size, (size_t) LINE_MAX)) {
@@ -625,7 +698,7 @@ static int do_shovel(PTYForward *f) {
 
                                         f->master_event_source = sd_event_source_unref(f->master_event_source);
                                 } else
-                                        return log_error_errno(errno, "read(): %m");
+                                        return log_error_errno(errno, "Failed to read from pty master fd: %m");
                         } else {
                                 f->read_from_master = true;
                                 size_t scan_index = f->out_buffer_full;
@@ -635,11 +708,14 @@ static int do_shovel(PTYForward *f) {
                                 if (r < 0)
                                         return log_error_errno(r, "Failed to scan for ANSI sequences: %m");
                         }
+
+                        did_something = true;
                 }
 
-                if (f->stdout_writable && f->out_buffer_full > 0) {
+                if (f->stdout_writable && f->out_buffer_write_len > 0) {
+                        assert(f->out_buffer_write_len <= f->out_buffer_full);
 
-                        k = write(f->output_fd, f->out_buffer, f->out_buffer_full);
+                        k = write(f->output_fd, f->out_buffer, f->out_buffer_write_len);
                         if (k < 0) {
 
                                 if (errno == EAGAIN)
@@ -649,27 +725,40 @@ static int do_shovel(PTYForward *f) {
                                         f->stdout_hangup = true;
                                         f->stdout_event_source = sd_event_source_unref(f->stdout_event_source);
                                 } else
-                                        return log_error_errno(errno, "write(): %m");
+                                        return log_error_errno(errno, "Failed to write to pty output fd: %m");
 
                         } else {
 
-                                if (k > 0) {
-                                        f->last_char = f->out_buffer[k-1];
+                                if (k > 0 && f->last_char_safe != '\0') {
+                                        if ((size_t) k == f->out_buffer_write_len)
+                                                /* If we wrote all, then save the last safe character. */
+                                                f->last_char = f->last_char_safe;
+                                        else
+                                                /* If we wrote partially, then tentatively save the last written character.
+                                                 * Hopefully, we will write more in the next loop. */
+                                                f->last_char = f->out_buffer[k-1];
+
                                         f->last_char_set = true;
                                 }
 
-                                assert(f->out_buffer_full >= (size_t) k);
+                                assert(f->out_buffer_write_len >= (size_t) k);
                                 memmove(f->out_buffer, f->out_buffer + k, f->out_buffer_full - k);
                                 f->out_buffer_full -= k;
+                                f->out_buffer_write_len -= k;
                         }
+
+                        did_something = true;
                 }
+
+                if (!did_something)
+                        break;
         }
 
         if (f->stdin_hangup || f->stdout_hangup || f->master_hangup) {
                 /* Exit the loop if any side hung up and if there's
                  * nothing more to write or nothing we could write. */
 
-                if ((f->out_buffer_full <= 0 || f->stdout_hangup) &&
+                if ((f->out_buffer_write_len <= 0 || f->stdout_hangup) &&
                     (f->in_buffer_full <= 0 || f->master_hangup))
                         return pty_forward_done(f, 0);
         }
@@ -753,6 +842,31 @@ static int on_sigwinch_event(sd_event_source *e, const struct signalfd_siginfo *
         return 0;
 }
 
+static int on_exit_event(sd_event_source *e, void *userdata) {
+        PTYForward *f = ASSERT_PTR(userdata);
+        int r;
+
+        assert(e);
+        assert(e == f->exit_event_source);
+
+        if (!pty_forward_drain(f)) {
+                /* If not drained, try to drain the buffer. */
+
+                if (!f->master_hangup)
+                        f->master_writable = f->master_readable = true;
+                if (!f->stdin_hangup)
+                        f->stdin_readable = true;
+                if (!f->stdout_hangup)
+                        f->stdout_writable = true;
+
+                r = shovel(f);
+                if (r < 0)
+                        return r;
+        }
+
+        return pty_forward_done(f, 0);
+}
+
 int pty_forward_new(
                 sd_event *event,
                 int master,
@@ -763,11 +877,14 @@ int pty_forward_new(
         struct winsize ws;
         int r;
 
+        assert(master >= 0);
+        assert(ret);
+
         f = new(PTYForward, 1);
         if (!f)
                 return -ENOMEM;
 
-        *f = (struct PTYForward) {
+        *f = (PTYForward) {
                 .flags = flags,
                 .master = -EBADF,
                 .input_fd = -EBADF,
@@ -845,14 +962,15 @@ int pty_forward_new(
 
         (void) ioctl(master, TIOCSWINSZ, &ws);
 
-        if (!(flags & PTY_FORWARD_READ_ONLY)) {
-                int same;
+        if (!FLAGS_SET(flags, PTY_FORWARD_READ_ONLY)) {
+                bool same;
 
                 assert(f->input_fd >= 0);
 
-                same = fd_inode_same(f->input_fd, f->output_fd);
-                if (same < 0)
-                        return same;
+                r = fd_inode_same(f->input_fd, f->output_fd);
+                if (r < 0)
+                        return r;
+                same = r > 0;
 
                 if (tcgetattr(f->input_fd, &f->saved_stdin_attr) >= 0) {
                         struct termios raw_stdin_attr;
@@ -903,36 +1021,33 @@ int pty_forward_new(
 
         (void) sd_event_source_set_description(f->master_event_source, "ptyfwd-master");
 
-        r = sd_event_add_signal(f->event, &f->sigwinch_event_source, SIGWINCH, on_sigwinch_event, f);
+        r = sd_event_add_signal(f->event, &f->sigwinch_event_source, SIGWINCH|SD_EVENT_SIGNAL_PROCMASK, on_sigwinch_event, f);
         if (r < 0)
                 return r;
 
         (void) sd_event_source_set_description(f->sigwinch_event_source, "ptyfwd-sigwinch");
+
+        r = sd_event_add_exit(f->event, &f->exit_event_source, on_exit_event, f);
+        if (r < 0)
+                return r;
+
+        (void) sd_event_source_set_description(f->exit_event_source, "ptyfwd-exit");
 
         *ret = TAKE_PTR(f);
 
         return 0;
 }
 
-PTYForward *pty_forward_free(PTYForward *f) {
+PTYForward* pty_forward_free(PTYForward *f) {
         if (!f)
                 return NULL;
+
         pty_forward_disconnect(f);
         free(f->background_color);
         free(f->title);
         free(f->title_prefix);
+
         return mfree(f);
-}
-
-int pty_forward_get_last_char(PTYForward *f, char *ch) {
-        assert(f);
-        assert(ch);
-
-        if (!f->last_char_set)
-                return -ENXIO;
-
-        *ch = f->last_char;
-        return 0;
 }
 
 int pty_forward_set_ignore_vhangup(PTYForward *f, bool b) {
@@ -940,15 +1055,14 @@ int pty_forward_set_ignore_vhangup(PTYForward *f, bool b) {
 
         assert(f);
 
-        if (!!(f->flags & PTY_FORWARD_IGNORE_VHANGUP) == b)
+        if (FLAGS_SET(f->flags, PTY_FORWARD_IGNORE_VHANGUP) == b)
                 return 0;
 
         SET_FLAG(f->flags, PTY_FORWARD_IGNORE_VHANGUP, b);
 
         if (!ignore_vhangup(f)) {
 
-                /* We shall now react to vhangup()s? Let's check
-                 * immediately if we might be in one */
+                /* We shall now react to vhangup()s? Let's check immediately if we might be in one. */
 
                 f->master_readable = true;
                 r = shovel(f);
@@ -962,13 +1076,7 @@ int pty_forward_set_ignore_vhangup(PTYForward *f, bool b) {
 bool pty_forward_get_ignore_vhangup(PTYForward *f) {
         assert(f);
 
-        return !!(f->flags & PTY_FORWARD_IGNORE_VHANGUP);
-}
-
-bool pty_forward_is_done(PTYForward *f) {
-        assert(f);
-
-        return f->done;
+        return FLAGS_SET(f->flags, PTY_FORWARD_IGNORE_VHANGUP);
 }
 
 void pty_forward_set_handler(PTYForward *f, PTYForwardHandler cb, void *userdata) {
@@ -994,6 +1102,7 @@ bool pty_forward_drain(PTYForward *f) {
 
 int pty_forward_set_priority(PTYForward *f, int64_t priority) {
         int r;
+
         assert(f);
 
         if (f->stdin_event_source) {
@@ -1069,7 +1178,18 @@ int pty_forward_set_title(PTYForward *f, const char *title) {
         if (f->out_buffer_size > 0)
                 return -EBUSY;
 
-        return free_and_strdup(&f->title, title);
+        if (!title) {
+                f->title = mfree(f->title);
+                return 0;
+        }
+
+        /* Truncate the title to 128 chars, since some terminal emulators really don't like overly long ANSI
+         * sequences */
+        _cleanup_free_ char *ellipsized = ellipsize(title, ANSI_SEQUENCE_WINDOW_TITLE_MAX, 66);
+        if (!ellipsized)
+                return -ENOMEM;
+
+        return free_and_replace(f->title, ellipsized);
 }
 
 int pty_forward_set_titlef(PTYForward *f, const char *format, ...) {
@@ -1084,14 +1204,12 @@ int pty_forward_set_titlef(PTYForward *f, const char *format, ...) {
                 return -EBUSY;
 
         va_start(ap, format);
-        DISABLE_WARNING_FORMAT_NONLITERAL;
         r = vasprintf(&title, format, ap);
-        REENABLE_WARNING;
         va_end(ap);
         if (r < 0)
                 return -ENOMEM;
 
-        return free_and_replace(f->title, title);
+        return pty_forward_set_title(f, title);
 }
 
 int pty_forward_set_title_prefix(PTYForward *f, const char *title_prefix) {

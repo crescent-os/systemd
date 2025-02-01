@@ -14,13 +14,10 @@
 #include "resolved-dns-transaction.h"
 #include "resolved-dnstls.h"
 #include "resolved-llmnr.h"
+#include "resolved-timeouts.h"
 #include "string-table.h"
 
 #define TRANSACTIONS_MAX 4096
-#define TRANSACTION_TCP_TIMEOUT_USEC (10U*USEC_PER_SEC)
-
-/* After how much time to repeat classic DNS requests */
-#define DNS_TIMEOUT_USEC (SD_RESOLVED_QUERY_TIMEOUT_USEC / DNS_TRANSACTION_ATTEMPTS_MAX)
 
 static void dns_transaction_reset_answer(DnsTransaction *t) {
         assert(t);
@@ -633,7 +630,7 @@ static int on_stream_complete(DnsStream *s, int error) {
         if (ERRNO_IS_DISCONNECT(error) && s->protocol != DNS_PROTOCOL_LLMNR) {
                 log_debug_errno(error, "Connection failure for DNS TCP stream: %m");
 
-                if (s->transactions) {
+                if (error != ECONNRESET && s->transactions) {
                         DnsTransaction *t;
 
                         t = s->transactions;
@@ -840,10 +837,8 @@ static void dns_transaction_cache_answer(DnsTransaction *t) {
                       dns_transaction_key(t),
                       t->answer_rcode,
                       t->answer,
-                      DNS_PACKET_CD(t->received) ? t->received : NULL, /* only cache full packets with CD on,
-                                                                        * since our use case for caching them
-                                                                        * is "bypass" mode which is only
-                                                                        * enabled for CD packets. */
+                      /* If neither DO nor EDE is set, the full packet isn't useful to cache */
+                      DNS_PACKET_DO(t->received) || t->answer_ede_rcode > 0 || t->answer_ede_msg ? t->received : NULL,
                       t->answer_query_flags,
                       t->answer_dnssec_result,
                       t->answer_nsec_ttl,
@@ -898,9 +893,7 @@ static int dns_transaction_dnssec_ready(DnsTransaction *t) {
                         /* All good. */
                         break;
 
-                case DNS_TRANSACTION_DNSSEC_FAILED: {
-                        DnsAnswer *empty;
-
+                case DNS_TRANSACTION_DNSSEC_FAILED:
                         /* We handle DNSSEC failures different from other errors, as we care about the DNSSEC
                          * validation result */
 
@@ -921,14 +914,10 @@ static int dns_transaction_dnssec_ready(DnsTransaction *t) {
 
                         /* The answer would normally be replaced by the validated subset, but at this point
                          * we aren't going to bother validating the rest, so just drop it. */
-                        empty = dns_answer_new(0);
-                        if (!empty)
-                                return -ENOMEM;
-                        DNS_ANSWER_REPLACE(t->answer, empty);
+                        t->answer = dns_answer_unref(t->answer);
 
                         dns_transaction_complete(t, DNS_TRANSACTION_DNSSEC_FAILED);
                         return 0;
-                }
 
                 default:
                         log_debug("Auxiliary DNSSEC RR query failed with %s", dns_transaction_state_to_string(dt->state));
@@ -1270,7 +1259,7 @@ void dns_transaction_process_reply(DnsTransaction *t, DnsPacket *p, bool encrypt
                                 }
 
                                 /* These codes probably indicate a transient error. Let's try again. */
-                                if (IN_SET(t->answer_ede_rcode, DNS_EDE_RCODE_NOT_READY, DNS_EDE_RCODE_NET_ERROR)) {
+                                if (t->answer_ede_rcode == DNS_EDE_RCODE_NOT_READY) {
                                         log_debug("Server returned error: %s (%s%s%s), retrying transaction.",
                                                   FORMAT_DNS_RCODE(DNS_PACKET_RCODE(p)),
                                                   FORMAT_DNS_EDE_RCODE(t->answer_ede_rcode),
@@ -1640,13 +1629,10 @@ static usec_t transaction_get_resend_timeout(DnsTransaction *t) {
 
         case DNS_PROTOCOL_DNS:
 
-                /* When we do TCP, grant a much longer timeout, as in this case there's no need for us to quickly
-                 * resend, as the kernel does that anyway for us, and we really don't want to interrupt it in that
-                 * needlessly. */
                 if (t->stream)
                         return TRANSACTION_TCP_TIMEOUT_USEC;
 
-                return DNS_TIMEOUT_USEC;
+                return TRANSACTION_UDP_TIMEOUT_USEC;
 
         case DNS_PROTOCOL_MDNS:
                 if (t->probing)
@@ -2347,9 +2333,9 @@ static int dns_transaction_request_dnssec_rr_full(DnsTransaction *t, DnsResource
                 r = dns_transaction_go(aux);
                 if (r < 0)
                         return r;
-                if (ret)
-                        *ret = aux;
         }
+        if (ret)
+                *ret = aux;
 
         return 1;
 }
@@ -2624,6 +2610,10 @@ int dns_transaction_request_dnssec_keys(DnsTransaction *t) {
                                         return r;
                                 if (r == 0)
                                         continue;
+
+                                /* If we were looking for the DS RR, don't request it again. */
+                                if (dns_transaction_key(t)->type == DNS_TYPE_DS)
+                                        continue;
                         }
 
                         r = dnssec_has_rrsig(t->answer, rr->key);
@@ -2696,6 +2686,21 @@ int dns_transaction_request_dnssec_keys(DnsTransaction *t) {
                         r = dns_transaction_request_dnssec_rr(t, ds);
                         if (r < 0)
                                 return r;
+
+                        if (t->scope->dnssec_mode == DNSSEC_ALLOW_DOWNGRADE && dns_name_is_root(name)) {
+                                _cleanup_(dns_resource_key_unrefp) DnsResourceKey *soa = NULL;
+                                /* We made it all the way to the root zone. If we are in allow-downgrade
+                                 * mode, we need to make at least one request that we can be certain should
+                                 * have been signed, to test for servers that are not dnssec aware. */
+                                soa = dns_resource_key_new(rr->key->class, DNS_TYPE_SOA, name);
+                                if (!soa)
+                                        return -ENOMEM;
+
+                                log_debug("Requesting root zone SOA to probe dnssec support.");
+                                r = dns_transaction_request_dnssec_rr(t, soa);
+                                if (r < 0)
+                                        return r;
+                        }
 
                         break;
                 }
@@ -2923,7 +2928,12 @@ static int dns_transaction_requires_rrsig(DnsTransaction *t, DnsResourceRecord *
                         if (r == 0)
                                 continue;
 
-                        return FLAGS_SET(dt->answer_query_flags, SD_RESOLVED_AUTHENTICATED);
+                        if (!FLAGS_SET(dt->answer_query_flags, SD_RESOLVED_AUTHENTICATED))
+                                return false;
+
+                        /* We expect this to be signed when the DS record exists, and don't expect it to be
+                         * signed when the DS record is proven not to exist. */
+                        return dns_answer_match_key(dt->answer, dns_transaction_key(dt), NULL);
                 }
 
                 return true;
@@ -3054,16 +3064,6 @@ static int dns_transaction_requires_nsec(DnsTransaction *t) {
         }
 
         name = dns_resource_key_name(dns_transaction_key(t));
-
-        if (IN_SET(dns_transaction_key(t)->type, DNS_TYPE_DS, DNS_TYPE_CNAME, DNS_TYPE_DNAME)) {
-                /* We got a negative reply for this DS/CNAME/DNAME lookup? Check the parent in this case to
-                 * see if this answer should have been signed. */
-                r = dns_name_parent(&name);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        return true;
-        }
 
         /* For all other RRs we check the DS on the same level to see
          * if it's signed. */

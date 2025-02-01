@@ -32,6 +32,10 @@
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wshadow\"")
 
+#define DISABLE_WARNING_STRINGOP_OVERREAD                               \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wstringop-overread\"")
+
 #define DISABLE_WARNING_INCOMPATIBLE_POINTER_TYPES                      \
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wincompatible-pointer-types\"")
@@ -43,6 +47,28 @@
 #define DISABLE_WARNING_ADDRESS                                         \
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Waddress\"")
+
+#define DISABLE_WARNING_STRINGOP_TRUNCATION                             \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wstringop-truncation\"")
+
+#if HAVE_WARNING_ZERO_LENGTH_BOUNDS
+#  define DISABLE_WARNING_ZERO_LENGTH_BOUNDS                            \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wzero-length-bounds\"")
+#else
+#  define DISABLE_WARNING_ZERO_LENGTH_BOUNDS                            \
+        _Pragma("GCC diagnostic push")
+#endif
+
+#if HAVE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT
+#  define DISABLE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT                 \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wzero-as-null-pointer-constant\"")
+#else
+#  define DISABLE_WARNING_ZERO_AS_NULL_POINTER_CONSTANT                 \
+        _Pragma("GCC diagnostic push")
+#endif
 
 #define REENABLE_WARNING                                                \
         _Pragma("GCC diagnostic pop")
@@ -80,10 +106,10 @@
 #  define _alloc_(...) __attribute__((__alloc_size__(__VA_ARGS__)))
 #endif
 
-#if __GNUC__ >= 7 || (defined(__clang__) && __clang_major__ >= 10)
-#  define _fallthrough_ __attribute__((__fallthrough__))
-#else
+#if defined(__clang__) && __clang_major__ < 10
 #  define _fallthrough_
+#else
+#  define _fallthrough_ __attribute__((__fallthrough__))
 #endif
 
 #define XSTRINGIFY(x) #x
@@ -517,6 +543,10 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
                 }                                                       \
         }
 
+/* Restriction/bug (see below) was fixed in GCC 15 and clang 19. */
+#if __GNUC__ >= 15 || (defined(__clang__) && __clang_major__ >= 19)
+#define DECLARE_FLEX_ARRAY(type, name) type name[]
+#else
 /* Declare a flexible array usable in a union.
  * This is essentially a work-around for a pointless constraint in C99
  * and might go away in some future version of the standard.
@@ -528,12 +558,12 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
                 dummy_t __empty__ ## name;             \
                 type name[];                           \
         }
+#endif
 
 /* Declares an ELF read-only string section that does not occupy memory at runtime. */
 #define DECLARE_NOALLOC_SECTION(name, text)   \
         asm(".pushsection " name ",\"S\"\n\t" \
             ".ascii " STRINGIFY(text) "\n\t"  \
-            ".zero 1\n\t"                     \
             ".popsection\n")
 
 #ifdef SBAT_DISTRO
@@ -541,3 +571,22 @@ static inline uint64_t ALIGN_OFFSET_U64(uint64_t l, uint64_t ali) {
 #else
         #define DECLARE_SBAT(text)
 #endif
+
+#define sizeof_field(struct_type, member) sizeof(((struct_type *) 0)->member)
+#define endoffsetof_field(struct_type, member) (offsetof(struct_type, member) + sizeof_field(struct_type, member))
+#define voffsetof(v, member) offsetof(typeof(v), member)
+
+#define _FOREACH_ARRAY(i, array, num, m, end)                           \
+        for (typeof(array[0]) *i = (array), *end = ({                   \
+                                typeof(num) m = (num);                  \
+                                (i && m > 0) ? i + m : NULL;            \
+                        }); end && i < end; i++)
+
+#define FOREACH_ARRAY(i, array, num)                                    \
+        _FOREACH_ARRAY(i, array, num, UNIQ_T(m, UNIQ), UNIQ_T(end, UNIQ))
+
+#define FOREACH_ELEMENT(i, array)                                 \
+        FOREACH_ARRAY(i, array, ELEMENTSOF(array))
+
+#define PTR_TO_SIZE(p) ((size_t) ((uintptr_t) (p)))
+#define SIZE_TO_PTR(u) ((void *) ((uintptr_t) (u)))

@@ -14,12 +14,14 @@
 #include "sd-bus.h"
 
 #include "alloc-util.h"
+#include "ask-password-agent.h"
 #include "build.h"
 #include "build-path.h"
 #include "bus-common-errors.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
+#include "bus-message-util.h"
 #include "bus-print-properties.h"
 #include "bus-unit-procs.h"
 #include "bus-unit-util.h"
@@ -31,9 +33,11 @@
 #include "edit-util.h"
 #include "env-util.h"
 #include "fd-util.h"
+#include "format-ifname.h"
 #include "format-table.h"
 #include "hostname-util.h"
 #include "import-util.h"
+#include "in-addr-util.h"
 #include "locale-util.h"
 #include "log.h"
 #include "logs-show.h"
@@ -46,15 +50,13 @@
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
 #include "process-util.h"
 #include "ptyfwd.h"
 #include "rlimit-util.h"
-#include "sigbus.h"
 #include "signal-util.h"
 #include "sort-util.h"
-#include "spawn-ask-password-agent.h"
-#include "spawn-polkit-agent.h"
 #include "stdio-util.h"
 #include "string-table.h"
 #include "strv.h"
@@ -261,7 +263,7 @@ static int show_table(Table *table, const char *word) {
                 table_set_header(table, arg_legend);
 
                 if (OUTPUT_MODE_IS_JSON(arg_output))
-                        r = table_print_json(table, NULL, output_mode_to_json_format_flags(arg_output) | JSON_FORMAT_COLOR_AUTO);
+                        r = table_print_json(table, NULL, output_mode_to_json_format_flags(arg_output) | SD_JSON_FORMAT_COLOR_AUTO);
                 else
                         r = table_print(table, NULL);
                 if (r < 0)
@@ -605,16 +607,15 @@ static void print_machine_status_info(sd_bus *bus, MachineStatusInfo *i) {
                         show_journal_by_unit(
                                         stdout,
                                         i->unit,
-                                        NULL,
+                                        /* namespace = */ NULL,
                                         arg_output,
-                                        0,
+                                        /* n_columns = */ 0,
                                         i->timestamp.monotonic,
                                         arg_lines,
-                                        0,
                                         get_output_flags() | OUTPUT_BEGIN_NEWLINE,
                                         SD_JOURNAL_LOCAL_ONLY,
-                                        true,
-                                        NULL);
+                                        /* system_unit = */ true,
+                                        /* ellipsized = */ NULL);
         }
 }
 
@@ -1044,7 +1045,7 @@ static int kill_machine(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (!arg_kill_whom)
                 arg_kill_whom = "all";
@@ -1089,7 +1090,7 @@ static int terminate_machine(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (int i = 1; i < argc; i++) {
                 r = bus_call_method(bus, bus_machine_mgr, "TerminateMachine", &error, NULL, "s", argv[i]);
@@ -1116,7 +1117,7 @@ static int copy_files(int argc, char *argv[], void *userdata) {
         bool copy_from;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         copy_from = streq(argv[0], "copy-from");
         dest = argv[3] ?: argv[2];
@@ -1167,7 +1168,7 @@ static int bind_mount(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_call_method(
                         bus,
@@ -1188,39 +1189,31 @@ static int bind_mount(int argc, char *argv[], void *userdata) {
 }
 
 static int on_machine_removed(sd_bus_message *m, void *userdata, sd_bus_error *ret_error) {
-        PTYForward ** forward = (PTYForward**) userdata;
+        PTYForward *forward = ASSERT_PTR(userdata);
         int r;
 
         assert(m);
-        assert(forward);
 
-        if (*forward) {
-                /* If the forwarder is already initialized, tell it to
-                 * exit on the next vhangup(), so that we still flush
-                 * out what might be queued and exit then. */
+        /* Tell the forwarder to exit on the next vhangup(), so that we still flush out what might be queued
+         * and exit then. */
 
-                r = pty_forward_set_ignore_vhangup(*forward, false);
-                if (r >= 0)
-                        return 0;
-
+        r = pty_forward_set_ignore_vhangup(forward, false);
+        if (r < 0) {
+                /* On error, quit immediately. */
                 log_error_errno(r, "Failed to set ignore_vhangup flag: %m");
+                (void) sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), EXIT_FAILURE);
         }
 
-        /* On error, or when the forwarder is not initialized yet, quit immediately */
-        sd_event_exit(sd_bus_get_event(sd_bus_message_get_bus(m)), EXIT_FAILURE);
         return 0;
 }
 
-static int process_forward(sd_event *event, PTYForward **forward, int master, PTYForwardFlags flags, const char *name) {
-        char last_char = 0;
-        bool machine_died;
+static int process_forward(sd_event *event, sd_bus_slot *machine_removed_slot, int master, PTYForwardFlags flags, const char *name) {
         int r;
 
         assert(event);
+        assert(machine_removed_slot);
         assert(master >= 0);
         assert(name);
-
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGWINCH, SIGTERM, SIGINT) >= 0);
 
         if (!arg_quiet) {
                 if (streq(name, ".host"))
@@ -1229,27 +1222,25 @@ static int process_forward(sd_event *event, PTYForward **forward, int master, PT
                         log_info("Connected to machine %s. Press ^] three times within 1s to exit session.", name);
         }
 
-        (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
-        (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
+        r = sd_event_set_signal_exit(event, true);
+        if (r < 0)
+                return log_error_errno(r, "Failed to enable SIGINT/SITERM handling: %m");
 
-        r = pty_forward_new(event, master, flags, forward);
+        _cleanup_(pty_forward_freep) PTYForward *forward = NULL;
+        r = pty_forward_new(event, master, flags, &forward);
         if (r < 0)
                 return log_error_errno(r, "Failed to create PTY forwarder: %m");
+
+        /* No userdata should not set previously. */
+        assert_se(!sd_bus_slot_set_userdata(machine_removed_slot, forward));
 
         r = sd_event_loop(event);
         if (r < 0)
                 return log_error_errno(r, "Failed to run event loop: %m");
 
-        pty_forward_get_last_char(*forward, &last_char);
-
-        machine_died =
+        bool machine_died =
                 (flags & PTY_FORWARD_IGNORE_VHANGUP) &&
-                pty_forward_get_ignore_vhangup(*forward) == 0;
-
-        *forward = pty_forward_free(*forward);
-
-        if (last_char != '\n')
-                fputc('\n', stdout);
+                pty_forward_get_ignore_vhangup(forward) == 0;
 
         if (!arg_quiet) {
                 if (machine_died)
@@ -1301,7 +1292,6 @@ static int parse_machine_uid(const char *spec, const char **machine, char **uid)
 static int login_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(pty_forward_freep) PTYForward *forward = NULL;
         _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *slot = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         int master = -1, r;
@@ -1316,7 +1306,7 @@ static int login_machine(int argc, char *argv[], void *userdata) {
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP),
                                        "Login only supported on local machines.");
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_event_default(&event);
         if (r < 0)
@@ -1335,7 +1325,7 @@ static int login_machine(int argc, char *argv[], void *userdata) {
                          "member='MachineRemoved',"
                          "arg0='", machine, "'");
 
-        r = sd_bus_add_match_async(bus, &slot, match, on_machine_removed, NULL, &forward);
+        r = sd_bus_add_match_async(bus, &slot, match, on_machine_removed, NULL, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request machine removal match: %m");
 
@@ -1347,13 +1337,12 @@ static int login_machine(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        return process_forward(event, &forward, master, PTY_FORWARD_IGNORE_VHANGUP, machine);
+        return process_forward(event, slot, master, PTY_FORWARD_IGNORE_VHANGUP, machine);
 }
 
 static int shell_machine(int argc, char *argv[], void *userdata) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL, *m = NULL;
         _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
-        _cleanup_(pty_forward_freep) PTYForward *forward = NULL;
         _cleanup_(sd_bus_slot_unrefp) sd_bus_slot *slot = NULL;
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
         int master = -1, r;
@@ -1376,7 +1365,7 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
                 }
         }
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = sd_event_default(&event);
         if (r < 0)
@@ -1397,7 +1386,7 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
                          "member='MachineRemoved',"
                          "arg0='", machine, "'");
 
-        r = sd_bus_add_match_async(bus, &slot, match, on_machine_removed, NULL, &forward);
+        r = sd_bus_add_match_async(bus, &slot, match, on_machine_removed, NULL, NULL);
         if (r < 0)
                 return log_error_errno(r, "Failed to request machine removal match: %m");
 
@@ -1427,7 +1416,7 @@ static int shell_machine(int argc, char *argv[], void *userdata) {
         if (r < 0)
                 return bus_log_parse_error(r);
 
-        return process_forward(event, &forward, master, 0, machine);
+        return process_forward(event, slot, master, /* flags = */ 0, machine);
 }
 
 static int normalize_nspawn_filename(const char *name, char **ret_file) {
@@ -1595,7 +1584,7 @@ static int remove_image(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         for (int i = 1; i < argc; i++) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
@@ -1623,7 +1612,7 @@ static int rename_image(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_call_method(
                         bus,
@@ -1644,7 +1633,7 @@ static int clone_image(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "CloneImage");
         if (r < 0)
@@ -1675,7 +1664,7 @@ static int read_only_image(int argc, char *argv[], void *userdata) {
                                                argv[2]);
         }
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_call_method(bus, bus_machine_mgr, "MarkImageReadOnly", &error, NULL, "sb", argv[1], b);
         if (r < 0)
@@ -1726,7 +1715,7 @@ static int start_machine(int argc, char *argv[], void *userdata) {
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
         ask_password_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_wait_for_jobs_new(bus, &w);
@@ -1784,7 +1773,7 @@ static int enable_machine(int argc, char *argv[], void *userdata) {
         int r;
         bool enable;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         enable = streq(argv[0], "enable");
         method = enable ? "EnableUnitFiles" : "DisableUnitFiles";
@@ -1878,7 +1867,7 @@ static int set_limit(int argc, char *argv[], void *userdata) {
         uint64_t limit;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (STR_IN_SET(argv[argc-1], "-", "none", "infinity"))
                 limit = UINT64_MAX;
@@ -1911,7 +1900,7 @@ static int clean_images(int argc, char *argv[], void *userdata) {
         unsigned c = 0;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         r = bus_message_new_method_call(bus, &m, bus_machine_mgr, "CleanPool");
         if (r < 0)
@@ -1959,7 +1948,8 @@ static int clean_images(int argc, char *argv[], void *userdata) {
 static int chainload_importctl(int argc, char *argv[]) {
         int r;
 
-        log_notice("The 'machinectl %1$s' command has been replaced by 'importctl -m %1$s'. Redirecting invocation.", argv[optind]);
+        if (!arg_quiet)
+                log_notice("The 'machinectl %1$s' command has been replaced by 'importctl -m %1$s'. Redirecting invocation.", argv[optind]);
 
         _cleanup_strv_free_ char **c =
                 strv_new("importctl", "--class=machine");
@@ -2430,13 +2420,11 @@ static int run(int argc, char *argv[]) {
         setlocale(LC_ALL, "");
         log_setup();
 
-        /* The journal merging logic potentially needs a lot of fds. */
-        (void) rlimit_nofile_bump(HIGH_RLIMIT_NOFILE);
-        sigbus_install();
-
         r = parse_argv(argc, argv);
         if (r <= 0)
                 return r;
+
+        journal_browse_prepare();
 
         if (STRPTR_IN_SET(argv[optind],
                           "import-tar", "import-raw", "import-fs",
@@ -2447,7 +2435,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         (void) sd_bus_set_allow_interactive_authorization(bus, arg_ask_password);
 

@@ -149,6 +149,7 @@ gettimeofday	96
 getuid	102
 getuid32
 getxattr	191
+getxattrat	464
 getxgid
 getxpid
 getxuid
@@ -190,7 +191,9 @@ linkat	265
 listen	50
 listmount	458
 listxattr	194
+listxattrat	465
 llistxattr	195
+llseek
 lookup_dcookie	212
 lremovexattr	198
 lseek	8
@@ -233,6 +236,7 @@ mq_timedsend	242
 mq_timedsend_time64
 mq_unlink	241
 mremap	25
+mseal	462
 msgctl	71
 msgget	68
 msgrcv	70
@@ -339,6 +343,7 @@ recvmmsg_time64
 recvmsg	47
 remap_file_pages	216
 removexattr	197
+removexattrat	466
 rename	82
 renameat	264
 renameat2	316
@@ -427,6 +432,7 @@ settimeofday	164
 setuid	105
 setuid32
 setxattr	188
+setxattrat	463
 sgetmask
 shmat	30
 shmctl	31
@@ -501,6 +507,7 @@ uname	63
 unlink	87
 unlinkat	263
 unshare	272
+uretprobe	335
 userfaultfd	323
 ustat	136
 utime	132

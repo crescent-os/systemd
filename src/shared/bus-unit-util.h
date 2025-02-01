@@ -7,6 +7,16 @@
 #include "pidref.h"
 #include "unit-def.h"
 
+typedef enum ExecDirectoryFlags {
+        EXEC_DIRECTORY_READ_ONLY      = 1 << 0, /* Public API via DBUS, do not change */
+        EXEC_DIRECTORY_ONLY_CREATE    = 1 << 1, /* Only the private directory will be created, not the symlink to it */
+        _EXEC_DIRECTORY_FLAGS_MAX,
+        _EXEC_DIRECTORY_FLAGS_PUBLIC  = EXEC_DIRECTORY_READ_ONLY,
+        _EXEC_DIRECTORY_FLAGS_INVALID = -EINVAL,
+} ExecDirectoryFlags;
+
+ExecDirectoryFlags exec_directory_flags_from_string(const char *s) _pure_;
+
 typedef struct UnitInfo {
         const char *machine;
         const char *id;
@@ -36,17 +46,12 @@ int unit_info_compare(const UnitInfo *a, const UnitInfo *b);
 
 int bus_service_manager_reload(sd_bus *bus);
 
-typedef struct UnitFreezer {
-        char *name;
-        sd_bus *bus;
-} UnitFreezer;
+typedef struct UnitFreezer UnitFreezer;
 
-int unit_freezer_new(const char *name, UnitFreezer *ret);
-void unit_freezer_done(UnitFreezer *f);
+UnitFreezer* unit_freezer_free(UnitFreezer *f);
+DEFINE_TRIVIAL_CLEANUP_FUNC(UnitFreezer*, unit_freezer_free);
+
+int unit_freezer_new(const char *name, UnitFreezer **ret);
 
 int unit_freezer_freeze(UnitFreezer *f);
 int unit_freezer_thaw(UnitFreezer *f);
-
-int unit_freezer_new_freeze(const char *name, UnitFreezer *ret);
-
-void unit_freezer_done_thaw(UnitFreezer *f);

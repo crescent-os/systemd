@@ -6,13 +6,13 @@
 #include "sd-event.h"
 #include "sd-netlink.h"
 #include "sd-network.h"
+#include "sd-varlink.h"
 
 #include "common-signal.h"
 #include "hashmap.h"
 #include "list.h"
 #include "ordered-set.h"
 #include "resolve-util.h"
-#include "varlink.h"
 
 typedef struct Manager Manager;
 
@@ -123,10 +123,6 @@ struct Manager {
         int hostname_fd;
         sd_event_source *hostname_event_source;
 
-        sd_event_source *sigusr1_event_source;
-        sd_event_source *sigusr2_event_source;
-        sd_event_source *sigrtmin1_event_source;
-
         unsigned n_transactions_total;
         unsigned n_timeouts_total;
         unsigned n_timeouts_served_stale_total;
@@ -153,10 +149,16 @@ struct Manager {
 
         Hashmap *polkit_registry;
 
-        VarlinkServer *varlink_server;
-        VarlinkServer *varlink_monitor_server;
+        sd_varlink_server *varlink_server;
+        sd_varlink_server *varlink_monitor_server;
 
-        Set *varlink_subscription;
+        Set *varlink_query_results_subscription;
+        Set *varlink_dns_configuration_subscription;
+
+        sd_json_variant *dns_configuration_json;
+
+        sd_netlink_slot *netlink_new_route_slot;
+        sd_netlink_slot *netlink_del_route_slot;
 
         sd_event_source *clock_change_event_source;
 
@@ -226,6 +228,12 @@ bool manager_server_is_stub(Manager *m, DnsServer *s);
 
 int socket_disable_pmtud(int fd, int af);
 
-int dns_manager_dump_statistics_json(Manager *m, JsonVariant **ret);
+int dns_manager_dump_statistics_json(Manager *m, sd_json_variant **ret);
 
 void dns_manager_reset_statistics(Manager *m);
+
+int manager_dump_dns_configuration_json(Manager *m, sd_json_variant **ret);
+int manager_send_dns_configuration_changed(Manager *m, Link *l, bool reset);
+
+int manager_start_dns_configuration_monitor(Manager *m);
+void manager_stop_dns_configuration_monitor(Manager *m);

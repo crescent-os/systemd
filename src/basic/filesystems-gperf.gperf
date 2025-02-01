@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 %{
+#if __GNUC__ >= 15
+_Pragma("GCC diagnostic ignored \"-Wzero-as-null-pointer-constant\"")
+#endif
 #include <linux/magic.h>
 
 #include "filesystems.h"
@@ -28,6 +31,7 @@ afs,             {AFS_FS_MAGIC, AFS_SUPER_MAGIC}
 anon_inodefs,    {ANON_INODE_FS_MAGIC}
 autofs,          {AUTOFS_SUPER_MAGIC}
 balloon-kvm,     {BALLOON_KVM_MAGIC}
+bcachefs,        {BCACHEFS_SUPER_MAGIC}
 bdev,            {BDEVFS_MAGIC}
 binder,          {BINDERFS_SUPER_MAGIC}
 binfmt_misc,     {BINFMTFS_MAGIC}

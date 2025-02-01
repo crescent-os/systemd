@@ -28,9 +28,11 @@
     <para><simplelist>
       <member><filename>/etc/systemd/resolved.conf</filename></member>
       <member><filename>/run/systemd/resolved.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/resolved.conf</filename></member>
       <member><filename>/usr/lib/systemd/resolved.conf</filename></member>
       <member><filename>/etc/systemd/resolved.conf.d/*.conf</filename></member>
       <member><filename>/run/systemd/resolved.conf.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/resolved.conf.d/*.conf</filename></member>
       <member><filename>/usr/lib/systemd/resolved.conf.d/*.conf</filename></member>
     </simplelist></para>
   </refsynopsisdiv>
@@ -199,7 +201,7 @@
         returned data could not be verified (either because the data
         was found unsigned in the DNS, or the DNS server did not
         support DNSSEC or no appropriate trust anchors were known). In
-        the latter case it is assumed that client programs employ a
+        the latter case, it is assumed that client programs employ a
         secondary scheme to validate the returned DNS data, should
         this be required.</para>
 
@@ -292,7 +294,7 @@
       <varlistentry>
         <term><varname>CacheFromLocalhost=</varname></term>
         <listitem><para>Takes a boolean as argument. If <literal>no</literal> (the default), and response cames from
-        host-local IP address (such as 127.0.0.1 or ::1), the result wouldn't be cached in order to avoid
+        host-local IP address (such as 127.0.0.1 or ::1), the result would not be cached in order to avoid
         potential duplicate local caching.</para>
 
         <xi:include href="version-info.xml" xpointer="v248"/>
@@ -371,7 +373,7 @@ DNSStubListenerExtra=udp:[2001:db8:0:f102::13]:9953</programlisting>
         <xi:include href="version-info.xml" xpointer="v246"/></listitem>
       </varlistentry>
       <varlistentry>
-        <term>StaleRetentionSec=<replaceable>SECONDS</replaceable></term>
+        <term><varname>StaleRetentionSec=</varname><replaceable>SECONDS</replaceable></term>
         <listitem><para>Takes a duration value, which determines the length of time DNS resource records can
         be retained in the cache beyond their Time To Live (TTL). This allows these records to be returned as
         stale records. By default, this value is set to zero, meaning that DNS resource records are not
@@ -380,7 +382,7 @@ DNSStubListenerExtra=udp:[2001:db8:0:f102::13]:9953</programlisting>
         <para>This is useful when a DNS server failure occurs or becomes unreachable. In such cases,
         <citerefentry><refentrytitle>systemd-resolved</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         continues to use the stale records to answer DNS queries, particularly when no valid response can be
-        obtained from the upstream DNS servers. However, this doesn't apply to NXDOMAIN responses, as those
+        obtained from the upstream DNS servers. However, this does not apply to NXDOMAIN responses, as those
         are still perfectly valid responses. This feature enhances resilience against DNS infrastructure
         failures and outages.</para>
 

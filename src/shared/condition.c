@@ -19,8 +19,10 @@
 #include "architecture.h"
 #include "audit-util.h"
 #include "battery-util.h"
+#include "bitfield.h"
 #include "blockdev-util.h"
 #include "cap-list.h"
+#include "capability-util.h"
 #include "cgroup-util.h"
 #include "compare-operator.h"
 #include "condition.h"
@@ -169,10 +171,11 @@ static int condition_test_credential(Condition *c, char **env) {
                 if (!j)
                         return -ENOMEM;
 
-                if (laccess(j, F_OK) >= 0)
+                r = access_nofollow(j, F_OK);
+                if (r >= 0)
                         return true; /* yay! */
-                if (errno != ENOENT)
-                        return -errno;
+                if (r != -ENOENT)
+                        return r;
 
                 /* not found in this dir */
         }
@@ -260,13 +263,13 @@ static int condition_test_osrelease(Condition *c, char **env) {
                 /* The os-release spec mandates env-var-like key names */
                 if (r == 0 || isempty(word) || !env_name_is_valid(key))
                         return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                        "Failed to parse parameter, key/value format expected: %m");
+                                        "Failed to parse parameter, key/value format expected.");
 
                 /* Do not allow whitespace after the separator, as that's not a valid os-release format */
                 operator = parse_compare_operator(&word, COMPARE_ALLOW_FNMATCH|COMPARE_EQUAL_BY_STRING);
                 if (operator < 0 || isempty(word) || strchr(WHITESPACE, *word) != NULL)
                         return log_debug_errno(SYNTHETIC_ERRNO(EINVAL),
-                                        "Failed to parse parameter, key/value format expected: %m");
+                                        "Failed to parse parameter, key/value format expected.");
 
                 r = parse_os_release(NULL, key, &actual_value);
                 if (r < 0)
@@ -543,7 +546,7 @@ static int condition_test_firmware_smbios_field(const char *expression) {
 
         /* Read actual value from sysfs */
         if (!filename_is_valid(field))
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid SMBIOS field name");
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid SMBIOS field name.");
 
         const char *p = strjoina("/sys/class/dmi/id/", field);
         r = read_virtual_file(p, SIZE_MAX, &actual_value, NULL);
@@ -599,7 +602,7 @@ static int condition_test_firmware(Condition *c, char **env) {
 
                 end = strrchr(arg, ')');
                 if (!end || *(end + 1) != '\0')
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Malformed ConditionFirmware=%s: %m", c->parameter);
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Malformed ConditionFirmware=%s.", c->parameter);
 
                 smbios_arg = strndup(arg, end - arg);
                 if (!smbios_arg)
@@ -667,7 +670,7 @@ static int has_tpm2(void) {
          *
          * Note that we don't check if we ourselves are built with TPM2 support here! */
 
-        return FLAGS_SET(tpm2_support(), TPM2_SUPPORT_SUBSYSTEM|TPM2_SUPPORT_FIRMWARE);
+        return FLAGS_SET(tpm2_support_full(TPM2_SUPPORT_SUBSYSTEM|TPM2_SUPPORT_FIRMWARE), TPM2_SUPPORT_SUBSYSTEM|TPM2_SUPPORT_FIRMWARE);
 }
 
 static int condition_test_security(Condition *c, char **env) {
@@ -700,45 +703,23 @@ static int condition_test_security(Condition *c, char **env) {
 }
 
 static int condition_test_capability(Condition *c, char **env) {
-        unsigned long long capabilities = (unsigned long long) -1;
-        _cleanup_fclose_ FILE *f = NULL;
-        int value, r;
+        int r;
 
         assert(c);
         assert(c->parameter);
         assert(c->type == CONDITION_CAPABILITY);
 
         /* If it's an invalid capability, we don't have it */
-        value = capability_from_name(c->parameter);
+        int value = capability_from_name(c->parameter);
         if (value < 0)
                 return -EINVAL;
 
-        /* If it's a valid capability we default to assume
-         * that we have it */
+        CapabilityQuintet q;
+        r = pidref_get_capability(&PIDREF_MAKE_FROM_PID(getpid_cached()), &q);
+        if (r < 0)
+                return r;
 
-        f = fopen("/proc/self/status", "re");
-        if (!f)
-                return -errno;
-
-        for (;;) {
-                _cleanup_free_ char *line = NULL;
-
-                r = read_line(f, LONG_LINE_MAX, &line);
-                if (r < 0)
-                        return r;
-                if (r == 0)
-                        break;
-
-                const char *p = startswith(line, "CapBnd:");
-                if (p) {
-                        if (sscanf(p, "%llx", &capabilities) != 1)
-                                return -EIO;
-
-                        break;
-                }
-        }
-
-        return !!(capabilities & (1ULL << value));
+        return BIT_SET(q.bounding, value);
 }
 
 static int condition_test_needs_update(Condition *c, char **env) {
@@ -1008,6 +989,7 @@ static int condition_test_psi(Condition *c, char **env) {
         const char *p, *value, *pressure_type;
         loadavg_t *current, limit;
         ResourcePressure pressure;
+        PressureType preferred_pressure_type = PRESSURE_TYPE_FULL;
         int r;
 
         assert(c);
@@ -1029,6 +1011,10 @@ static int condition_test_psi(Condition *c, char **env) {
                 return log_debug_errno(r < 0 ? r : SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s: %m", c->parameter);
         /* If only one parameter is passed, then we look at the global system pressure rather than a specific cgroup. */
         if (r == 1) {
+                /* cpu.pressure 'full' is reported but undefined at system level */
+                if (c->type == CONDITION_CPU_PRESSURE)
+                        preferred_pressure_type = PRESSURE_TYPE_SOME;
+
                 pressure_path = path_join("/proc/pressure", pressure_type);
                 if (!pressure_path)
                         return log_oom_debug();
@@ -1046,7 +1032,7 @@ static int condition_test_psi(Condition *c, char **env) {
 
                 slice = strstrip(first);
                 if (!slice)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s: %m", c->parameter);
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s.", c->parameter);
 
                 r = cg_all_unified();
                 if (r < 0)
@@ -1109,7 +1095,7 @@ static int condition_test_psi(Condition *c, char **env) {
 
                 timespan = skip_leading_chars(fourth, NULL);
                 if (!timespan)
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s: %m", c->parameter);
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s.", c->parameter);
 
                 if (startswith(timespan, "10sec"))
                         current = &pressure.avg10;
@@ -1118,12 +1104,12 @@ static int condition_test_psi(Condition *c, char **env) {
                 else if (startswith(timespan, "5min"))
                         current = &pressure.avg300;
                 else
-                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s: %m", c->parameter);
+                        return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s.", c->parameter);
         }
 
         value = strstrip(third);
         if (!value)
-                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s: %m", c->parameter);
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Failed to parse condition parameter %s.", c->parameter);
 
         r = parse_permyriad(value);
         if (r < 0)
@@ -1133,8 +1119,9 @@ static int condition_test_psi(Condition *c, char **env) {
         if (r < 0)
                 return log_debug_errno(r, "Failed to parse loadavg: %s", c->parameter);
 
-        r = read_resource_pressure(pressure_path, PRESSURE_TYPE_FULL, &pressure);
-        if (r == -ENODATA) /* cpu.pressure 'full' was added recently, fall back to 'some'. */
+        r = read_resource_pressure(pressure_path, preferred_pressure_type, &pressure);
+        /* cpu.pressure 'full' was recently added at cgroup level, fall back to 'some' */
+        if (r == -ENODATA && preferred_pressure_type == PRESSURE_TYPE_FULL)
                 r = read_resource_pressure(pressure_path, PRESSURE_TYPE_SOME, &pressure);
         if (r == -ENOENT) {
                 /* We already checked that /proc/pressure exists, so this means we were given a cgroup
@@ -1146,6 +1133,59 @@ static int condition_test_psi(Condition *c, char **env) {
                 return log_debug_errno(r, "Error parsing pressure from %s: %m", pressure_path);
 
         return *current <= limit;
+}
+
+static int condition_test_kernel_module_loaded(Condition *c, char **env) {
+        int r;
+
+        assert(c);
+        assert(c->parameter);
+        assert(c->type == CONDITION_KERNEL_MODULE_LOADED);
+
+        /* Checks whether a specific kernel module is fully loaded (i.e. with the full initialization routine
+         * complete). */
+
+        _cleanup_free_ char *normalized = strreplace(c->parameter, "-", "_");
+        if (!normalized)
+                return log_oom_debug();
+
+        if (!filename_is_valid(normalized)) {
+                log_debug("Kernel module name '%s' is not valid, hence reporting it to not be loaded.", normalized);
+                return false;
+        }
+
+        _cleanup_free_ char *p = path_join("/sys/module/", normalized);
+        if (!p)
+                return log_oom_debug();
+
+        _cleanup_close_ int dir_fd = open(p, O_PATH|O_DIRECTORY|O_CLOEXEC);
+        if (dir_fd < 0) {
+                if (errno == ENOENT) {
+                        log_debug_errno(errno, "'%s/' does not exist, kernel module '%s' not loaded.", p, normalized);
+                        return false;
+                }
+
+                return log_debug_errno(errno, "Failed to open directory '%s/': %m", p);
+        }
+
+        _cleanup_free_ char *initstate = NULL;
+        r = read_virtual_file_at(dir_fd, "initstate", SIZE_MAX, &initstate, NULL);
+        if (r == -ENOENT) {
+                log_debug_errno(r, "'%s/' exists but '%s/initstate' does not, kernel module '%s' is built-in, hence loaded.", p, p, normalized);
+                return true;
+        }
+        if (r < 0)
+                return log_debug_errno(r, "Failed to open '%s/initstate': %m", p);
+
+        delete_trailing_chars(initstate, WHITESPACE);
+
+        if (!streq(initstate, "live")) {
+                log_debug("Kernel module '%s' is reported as '%s', hence not loaded.", normalized, initstate);
+                return false;
+        }
+
+        log_debug("Kernel module '%s' detected as loaded.", normalized);
+        return true;
 }
 
 int condition_test(Condition *c, char **env) {
@@ -1184,6 +1224,7 @@ int condition_test(Condition *c, char **env) {
                 [CONDITION_MEMORY_PRESSURE]          = condition_test_psi,
                 [CONDITION_CPU_PRESSURE]             = condition_test_psi,
                 [CONDITION_IO_PRESSURE]              = condition_test_psi,
+                [CONDITION_KERNEL_MODULE_LOADED]     = condition_test_kernel_module_loaded,
         };
 
         int r, b;
@@ -1308,6 +1349,7 @@ static const char* const condition_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_MEMORY_PRESSURE] = "ConditionMemoryPressure",
         [CONDITION_CPU_PRESSURE] = "ConditionCPUPressure",
         [CONDITION_IO_PRESSURE] = "ConditionIOPressure",
+        [CONDITION_KERNEL_MODULE_LOADED] = "ConditionKernelModuleLoaded",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(condition_type, ConditionType);
@@ -1346,6 +1388,7 @@ static const char* const assert_type_table[_CONDITION_TYPE_MAX] = {
         [CONDITION_MEMORY_PRESSURE] = "AssertMemoryPressure",
         [CONDITION_CPU_PRESSURE] = "AssertCPUPressure",
         [CONDITION_IO_PRESSURE] = "AssertIOPressure",
+        [CONDITION_KERNEL_MODULE_LOADED] = "AssertKernelModuleLoaded",
 };
 
 DEFINE_STRING_TABLE_LOOKUP(assert_type, ConditionType);

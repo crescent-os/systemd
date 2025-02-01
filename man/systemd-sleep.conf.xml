@@ -139,7 +139,7 @@
         <term><varname>AllowHybridSleep=</varname></term>
         <term><varname>AllowSuspendThenHibernate=</varname></term>
 
-        <listitem><para>By default any power-saving mode is advertised if possible (i.e.
+        <listitem><para>By default, any power-saving mode is advertised if possible (i.e.
         the kernel supports that mode, the necessary resources are available). Those
         switches can be used to disable specific modes.</para>
 
@@ -224,6 +224,23 @@
           other options/system battery state.</para>
 
           <xi:include href="version-info.xml" xpointer="v239"/>
+        </listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>HibernateOnACPower=</varname></term>
+
+        <listitem>
+          <para>Whether to allow hibernation when the system has AC power. Only used by
+          <citerefentry><refentrytitle>systemd-suspend-then-hibernate.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+          when <varname>HibernateDelaySec=</varname> is set.</para>
+
+          <para>If this option is disabled, the countdown of <varname>HibernateDelaySec=</varname> starts only
+          after AC power is disconnected, keeping the system in the suspend state otherwise.</para>
+
+          <para>This option is only effective on systems with a battery.</para>
+
+          <xi:include href="version-info.xml" xpointer="v257"/>
         </listitem>
       </varlistentry>
 

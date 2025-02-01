@@ -25,6 +25,7 @@
 #include "string-util.h"
 #include "tests.h"
 #include "udev-event.h"
+#include "udev-rules.h"
 #include "udev-spawn.h"
 #include "version.h"
 
@@ -76,10 +77,10 @@ static int fake_filesystems(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to detach mount namespace: %m");
 
-        for (size_t i = 0; i < ELEMENTSOF(fakefss); i++) {
-                r = mount_nofollow_verbose(fakefss[i].ignore_mount_error ? LOG_NOTICE : LOG_ERR,
-                                           fakefss[i].src, fakefss[i].target, NULL, MS_BIND, NULL);
-                if (r < 0 && !fakefss[i].ignore_mount_error)
+        FOREACH_ELEMENT(fakefs, fakefss) {
+                r = mount_nofollow_verbose(fakefs->ignore_mount_error ? LOG_NOTICE : LOG_ERR,
+                                           fakefs->src, fakefs->target, NULL, MS_BIND, NULL);
+                if (r < 0 && !fakefs->ignore_mount_error)
                         return r;
         }
 
@@ -88,7 +89,7 @@ static int fake_filesystems(void) {
 
 static int run(int argc, char *argv[]) {
         _cleanup_(udev_rules_freep) UdevRules *rules = NULL;
-        _cleanup_(udev_event_freep) UdevEvent *event = NULL;
+        _cleanup_(udev_event_unrefp) UdevEvent *event = NULL;
         _cleanup_(sd_device_unrefp) sd_device *dev = NULL;
         const char *devpath, *devname, *action;
         int r;
@@ -135,7 +136,7 @@ static int run(int argc, char *argv[]) {
                 usleep_safe(us);
         }
 
-        assert_se(udev_rules_load(&rules, RESOLVE_NAME_EARLY) == 0);
+        assert_se(udev_rules_load(&rules, RESOLVE_NAME_EARLY, /* extra = */ NULL) == 0);
 
         const char *syspath = strjoina("/sys", devpath);
         r = device_new_from_synthetic_event(&dev, syspath, action);

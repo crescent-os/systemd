@@ -152,6 +152,14 @@ void bus_close_inotify_fd(sd_bus *b) {
         b->n_inotify_watches = 0;
 }
 
+static void bus_close_fds(sd_bus *b) {
+        assert(b);
+
+        bus_close_io_fds(b);
+        bus_close_inotify_fd(b);
+        b->pidfd = safe_close(b->pidfd);
+}
+
 static void bus_reset_queues(sd_bus *b) {
         assert(b);
 
@@ -192,8 +200,7 @@ static sd_bus* bus_free(sd_bus *b) {
         if (b->default_bus_ptr)
                 *b->default_bus_ptr = NULL;
 
-        bus_close_io_fds(b);
-        bus_close_inotify_fd(b);
+        bus_close_fds(b);
 
         free(b->label);
         free(b->groups);
@@ -213,14 +220,14 @@ static sd_bus* bus_free(sd_bus *b) {
 
         bus_reset_queues(b);
 
-        ordered_hashmap_free_free(b->reply_callbacks);
+        ordered_hashmap_free(b->reply_callbacks);
         prioq_free(b->reply_callbacks_prioq);
 
         assert(b->match_callbacks.type == BUS_MATCH_ROOT);
         bus_match_free(&b->match_callbacks);
 
-        hashmap_free_free(b->vtable_methods);
-        hashmap_free_free(b->vtable_properties);
+        set_free(b->vtable_methods);
+        set_free(b->vtable_properties);
 
         assert(hashmap_isempty(b->nodes));
         hashmap_free(b->nodes);
@@ -1126,8 +1133,7 @@ static int bus_start_address(sd_bus *b) {
         assert(b);
 
         for (;;) {
-                bus_close_io_fds(b);
-                bus_close_inotify_fd(b);
+                bus_close_fds(b);
 
                 bus_kill_exec(b);
 
@@ -1802,8 +1808,7 @@ _public_ void sd_bus_close(sd_bus *bus) {
          * the bus object and the bus may be freed */
         bus_reset_queues(bus);
 
-        bus_close_io_fds(bus);
-        bus_close_inotify_fd(bus);
+        bus_close_fds(bus);
 }
 
 _public_ sd_bus *sd_bus_close_unref(sd_bus *bus) {
@@ -2327,10 +2332,6 @@ _public_ int sd_bus_call_async(
         if (!callback && !slot && !m->sealed)
                 m->header->flags |= BUS_MESSAGE_NO_REPLY_EXPECTED;
 
-        r = ordered_hashmap_ensure_allocated(&bus->reply_callbacks, &uint64_hash_ops);
-        if (r < 0)
-                return r;
-
         r = prioq_ensure_allocated(&bus->reply_callbacks_prioq, timeout_compare);
         if (r < 0)
                 return r;
@@ -2351,7 +2352,7 @@ _public_ int sd_bus_call_async(
                 s->reply_callback.callback = callback;
 
                 s->reply_callback.cookie = BUS_MESSAGE_COOKIE(m);
-                r = ordered_hashmap_put(bus->reply_callbacks, &s->reply_callback.cookie, &s->reply_callback);
+                r = ordered_hashmap_ensure_put(&bus->reply_callbacks, &uint64_hash_ops_value_free, &s->reply_callback.cookie, &s->reply_callback);
                 if (r < 0) {
                         s->reply_callback.cookie = 0;
                         return r;
@@ -3611,7 +3612,6 @@ int bus_add_match_full(
                                                                  add_match_callback,
                                                                  s,
                                                                  timeout_usec);
-
                                 if (r < 0)
                                         return r;
 
@@ -3668,7 +3668,7 @@ static int io_callback(sd_event_source *s, int fd, uint32_t revents, void *userd
         sd_bus *bus = ASSERT_PTR(userdata);
         int r;
 
-        /* Note that this is called both on input_fd, output_fd as well as inotify_fd events */
+        /* Note that this is called both on input_fd, output_fd, as well as inotify_fd events */
 
         r = sd_bus_process(bus, NULL);
         if (r < 0) {
@@ -4465,4 +4465,22 @@ _public_ int sd_bus_enqueue_for_read(sd_bus *bus, sd_bus_message *m) {
 
         bus->rqueue[bus->rqueue_size++] = bus_message_ref_queued(m, bus);
         return 0;
+}
+
+_public_ int sd_bus_pending_method_calls(sd_bus *bus) {
+
+        /* Returns the number of currently pending asynchronous method calls. This is graceful, i.e. an
+         * unallocated (i.e. NULL) bus connection has no method calls pending. */
+
+        if (!bus)
+                return 0;
+
+        assert_return(bus = bus_resolve(bus), -ENOPKG);
+
+        if (!BUS_IS_OPEN(bus->state))
+                return 0;
+
+        size_t n = ordered_hashmap_size(bus->reply_callbacks);
+
+        return n > INT_MAX ? INT_MAX : (int) n; /* paranoid overflow check */
 }

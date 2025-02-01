@@ -14,6 +14,7 @@
 #include "udev-event.h"
 #include "udev-spawn.h"
 #include "udev-trace.h"
+#include "udev-worker.h"
 
 typedef struct Spawn {
         sd_device *device;
@@ -234,12 +235,13 @@ int udev_event_spawn(
             !STARTSWITH_SET(cmd, "ata_id", "cdrom_id", "dmi_memory_id", "fido_id", "mtd_probe", "scsi_id")) {
                 log_device_debug(event->dev, "Running in test mode, skipping execution of '%s'.", cmd);
                 result[0] = '\0';
-                ret_truncated = false;
+                if (ret_truncated)
+                        *ret_truncated = false;
                 return 0;
         }
 
-        int timeout_signal = event->worker ? event->worker->timeout_signal : SIGKILL;
-        usec_t timeout_usec = event->worker ? event->worker->timeout_usec : DEFAULT_WORKER_TIMEOUT_USEC;
+        int timeout_signal = event->worker ? event->worker->config.timeout_signal : SIGKILL;
+        usec_t timeout_usec = event->worker ? event->worker->config.timeout_usec : DEFAULT_WORKER_TIMEOUT_USEC;
         usec_t now_usec = now(CLOCK_MONOTONIC);
         usec_t age_usec = usec_sub_unsigned(now_usec, event->birth_usec);
         usec_t cmd_timeout_usec = usec_sub_unsigned(timeout_usec, age_usec);
@@ -347,21 +349,20 @@ void udev_event_execute_run(UdevEvent *event) {
                         if (r < 0)
                                 log_device_debug_errno(event->dev, r, "Failed to run built-in command \"%s\", ignoring: %m", command);
                 } else {
-                        if (event->worker && event->worker->exec_delay_usec > 0) {
-                                usec_t timeout_usec = event->worker ? event->worker->timeout_usec : DEFAULT_WORKER_TIMEOUT_USEC;
+                        if (event->worker && event->worker->config.exec_delay_usec > 0) {
                                 usec_t now_usec = now(CLOCK_MONOTONIC);
                                 usec_t age_usec = usec_sub_unsigned(now_usec, event->birth_usec);
 
-                                if (event->worker->exec_delay_usec >= usec_sub_unsigned(timeout_usec, age_usec)) {
+                                if (event->worker->config.exec_delay_usec >= usec_sub_unsigned(event->worker->config.timeout_usec, age_usec)) {
                                         log_device_warning(event->dev,
-                                                           "Cannot delaying execution of \"%s\" for %s, skipping.",
-                                                           command, FORMAT_TIMESPAN(event->worker->exec_delay_usec, USEC_PER_SEC));
+                                                           "Cannot delay execution of \"%s\" for %s, skipping.",
+                                                           command, FORMAT_TIMESPAN(event->worker->config.exec_delay_usec, USEC_PER_SEC));
                                         continue;
                                 }
 
                                 log_device_debug(event->dev, "Delaying execution of \"%s\" for %s.",
-                                                 command, FORMAT_TIMESPAN(event->worker->exec_delay_usec, USEC_PER_SEC));
-                                (void) usleep_safe(event->worker->exec_delay_usec);
+                                                 command, FORMAT_TIMESPAN(event->worker->config.exec_delay_usec, USEC_PER_SEC));
+                                (void) usleep_safe(event->worker->config.exec_delay_usec);
                         }
 
                         log_device_debug(event->dev, "Running command \"%s\"", command);

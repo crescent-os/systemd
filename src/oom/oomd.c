@@ -11,6 +11,7 @@
 #include "fileio.h"
 #include "log.h"
 #include "main-func.h"
+#include "oomd-conf.h"
 #include "oomd-manager-bus.h"
 #include "oomd-manager.h"
 #include "parse-util.h"
@@ -19,25 +20,6 @@
 #include "signal-util.h"
 
 static bool arg_dry_run = false;
-static int arg_swap_used_limit_permyriad = -1;
-static int arg_mem_pressure_limit_permyriad = -1;
-static usec_t arg_mem_pressure_usec = 0;
-
-static int parse_config(void) {
-        static const ConfigTableItem items[] = {
-                { "OOM", "SwapUsedLimit",                    config_parse_permyriad, 0, &arg_swap_used_limit_permyriad    },
-                { "OOM", "DefaultMemoryPressureLimit",       config_parse_permyriad, 0, &arg_mem_pressure_limit_permyriad },
-                { "OOM", "DefaultMemoryPressureDurationSec", config_parse_sec,       0, &arg_mem_pressure_usec            },
-                {}
-        };
-
-        return config_parse_standard_file_with_dropins(
-                        "systemd/oomd.conf",
-                        "OOM\0",
-                        config_item_table_lookup, items,
-                        CONFIG_PARSE_WARN,
-                        /* userdata= */ NULL);
-}
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -129,10 +111,6 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        r = parse_config();
-        if (r < 0)
-                return r;
-
         /* Do some basic requirement checks for running systemd-oomd. It's not exhaustive as some of the other
          * requirements do not have a reliable means to check for in code. */
 
@@ -167,11 +145,6 @@ static int run(int argc, char *argv[]) {
         if (!FLAGS_SET(mask, CGROUP_MASK_MEMORY))
                 return log_error_errno(SYNTHETIC_ERRNO(EOPNOTSUPP), "Requires the cgroup memory controller.");
 
-        assert_se(sigprocmask_many(SIG_BLOCK, NULL, SIGTERM, SIGINT) >= 0);
-
-        if (arg_mem_pressure_usec > 0 && arg_mem_pressure_usec < 1 * USEC_PER_SEC)
-                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "DefaultMemoryPressureDurationSec= must be 0 or at least 1s");
-
         r = manager_new(&m);
         if (r < 0)
                 return log_error_errno(r, "Failed to create manager: %m");
@@ -179,9 +152,6 @@ static int run(int argc, char *argv[]) {
         r = manager_start(
                         m,
                         arg_dry_run,
-                        arg_swap_used_limit_permyriad,
-                        arg_mem_pressure_limit_permyriad,
-                        arg_mem_pressure_usec,
                         fd);
         if (r < 0)
                 return log_error_errno(r, "Failed to start up daemon: %m");

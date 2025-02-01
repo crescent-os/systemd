@@ -98,9 +98,7 @@ _printf_(2, 3) static int log_callback(int type, const char *fmt, ...) {
         const char *fmt2;
 
 #if HAVE_AUDIT
-        int fd;
-
-        fd = get_audit_fd();
+        int fd = get_core_audit_fd();
 
         if (fd >= 0) {
                 _cleanup_free_ char *buf = NULL;
@@ -112,9 +110,9 @@ _printf_(2, 3) static int log_callback(int type, const char *fmt, ...) {
 
                 if (r >= 0) {
                         if (type == SELINUX_AVC)
-                                audit_log_user_avc_message(get_audit_fd(), AUDIT_USER_AVC, buf, NULL, NULL, NULL, getuid());
+                                audit_log_user_avc_message(fd, AUDIT_USER_AVC, buf, NULL, NULL, NULL, getuid());
                         else if (type == SELINUX_ERROR)
-                                audit_log_user_avc_message(get_audit_fd(), AUDIT_USER_SELINUX_ERR, buf, NULL, NULL, NULL, getuid());
+                                audit_log_user_avc_message(fd, AUDIT_USER_SELINUX_ERR, buf, NULL, NULL, NULL, getuid());
 
                         return 0;
                 }
@@ -193,7 +191,6 @@ int mac_selinux_access_check_internal(
         assert(message);
         assert(permission);
         assert(function);
-        assert(error);
 
         r = access_init(error);
         if (r <= 0)
@@ -268,7 +265,7 @@ int mac_selinux_access_check_internal(
 
         log_full_errno_zerook(LOG_DEBUG, r,
                               "SELinux access check scon=%s tcon=%s tclass=%s perm=%s state=%s function=%s path=%s cmdline=%s: %m",
-                              scon, acon, tclass, permission, enforce ? "enforcing" : "permissive", function, strna(unit_path), strna(empty_to_null(cl)));
+                              scon, acon, tclass, permission, enforce ? "enforcing" : "permissive", function, strna(unit_path), empty_to_na(cl));
         return enforce ? r : 0;
 }
 

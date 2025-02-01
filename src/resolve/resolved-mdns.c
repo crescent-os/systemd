@@ -22,6 +22,19 @@ void manager_mdns_stop(Manager *m) {
         m->mdns_ipv6_fd = safe_close(m->mdns_ipv6_fd);
 }
 
+void manager_mdns_maybe_stop(Manager *m) {
+        assert(m);
+
+        /* This stops mDNS only when no interface enables mDNS. */
+
+        Link *l;
+        HASHMAP_FOREACH(l, m->links)
+                if (link_get_mdns_support(l) != RESOLVE_SUPPORT_NO)
+                        return;
+
+        manager_mdns_stop(m);
+}
+
 int manager_mdns_start(Manager *m) {
         int r;
 
@@ -236,7 +249,6 @@ static bool sender_on_local_subnet(DnsScope *s, DnsPacket *p) {
         return false;
 }
 
-
 static int mdns_scope_process_query(DnsScope *s, DnsPacket *p) {
         _cleanup_(dns_answer_unrefp) DnsAnswer *full_answer = NULL;
         _cleanup_(dns_packet_unrefp) DnsPacket *reply = NULL;
@@ -386,7 +398,10 @@ static int on_mdns_packet(sd_event_source *s, int fd, uint32_t revents, void *us
         if (r <= 0)
                 return r;
 
-        if (manager_packet_from_local_address(m, p))
+        /* Refuse traffic from the local host, to avoid query loops. However, allow legacy mDNS
+         * unicast queries through anyway (we never send those ourselves, hence no risk).
+         * i.e. check for the source port nr. */
+        if (p->sender_port == MDNS_PORT && manager_packet_from_local_address(m, p))
                 return 0;
 
         scope = manager_find_scope(m, p);

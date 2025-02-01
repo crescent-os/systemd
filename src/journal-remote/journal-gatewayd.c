@@ -32,7 +32,6 @@
 #include "os-util.h"
 #include "parse-util.h"
 #include "pretty-print.h"
-#include "sigbus.h"
 #include "signal-util.h"
 #include "time-util.h"
 #include "tmpfile-util.h"
@@ -50,6 +49,7 @@ static char **arg_file = NULL;
 STATIC_DESTRUCTOR_REGISTER(arg_key_pem, erase_and_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_cert_pem, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_trust_pem, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_file, strv_freep);
 
 typedef struct RequestMeta {
         sd_journal *journal;
@@ -347,6 +347,9 @@ static int request_parse_range_entries(
         const char *colon;
         int r;
 
+        assert(m);
+        assert(entries_request);
+
         colon = strchr(entries_request, ':');
         if (!colon)
                 m->cursor = strdup(entries_request);
@@ -374,6 +377,9 @@ static int request_parse_range_time(
         _cleanup_free_ char *until = NULL;
         const char *colon;
         int r;
+
+        assert(m);
+        assert(time_request);
 
         colon = strchr(time_request, ':');
         if (!colon)
@@ -439,17 +445,14 @@ static int request_parse_range(
                 return -EINVAL;
 
         m->n_skip = 0;
+
         range_after_eq = startswith(range, "entries=");
-        if (range_after_eq) {
-                range_after_eq += strspn(range_after_eq, WHITESPACE);
-                return request_parse_range_entries(m, range_after_eq);
-        }
+        if (range_after_eq)
+                return request_parse_range_entries(m, skip_leading_chars(range_after_eq, /* bad = */ NULL));
 
         range_after_eq = startswith(range, "realtime=");
-        if (startswith(range, "realtime=")) {
-                range_after_eq += strspn(range_after_eq, WHITESPACE);
-                return request_parse_range_time(m, range_after_eq);
-        }
+        if (range_after_eq)
+                return request_parse_range_time(m, skip_leading_chars(range_after_eq, /* bad = */ NULL));
 
         return 0;
 }
@@ -813,7 +816,7 @@ static int request_handler_machine(
         _cleanup_(MHD_destroy_responsep) struct MHD_Response *response = NULL;
         RequestMeta *m = ASSERT_PTR(connection_cls);
         int r;
-        _cleanup_free_ char* hostname = NULL, *pretty_name = NULL, *os_name = NULL;
+        _cleanup_free_ char *hostname = NULL, *pretty_name = NULL, *os_name = NULL;
         uint64_t cutoff_from = 0, cutoff_to = 0, usage = 0;
         sd_id128_t mid, bid;
         _cleanup_free_ char *v = NULL, *json = NULL;
@@ -1130,7 +1133,8 @@ static int run(int argc, char *argv[]) {
         if (r <= 0)
                 return r;
 
-        sigbus_install();
+        journal_browse_prepare();
+
         assert_se(sigaction(SIGTERM, &sigterm, NULL) >= 0);
 
         r = setup_gnutls_logger(NULL);

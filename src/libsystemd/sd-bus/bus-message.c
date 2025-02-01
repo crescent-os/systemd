@@ -1276,7 +1276,7 @@ static void *message_extend_body(
 }
 
 static int message_push_fd(sd_bus_message *m, int fd) {
-        int *f, copy;
+        int copy;
 
         assert(m);
 
@@ -1290,15 +1290,13 @@ static int message_push_fd(sd_bus_message *m, int fd) {
         if (copy < 0)
                 return -errno;
 
-        f = reallocarray(m->fds, m->n_fds + 1, sizeof(int));
-        if (!f) {
+        if (!GREEDY_REALLOC(m->fds, m->n_fds + 1)) {
                 m->poisoned = true;
                 safe_close(copy);
                 return -ENOMEM;
         }
 
-        m->fds = f;
-        m->fds[m->n_fds] = copy;
+        m->fds[m->n_fds] = copy; /* m->n_fds will be incremented by the caller later */
         m->free_fds = true;
 
         return copy;
@@ -4158,7 +4156,6 @@ static int message_parse_fields(sd_bus_message *m) {
                         if (m->reply_cookie != 0)
                                 return -EBADMSG;
 
-
                         if (!streq(signature, "u"))
                                 return -EBADMSG;
 
@@ -4387,7 +4384,6 @@ static int bus_message_get_arg_skip(
                 if (r < 0)
                         return r;
         }
-
 }
 
 int bus_message_get_arg(sd_bus_message *m, unsigned i, const char **str) {

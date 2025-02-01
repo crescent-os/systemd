@@ -81,7 +81,7 @@ int path_spec_watch(PathSpec *s, sd_event_io_handler_t handler) {
                         tmp = *cut;
                         *cut = '\0';
 
-                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_ATTRIB | IN_CREATE | IN_MOVED_TO;
+                        flags = IN_MOVE_SELF | IN_DELETE_SELF | IN_CREATE | IN_MOVED_TO;
                 } else {
                         cut = NULL;
                         flags = flags_table[s->type];
@@ -546,7 +546,7 @@ static void path_enter_running(Path *p, char *trigger_path) {
                 goto fail;
         }
 
-        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, NULL, &error, &job);
+        r = manager_add_job(UNIT(p)->manager, JOB_START, trigger, JOB_REPLACE, &error, &job);
         if (r < 0) {
                 log_unit_warning(UNIT(p), "Failed to queue unit startup job: %s", bus_error_message(&error, r));
                 goto fail;
@@ -591,7 +591,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) 
         }
 
         if (path_check_good(p, initial, from_trigger_notify, &trigger_path)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                 path_enter_running(p, trigger_path);
                 return;
         }
@@ -608,7 +608,7 @@ static void path_enter_waiting(Path *p, bool initial, bool from_trigger_notify) 
          * recheck */
 
         if (path_check_good(p, false, from_trigger_notify, &trigger_path)) {
-                log_unit_debug(UNIT(p), "Got triggered.");
+                log_unit_debug(UNIT(p), "Got triggered by '%s'.", trigger_path);
                 path_enter_running(p, trigger_path);
                 return;
         }

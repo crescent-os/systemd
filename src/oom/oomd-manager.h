@@ -3,10 +3,10 @@
 
 #include "sd-bus.h"
 #include "sd-event.h"
+#include "sd-varlink.h"
 
 #include "conf-parser.h"
 #include "oomd-util.h"
-#include "varlink.h"
 
 /* Polling interval for monitoring stats */
 #define SWAP_INTERVAL_USEC 150000 /* 0.15 seconds */
@@ -55,10 +55,10 @@ struct Manager {
 
         /* This varlink object is used to manage the subscription from systemd-oomd to PID1 which it uses to
          * listen for changes in ManagedOOM settings (oomd client - systemd server). */
-        Varlink *varlink_client;
+        sd_varlink *varlink_client;
         /* This varlink server object is used to manage systemd-oomd's varlink server which is used by user
          * managers to report changes in ManagedOOM settings (oomd server - systemd client). */
-        VarlinkServer *varlink_server;
+        sd_varlink_server *varlink_server;
 };
 
 Manager* manager_free(Manager *m);
@@ -66,7 +66,7 @@ DEFINE_TRIVIAL_CLEANUP_FUNC(Manager*, manager_free);
 
 int manager_new(Manager **ret);
 
-int manager_start(Manager *m, bool dry_run, int swap_used_limit_permyriad, int mem_pressure_limit_permyriad, usec_t mem_pressure_usec, int fd);
+int manager_start(Manager *m, bool dry_run, int fd);
 
 int manager_get_dump_string(Manager *m, char **ret);
 

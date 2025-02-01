@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
 udevadm_sources = files(
+        'udevadm-cat.c',
         'udevadm-control.c',
         'udevadm-hwdb.c',
         'udevadm-info.c',
@@ -19,15 +20,6 @@ udevadm_sources = files(
 
 libudevd_core_sources = files(
         'net/link-config.c',
-        'udev-ctrl.c',
-        'udev-event.c',
-        'udev-format.c',
-        'udev-manager.c',
-        'udev-node.c',
-        'udev-rules.c',
-        'udev-spawn.c',
-        'udev-watch.c',
-        'udev-worker.c',
         'udev-builtin-btrfs.c',
         'udev-builtin-hwdb.c',
         'udev-builtin-input_id.c',
@@ -38,6 +30,19 @@ libudevd_core_sources = files(
         'udev-builtin-path_id.c',
         'udev-builtin-usb_id.c',
         'udev-builtin.c',
+        'udev-config.c',
+        'udev-ctrl.c',
+        'udev-dump.c',
+        'udev-event.c',
+        'udev-format.c',
+        'udev-manager.c',
+        'udev-manager-ctrl.c',
+        'udev-node.c',
+        'udev-rules.c',
+        'udev-spawn.c',
+        'udev-varlink.c',
+        'udev-watch.c',
+        'udev-worker.c',
 )
 
 if conf.get('HAVE_KMOD') == 1
@@ -57,8 +62,9 @@ endif
 generate_keyboard_keys_list = find_program('generate-keyboard-keys-list.sh')
 keyboard_keys_list_txt = custom_target(
         'keyboard-keys-list.txt',
+        input : files('../basic/linux/input.h'),
         output : 'keyboard-keys-list.txt',
-        command : [generate_keyboard_keys_list, cpp],
+        command : [generate_keyboard_keys_list, cpp, '@INPUT@'],
         capture : true)
 
 generate_keyboard_keys_gperf = find_program('generate-keyboard-keys-gperf.sh')
@@ -114,7 +120,7 @@ libudevd_core = static_library(
         include_directories : includes + include_directories('net'),
         link_with : udev_link_with,
         dependencies : [libblkid,
-                        libkmod,
+                        libkmod_cflags,
                         userspace],
         build_by_default : false)
 
@@ -130,6 +136,7 @@ udev_plugin_template = executable_template + {
         'link_with' : udev_link_with,
         'install_rpath' : udev_rpath,
         'install_dir' : udevlibexecdir,
+        'install_tag' : 'udev',
 }
 
 udev_common_template = {
@@ -145,7 +152,7 @@ udev_common_template = {
 udev_test_template = test_template + udev_common_template
 udev_fuzz_template = fuzz_template + udev_common_template
 
-executables += [
+udev_binaries_dict = [
         executable_template + {
                 'name' : 'udevadm',
                 'public' : true,
@@ -153,6 +160,7 @@ executables += [
                 'link_with' : [libudevd_core],
                 'dependencies' : udev_dependencies,
                 'install_rpath' : udev_rpath,
+                'install_tag' : 'udev',
         },
         udev_plugin_template + {
                 'name' : 'ata_id',
@@ -196,6 +204,15 @@ executables += [
                 'name' : 'v4l_id',
                 'sources' : files('v4l_id/v4l_id.c'),
         },
+]
+# For the udev alias
+udev_binaries = []
+foreach binary : udev_binaries_dict
+        udev_binaries += binary.get('name')
+endforeach
+
+executables += udev_binaries_dict
+executables += [
         test_template + {
                 'sources' : files(
                         'fido_id/test-fido-id-desc.c',
@@ -252,13 +269,16 @@ executables += [
 ]
 
 meson.add_install_script(sh, '-c', ln_s.format(bindir / 'udevadm',
-                                               libexecdir / 'systemd-udevd'))
+                                               libexecdir / 'systemd-udevd'),
+                         install_tag : 'udev')
 
 if install_sysconfdir_samples
         install_data('udev.conf',
-                     install_dir : configfiledir / 'udev')
+                     install_dir : configfiledir / 'udev',
+                     install_tag : 'udev')
         install_data('iocost/iocost.conf',
-                     install_dir : configfiledir / 'udev')
+                     install_dir : configfiledir / 'udev',
+                     install_tag : 'udev')
 endif
 
 udev_pc = custom_target(
@@ -271,5 +291,5 @@ udev_pc = custom_target(
         install_dir : pkgconfigdatadir)
 
 if install_sysconfdir
-        install_emptydir(sysconfdir / 'udev/rules.d')
+        install_emptydir(sysconfdir / 'udev/rules.d', install_tag : 'udev')
 endif

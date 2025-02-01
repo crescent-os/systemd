@@ -8,8 +8,12 @@
 #include "sd-ndisc.h"
 
 #include "alloc-util.h"
+#include "dns-domain.h"
+#include "dns-resolver-internal.h"
 #include "ndisc-internal.h"
 #include "ndisc-router-internal.h"
+#include "string-table.h"
+#include "unaligned.h"
 
 static sd_ndisc_router* ndisc_router_free(sd_ndisc_router *rt) {
         if (!rt)
@@ -90,6 +94,7 @@ DEFINE_GET_TIMESTAMP(route_get_lifetime);
 DEFINE_GET_TIMESTAMP(rdnss_get_lifetime);
 DEFINE_GET_TIMESTAMP(dnssl_get_lifetime);
 DEFINE_GET_TIMESTAMP(prefix64_get_lifetime);
+DEFINE_GET_TIMESTAMP(encrypted_dns_get_lifetime);
 
 int ndisc_router_parse(sd_ndisc *nd, sd_ndisc_router *rt) {
         const struct nd_router_advert *a;
@@ -163,6 +168,27 @@ int sd_ndisc_router_get_flags(sd_ndisc_router *rt, uint64_t *ret) {
         return 0;
 }
 
+int ndisc_router_flags_to_string(uint64_t flags, char **ret) {
+        _cleanup_free_ char *s = NULL;
+
+        assert(ret);
+
+        if (FLAGS_SET(flags, ND_RA_FLAG_MANAGED) &&
+            !strextend_with_separator(&s, ", ", "managed"))
+                return -ENOMEM;
+
+        if (FLAGS_SET(flags, ND_RA_FLAG_OTHER) &&
+            !strextend_with_separator(&s, ", ", "other"))
+                return -ENOMEM;
+
+        if (FLAGS_SET(flags, ND_RA_FLAG_HOME_AGENT) &&
+            !strextend_with_separator(&s, ", ", "home-agent"))
+                return -ENOMEM;
+
+        *ret = TAKE_PTR(s);
+        return 0;
+}
+
 int sd_ndisc_router_get_lifetime(sd_ndisc_router *rt, uint64_t *ret) {
         assert_return(rt, -EINVAL);
 
@@ -179,6 +205,15 @@ int sd_ndisc_router_get_preference(sd_ndisc_router *rt, uint8_t *ret) {
         *ret = rt->preference;
         return 0;
 }
+
+static const char* const ndisc_router_preference_table[] = {
+        [SD_NDISC_PREFERENCE_LOW]      = "low",
+        [SD_NDISC_PREFERENCE_MEDIUM]   = "medium",
+        [SD_NDISC_PREFERENCE_HIGH]     = "high",
+        [SD_NDISC_PREFERENCE_RESERVED] = "reserved",
+};
+
+DEFINE_STRING_TABLE_LOOKUP_TO_STRING(ndisc_router_preference, int);
 
 int sd_ndisc_router_get_sender_mac(sd_ndisc_router *rt, struct ether_addr *ret) {
         assert_return(rt, -EINVAL);
@@ -311,3 +346,6 @@ DEFINE_GETTER(dnssl, SD_NDISC_OPTION_DNSSL, lifetime, uint64_t);
 DEFINE_GETTER(prefix64, SD_NDISC_OPTION_PREF64, prefixlen, uint8_t);
 DEFINE_GETTER(prefix64, SD_NDISC_OPTION_PREF64, prefix, struct in6_addr);
 DEFINE_GETTER(prefix64, SD_NDISC_OPTION_PREF64, lifetime, uint64_t);
+
+DEFINE_GETTER(encrypted_dns, SD_NDISC_OPTION_ENCRYPTED_DNS, lifetime, uint64_t);
+DEFINE_GETTER(encrypted_dns, SD_NDISC_OPTION_ENCRYPTED_DNS, resolver, sd_dns_resolver*);

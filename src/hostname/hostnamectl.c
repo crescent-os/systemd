@@ -9,6 +9,7 @@
 
 #include "sd-bus.h"
 #include "sd-id128.h"
+#include "sd-json.h"
 
 #include "alloc-util.h"
 #include "architecture.h"
@@ -17,15 +18,15 @@
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "bus-map-properties.h"
+#include "bus-message-util.h"
 #include "format-table.h"
 #include "hostname-setup.h"
 #include "hostname-util.h"
-#include "json.h"
 #include "main-func.h"
 #include "parse-argument.h"
+#include "polkit-agent.h"
 #include "pretty-print.h"
 #include "socket-util.h"
-#include "spawn-polkit-agent.h"
 #include "terminal-util.h"
 #include "verbs.h"
 
@@ -35,7 +36,7 @@ static char *arg_host = NULL;
 static bool arg_transient = false;
 static bool arg_pretty = false;
 static bool arg_static = false;
-static JsonFormatFlags arg_json_format_flags = JSON_FORMAT_OFF;
+static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 
 typedef struct StatusInfo {
         const char *hostname;
@@ -91,12 +92,12 @@ static const char *os_support_end_color(usec_t n, usec_t eol) {
          * yellow. If more than a year is left, color green. In between just show in regular color. */
 
         if (n >= eol)
-                return ANSI_HIGHLIGHT_RED;
+                return ansi_highlight_red();
         left = eol - n;
         if (left < USEC_PER_MONTH)
-                return ANSI_HIGHLIGHT_YELLOW;
+                return ansi_highlight_yellow();
         if (left > USEC_PER_YEAR)
-                return ANSI_HIGHLIGHT_GREEN;
+                return ansi_highlight_green();
 
         return NULL;
 }
@@ -313,7 +314,7 @@ static int print_status_info(StatusInfo *i) {
                         r = table_add_many(table,
                                            TABLE_FIELD, "Firmware Age",
                                            TABLE_TIMESPAN_DAY, n - i->firmware_date,
-                                           TABLE_SET_COLOR, n - i->firmware_date > USEC_PER_YEAR*2 ? ANSI_HIGHLIGHT_YELLOW : NULL);
+                                           TABLE_SET_COLOR, n - i->firmware_date > USEC_PER_YEAR*2 ? ansi_highlight_yellow() : NULL);
                         if (r < 0)
                                 return table_log_add_error(r);
                 }
@@ -491,10 +492,10 @@ static int show_status(int argc, char **argv, void *userdata) {
         sd_bus *bus = userdata;
         int r;
 
-        if (arg_json_format_flags != JSON_FORMAT_OFF) {
+        if (sd_json_format_enabled(arg_json_format_flags)) {
                 _cleanup_(sd_bus_error_free) sd_bus_error error = SD_BUS_ERROR_NULL;
                 _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-                _cleanup_(json_variant_unrefp) JsonVariant *v = NULL;
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *v = NULL;
                 const char *text = NULL;
 
                 r = bus_call_method(bus, bus_hostname, "Describe", &error, &reply, NULL);
@@ -505,11 +506,11 @@ static int show_status(int argc, char **argv, void *userdata) {
                 if (r < 0)
                         return bus_log_parse_error(r);
 
-                r = json_parse(text, 0, &v, NULL, NULL);
+                r = sd_json_parse(text, 0, &v, NULL, NULL);
                 if (r < 0)
                         return log_error_errno(r, "Failed to parse JSON: %m");
 
-                json_variant_dump(v, arg_json_format_flags, NULL, NULL);
+                sd_json_variant_dump(v, arg_json_format_flags, NULL, NULL);
                 return 0;
         }
 
@@ -519,12 +520,11 @@ static int show_status(int argc, char **argv, void *userdata) {
         return show_all_names(bus);
 }
 
-
 static int set_simple_string_internal(sd_bus *bus, sd_bus_error *error, const char *target, const char *method, const char *value) {
         _cleanup_(sd_bus_error_free) sd_bus_error e = SD_BUS_ERROR_NULL;
         int r;
 
-        polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
+        (void) polkit_agent_open_if_enabled(arg_transport, arg_ask_password);
 
         if (!error)
                 error = &e;
@@ -766,7 +766,7 @@ static int parse_argv(int argc, char *argv[]) {
                         break;
 
                 case 'j':
-                        arg_json_format_flags = JSON_FORMAT_PRETTY_AUTO|JSON_FORMAT_COLOR_AUTO;
+                        arg_json_format_flags = SD_JSON_FORMAT_PRETTY_AUTO|SD_JSON_FORMAT_COLOR_AUTO;
                         break;
 
                 case '?':
@@ -813,7 +813,7 @@ static int run(int argc, char *argv[]) {
 
         r = bus_connect_transport(arg_transport, arg_host, RUNTIME_SCOPE_SYSTEM, &bus);
         if (r < 0)
-                return bus_log_connect_error(r, arg_transport);
+                return bus_log_connect_error(r, arg_transport, RUNTIME_SCOPE_SYSTEM);
 
         return hostnamectl_main(bus, argc, argv);
 }

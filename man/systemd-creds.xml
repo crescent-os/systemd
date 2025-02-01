@@ -88,7 +88,7 @@
 
         <listitem><para>Generates a host encryption key for credentials, if one has not been generated
         already. This ensures the <filename>/var/lib/systemd/credential.secret</filename> file is initialized
-        with a random secret key if it doesn't exist yet. This secret key is used when encrypting/decrypting
+        with a random secret key if it does not exist yet. This secret key is used when encrypting/decrypting
         credentials with <command>encrypt</command> or <command>decrypt</command>, and is only accessible to
         the root user. Note that there's typically no need to invoke this command explicitly as it is
         implicitly called when <command>encrypt</command> is invoked, and credential host key encryption
@@ -177,22 +177,7 @@
         <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
-      <varlistentry>
-        <term><command>has-tpm2</command></term>
-
-        <listitem><para>Reports whether the system is equipped with a TPM2 device usable for protecting
-        credentials. If a TPM2 device has been discovered, is supported, and is being used by firmware,
-        by the OS kernel drivers and by userspace (i.e. systemd) this prints <literal>yes</literal> and exits
-        with exit status zero. If no such device is discovered/supported/used, prints
-        <literal>no</literal>. Otherwise prints <literal>partial</literal>. In either of these two cases
-        exits with non-zero exit status. It also shows four lines indicating separately whether firmware,
-        drivers, the system and the kernel discovered/support/use TPM2.</para>
-
-        <para>Combine with <option>--quiet</option> to suppress the output.</para>
-
-        <xi:include href="version-info.xml" xpointer="v251"/></listitem>
-      </varlistentry>
-
+      <xi:include href="standard-options.xml" xpointer="no-ask-password" />
       <xi:include href="standard-options.xml" xpointer="help" />
       <xi:include href="standard-options.xml" xpointer="version" />
     </variablelist>
@@ -250,7 +235,8 @@
         <listitem><para>When specified with the <command>cat</command> or <command>decrypt</command>
         commands, transcodes the output before showing it. Takes one of <literal>base64</literal>,
         <literal>unbase64</literal>, <literal>hex</literal> or <literal>unhex</literal> as argument, in order
-        to encode/decode the credential data with Base64 or as series of hexadecimal values.</para>
+        to encode/decode the credential data with Base64 or as series of hexadecimal values. The special
+        value <literal>help</literal> may be used to list supported transcode types.</para>
 
         <para>Note that this has no effect on the <command>encrypt</command> command, as encrypted
         credentials are unconditionally encoded in Base64.</para>
@@ -262,7 +248,7 @@
         <term><option>--newline=</option></term>
 
         <listitem><para>When specified with <command>cat</command> or <command>decrypt</command> controls
-        whether to add a trailing newline character to the end of the output if it doesn't end in one,
+        whether to add a trailing newline character to the end of the output if it does not end in one,
         anyway. Takes one of <literal>auto</literal>, <literal>yes</literal> or <literal>no</literal>. The
         default mode of <literal>auto</literal> will suffix the output with a single newline character only
         when writing credential data to a TTY.</para>
@@ -283,30 +269,30 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--name=</option><replaceable>name</replaceable></term>
+        <term><option>--name=<replaceable>name</replaceable></option></term>
 
         <listitem><para>When specified with the <command>encrypt</command> command controls the credential
-        name to embed in the encrypted credential data. If not specified the name is chosen automatically
+        name to embed in the encrypted credential data. If not specified, the name is chosen automatically
         from the filename component of the specified output path. If specified as empty string no
         credential name is embedded in the encrypted credential, and no verification of credential name is
         done when the credential is decrypted.</para>
 
         <para>When specified with the <command>decrypt</command> command control the credential name to
-        validate the credential name embedded in the encrypted credential with. If not specified the name is
+        validate the credential name embedded in the encrypted credential with. If not specified, the name is
         chosen automatically from the filename component of the specified input path. If no credential name
         is embedded in the encrypted credential file (i.e. the <option>--name=</option> with an empty string
         was used when encrypted) the specified name has no effect as no credential name validation is
         done.</para>
 
         <para>Embedding the credential name in the encrypted credential is done in order to protect against
-        reuse of credentials for purposes they weren't originally intended for, under the assumption the
+        reuse of credentials for purposes they were not originally intended for, under the assumption the
         credential name is chosen carefully to encode its intended purpose.</para>
 
         <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--timestamp=</option><replaceable>timestamp</replaceable></term>
+        <term><option>--timestamp=<replaceable>timestamp</replaceable></option></term>
 
         <listitem><para>When specified with the <command>encrypt</command> command controls the timestamp to
         embed into the encrypted credential. Defaults to the current time. Takes a timestamp specification in
@@ -315,18 +301,18 @@
 
         <para>When specified with the <command>decrypt</command> command controls the timestamp to use to
         validate the "not-after" timestamp that was configured with <option>--not-after=</option> during
-        encryption. If not specified defaults to the current system time.</para>
+        encryption. If not specified, defaults to the current system time.</para>
 
         <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--not-after=</option><replaceable>timestamp</replaceable></term>
+        <term><option>--not-after=<replaceable>timestamp</replaceable></option></term>
 
         <listitem><para>When specified with the <command>encrypt</command> command controls the time when the
         credential shall not be used anymore. This embeds the specified timestamp in the encrypted
         credential. During decryption the timestamp is checked against the current system clock, and if the
-        timestamp is in the past the decryption will fail. By default no such timestamp is set. Takes a
+        timestamp is in the past the decryption will fail. By default, no such timestamp is set. Takes a
         timestamp specification in the format described in
         <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>.</para>
 
@@ -356,7 +342,8 @@
         information). If set to <literal>auto-initrd</literal> a TPM2 key is used if a TPM2 is found. If not
         a fixed zero length key is used, equivalent to <literal>null</literal> mode. This option is
         particularly useful to generate credentials files that are encrypted/authenticated against TPM2 where
-        available but still work on systems lacking support for this.</para>
+        available but still work on systems lacking support for this. The special value
+        <literal>help</literal> may be used to list supported key types.</para>
 
         <para>The <option>-H</option> switch is a shortcut for <option>--with-key=host</option>. Similar,
         <option>-T</option> is a shortcut for <option>--with-key=tpm2</option>.</para>
@@ -372,7 +359,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--tpm2-device=</option><replaceable>PATH</replaceable></term>
+        <term><option>--tpm2-device=<replaceable>PATH</replaceable></option></term>
 
         <listitem><para>Controls the TPM2 device to use. Expects a device node path referring to the TPM2
         chip (e.g. <filename>/dev/tpmrm0</filename>). Alternatively the special value <literal>auto</literal>
@@ -384,20 +371,21 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--tpm2-pcrs=</option><replaceable>PCR<optional>+PCR...</optional></replaceable></term>
+        <term><option>--tpm2-pcrs=<replaceable>PCR<optional>+PCR...</optional></replaceable></option></term>
 
         <listitem><para>Configures the TPM2 PCRs (Platform Configuration Registers) to bind the encryption
-        key to. Takes a <literal>+</literal> separated list of numeric PCR indexes in the range 0…23. If not
-        used, defaults to PCR 7 only. If an empty string is specified, binds the encryption key to no PCRs at
-        all. For details about the PCRs available, see the documentation of the switch of the same name for
+        key to. Takes a <literal>+</literal> separated list of numeric PCR indexes in the range 0…23. If an
+        empty string is specified, binds the encryption key to no PCRs at all (this is also the default if
+        this option is not used). For details about the PCRs available, see the documentation of the switch
+        of the same name for
         <citerefentry><refentrytitle>systemd-cryptenroll</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
 
         <xi:include href="version-info.xml" xpointer="v250"/></listitem>
       </varlistentry>
 
       <varlistentry>
-        <term><option>--tpm2-public-key=</option><replaceable>PATH</replaceable></term>
-        <term><option>--tpm2-public-key-pcrs=</option><replaceable>PCR<optional>+PCR...</optional></replaceable></term>
+        <term><option>--tpm2-public-key=<replaceable>PATH</replaceable></option></term>
+        <term><option>--tpm2-public-key-pcrs=<replaceable>PCR<optional>+PCR...</optional></replaceable></option></term>
 
         <listitem><para>Configures a TPM2 signed PCR policy to bind encryption to, for use with the
         <command>encrypt</command> command. The <option>--tpm2-public-key=</option> option accepts a path to
@@ -406,7 +394,7 @@
         <filename>/etc/systemd/</filename>, <filename>/run/systemd/</filename>,
         <filename>/usr/lib/systemd/</filename> (searched in this order), it is automatically used. The
         <option>--tpm2-public-key-pcrs=</option> option takes a list of TPM2 PCR indexes to bind to (same
-        syntax as <option>--tpm2-pcrs=</option> described above). If not specified defaults to 11 (i.e. this
+        syntax as <option>--tpm2-pcrs=</option> described above). If not specified, defaults to 11 (i.e. this
         binds the policy to any unified kernel image for which a PCR signature can be provided).</para>
 
         <para>Note the difference between <option>--tpm2-pcrs=</option> and
@@ -419,7 +407,7 @@
       </varlistentry>
 
       <varlistentry>
-        <term><option>--tpm2-signature=</option><replaceable>PATH</replaceable></term>
+        <term><option>--tpm2-signature=<replaceable>PATH</replaceable></option></term>
 
         <listitem><para>Takes a path to a TPM2 PCR signature file as generated by the
         <citerefentry><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>
@@ -434,11 +422,18 @@
       </varlistentry>
 
       <varlistentry>
+        <term><option>--allow-null</option></term>
+
+        <listitem><para>Allow decrypting credentials that use an empty key.</para>
+
+        <xi:include href="version-info.xml" xpointer="v256"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><option>--quiet</option></term>
         <term><option>-q</option></term>
 
-        <listitem><para>When used with <command>has-tpm2</command> suppresses the output, and only returns an
-        exit status indicating support for TPM2.</para>
+        <listitem><para>Suppress additional output.</para>
 
         <xi:include href="version-info.xml" xpointer="v251"/></listitem>
       </varlistentry>
@@ -453,12 +448,6 @@
     <title>Exit status</title>
 
     <para>On success, 0 is returned.</para>
-
-    <para>In case of the <command>has-tpm2</command> command returns 0 if a TPM2 device is discovered,
-    supported and used by firmware, driver, and userspace (i.e. systemd). Otherwise returns the OR
-    combination of the value 1 (in case firmware support is missing), 2 (in case driver support is missing)
-    and 4 (in case userspace support is missing). If no TPM2 support is available at all, value 7 is hence
-    returned.</para>
   </refsect1>
 
   <refsect1>

@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
+#include "ansi-color.h"
 #include "bus-error.h"
 #include "bus-locator.h"
 #include "locale-util.h"
@@ -27,17 +28,16 @@ static int output_waiting_jobs(sd_bus *bus, Table *table, uint32_t id, const cha
 
         while ((r = sd_bus_message_read(reply, "(usssoo)", &other_id, &name, &type, NULL, NULL, NULL)) > 0) {
                 _cleanup_free_ char *row = NULL;
-                int rc;
 
                 if (asprintf(&row, "%s %u (%s/%s)", prefix, other_id, name, type) < 0)
                         return log_oom();
 
-                rc = table_add_many(table,
+                r = table_add_many(table,
                                     TABLE_STRING, special_glyph(SPECIAL_GLYPH_TREE_RIGHT),
                                     TABLE_STRING, row,
                                     TABLE_EMPTY,
                                     TABLE_EMPTY);
-                if (rc < 0)
+                if (r < 0)
                         return table_log_add_error(r);
         }
 
@@ -102,9 +102,9 @@ static int output_jobs_list(sd_bus *bus, const struct job_info* jobs, unsigned n
                         return table_log_add_error(r);
 
                 if (arg_jobs_after)
-                        output_waiting_jobs(bus, table, j->id, "GetJobAfter", "\twaiting for job");
+                        output_waiting_jobs(bus, table, j->id, "GetJobAfter", "\tblocking job");
                 if (arg_jobs_before)
-                        output_waiting_jobs(bus, table, j->id, "GetJobBefore", "\tblocking job");
+                        output_waiting_jobs(bus, table, j->id, "GetJobBefore", "\twaiting for job");
         }
 
         r = table_print(table, NULL);

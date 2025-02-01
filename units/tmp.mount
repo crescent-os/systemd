@@ -11,7 +11,7 @@
 Description=Temporary Directory /tmp
 Documentation=https://systemd.io/TEMPORARY_DIRECTORIES
 Documentation=man:file-hierarchy(7)
-Documentation=https://www.freedesktop.org/wiki/Software/systemd/APIFileSystems
+Documentation=https://systemd.io/API_FILE_SYSTEMS
 ConditionPathIsSymbolicLink=!/tmp
 DefaultDependencies=no
 Conflicts=umount.target
@@ -23,3 +23,4 @@ What=tmpfs
 Where=/tmp
 Type=tmpfs
 Options=mode=1777,strictatime,nosuid,nodev,size=50%%,nr_inodes=1m
+GracefulOptions=usrquota

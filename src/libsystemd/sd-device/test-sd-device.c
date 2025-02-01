@@ -74,33 +74,37 @@ static void test_sd_device_one(sd_device *d) {
         r = sd_device_get_subsystem(d, &subsystem);
         if (r < 0)
                 assert_se(r == -ENOENT);
-        else if (!streq(subsystem, "gpio")) { /* Unfortunately, there exist /sys/class/gpio and /sys/bus/gpio.
-                                               * Hence, sd_device_new_from_subsystem_sysname() and
-                                               * sd_device_new_from_device_id() may not work as expected. */
+        else {
                 const char *name, *id;
 
-                if (streq(subsystem, "drivers"))
-                        name = strjoina(d->driver_subsystem, ":", sysname);
-                else
+                if (streq(subsystem, "drivers")) {
+                        const char *driver_subsystem;
+                        ASSERT_OK(sd_device_get_driver_subsystem(d, &driver_subsystem));
+                        name = strjoina(driver_subsystem, ":", sysname);
+                } else
                         name = sysname;
-                assert_se(sd_device_new_from_subsystem_sysname(&dev, subsystem, name) >= 0);
-                assert_se(sd_device_get_syspath(dev, &val) >= 0);
-                assert_se(streq(syspath, val));
-                dev = sd_device_unref(dev);
+
+                r = sd_device_new_from_subsystem_sysname(&dev, subsystem, name);
+                if (r >= 0) {
+                        assert_se(sd_device_get_syspath(dev, &val) >= 0);
+                        assert_se(streq(syspath, val));
+                        dev = sd_device_unref(dev);
+                } else
+                        ASSERT_ERROR(r, ETOOMANYREFS);
 
                 /* The device ID depends on subsystem. */
-                assert_se(device_get_device_id(d, &id) >= 0);
+                assert_se(sd_device_get_device_id(d, &id) >= 0);
                 r = sd_device_new_from_device_id(&dev, id);
                 if (r == -ENODEV && ifindex > 0)
                         log_device_warning_errno(d, r,
                                                  "Failed to create sd-device object from device ID \"%s\". "
                                                  "Maybe running on a non-host network namespace.", id);
-                else {
-                        assert_se(r >= 0);
+                else if (r >= 0) {
                         assert_se(sd_device_get_syspath(dev, &val) >= 0);
                         assert_se(streq(syspath, val));
                         dev = sd_device_unref(dev);
-                }
+                } else
+                        ASSERT_ERROR(r, ETOOMANYREFS);
 
                 /* These require udev database, and reading database requires device ID. */
                 r = sd_device_get_is_initialized(d);
@@ -493,6 +497,43 @@ TEST(sd_device_enumerator_add_match_parent) {
                 }
                 check_parent_match(p, parent);
         }
+}
+
+TEST(sd_device_enumerator_add_all_parents) {
+        _cleanup_(sd_device_enumerator_unrefp) sd_device_enumerator *e = NULL;
+
+        /* STEP 1: enumerate all block devices without all_parents() */
+        ASSERT_OK(sd_device_enumerator_new(&e));
+        ASSERT_OK(sd_device_enumerator_allow_uninitialized(e));
+
+        /* filter in only a subsystem */
+        ASSERT_OK(sd_device_enumerator_add_nomatch_sysname(e, "loop*"));
+        ASSERT_OK(sd_device_enumerator_add_match_subsystem(e, "block", true));
+        ASSERT_OK(sd_device_enumerator_add_match_property(e, "DEVTYPE", "partition"));
+
+        unsigned devices_count_with_parents = 0;
+        unsigned devices_count_without_parents = 0;
+        FOREACH_DEVICE(e, dev) {
+                ASSERT_TRUE(device_in_subsystem(dev, "block"));
+                ASSERT_TRUE(device_is_devtype(dev, "partition"));
+                devices_count_without_parents++;
+        }
+
+        log_debug("found %u devices", devices_count_without_parents);
+
+        /* STEP 2: enumerate again with all_parents() */
+        ASSERT_OK(sd_device_enumerator_add_all_parents(e) >= 0);
+
+        unsigned not_filtered_parent_count = 0;
+        FOREACH_DEVICE(e, dev) {
+                if (!device_in_subsystem(dev, "block") || !device_is_devtype(dev, "partition"))
+                        not_filtered_parent_count++;
+                devices_count_with_parents++;
+        }
+        log_debug("found %u devices out of %u that would have been excluded without all_parents()",
+                  not_filtered_parent_count,
+                  devices_count_with_parents);
+        ASSERT_EQ(devices_count_with_parents, devices_count_without_parents + not_filtered_parent_count);
 }
 
 TEST(sd_device_get_child) {

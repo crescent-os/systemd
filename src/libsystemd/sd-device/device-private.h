@@ -9,6 +9,7 @@
 
 #include "sd-device.h"
 
+#include "chase.h"
 #include "macro.h"
 
 int device_new_from_mode_and_devnum(sd_device **ret, mode_t mode, dev_t devnum);
@@ -20,18 +21,20 @@ int device_opendir(sd_device *device, const char *subdir, DIR **ret);
 int device_get_property_bool(sd_device *device, const char *key);
 int device_get_property_int(sd_device *device, const char *key, int *ret);
 int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret_value);
-int device_get_sysattr_unsigned(sd_device *device, const char *sysattr, unsigned *ret_value);
+int device_get_sysattr_unsigned_full(sd_device *device, const char *sysattr, unsigned base, unsigned *ret_value);
+static inline int device_get_sysattr_unsigned(sd_device *device, const char *sysattr, unsigned *ret_value) {
+        return device_get_sysattr_unsigned_full(device, sysattr, 0, ret_value);
+}
 int device_get_sysattr_u32(sd_device *device, const char *sysattr, uint32_t *ret_value);
 int device_get_sysattr_bool(sd_device *device, const char *sysattr);
-int device_get_device_id(sd_device *device, const char **ret);
 int device_get_devlink_priority(sd_device *device, int *ret);
 int device_get_devnode_mode(sd_device *device, mode_t *ret);
 int device_get_devnode_uid(sd_device *device, uid_t *ret);
 int device_get_devnode_gid(sd_device *device, gid_t *ret);
 
+int device_chase(sd_device *device, const char *path, ChaseFlags flags, char **ret_resolved, int *ret_fd);
 void device_clear_sysattr_cache(sd_device *device);
-int device_cache_sysattr_value(sd_device *device, const char *key, char *value);
-int device_get_cached_sysattr_value(sd_device *device, const char *key, const char **ret_value);
+int device_cache_sysattr_value(sd_device *device, char *key, char *value, int error);
 
 void device_seal(sd_device *device);
 void device_set_is_initialized(sd_device *device);
@@ -73,5 +76,5 @@ int device_read_uevent_file(sd_device *device);
 
 int device_set_action(sd_device *device, sd_device_action_t a);
 sd_device_action_t device_action_from_string(const char *s) _pure_;
-const char *device_action_to_string(sd_device_action_t a) _const_;
+const char* device_action_to_string(sd_device_action_t a) _const_;
 void dump_device_action_table(void);

@@ -28,9 +28,11 @@
     <para><simplelist>
       <member><filename>/etc/systemd/logind.conf</filename></member>
       <member><filename>/run/systemd/logind.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/logind.conf</filename></member>
       <member><filename>/usr/lib/systemd/logind.conf</filename></member>
       <member><filename>/etc/systemd/logind.conf.d/*.conf</filename></member>
       <member><filename>/run/systemd/logind.conf.d/*.conf</filename></member>
+      <member><filename>/usr/local/lib/systemd/logind.conf.d/*.conf</filename></member>
       <member><filename>/usr/lib/systemd/logind.conf.d/*.conf</filename></member>
     </simplelist></para>
   </refsynopsisdiv>
@@ -222,13 +224,14 @@
         <term><varname>HandleLidSwitch=</varname></term>
         <term><varname>HandleLidSwitchExternalPower=</varname></term>
         <term><varname>HandleLidSwitchDocked=</varname></term>
+        <term><varname>HandleSecureAttentionKey=</varname></term>
 
         <listitem><para>Controls how logind shall handle the system power, reboot and sleep keys and the lid
         switch to trigger actions such as system power-off, reboot or suspend. Can be one of
         <literal>ignore</literal>, <literal>poweroff</literal>, <literal>reboot</literal>, <literal>halt</literal>,
         <literal>kexec</literal>, <literal>suspend</literal>, <literal>hibernate</literal>, <literal>hybrid-sleep</literal>,
         <literal>suspend-then-hibernate</literal>, <literal>sleep</literal>, <literal>lock</literal>, and
-        <literal>factory-reset</literal>.  If <literal>ignore</literal>, <command>systemd-logind</command>
+        <literal>factory-reset</literal>, <literal>secure-attention-key</literal>.  If <literal>ignore</literal>, <command>systemd-logind</command>
         will never handle these keys. If <literal>lock</literal>, all running sessions will be screen-locked;
         otherwise, the specified action will be taken in the respective event. Only input devices with the
         <literal>power-switch</literal> udev tag will be watched for key/lid switch
@@ -249,7 +252,8 @@
         system is inserted in a docking station, or if more than one display is connected, the action
         specified by <varname>HandleLidSwitchDocked=</varname> occurs; if the system is on external power the
         action (if any) specified by <varname>HandleLidSwitchExternalPower=</varname> occurs; otherwise the
-        <varname>HandleLidSwitch=</varname> action occurs.</para>
+        <varname>HandleLidSwitch=</varname> action occurs.
+        <varname>HandleSecureAttentionKey=</varname> defaults to <literal>secure-attention-key</literal></para>
 
         <para>A different application may disable logind's handling of system power and
         sleep keys and the lid switch by taking a low-level inhibitor lock
@@ -260,7 +264,7 @@
         to take over suspend and hibernation handling, and to use their own configuration
         mechanisms. If a low-level inhibitor lock is taken, logind will not take any
         action when that key or switch is triggered and the <varname>Handle*=</varname>
-        settings are irrelevant.</para>
+        settings are irrelevant, except for <varname>HandleSecureAttentionKey=</varname>, which is always handled since its addition in v257.</para>
 
         <xi:include href="version-info.xml" xpointer="v184"/></listitem>
       </varlistentry>
@@ -382,7 +386,7 @@
 
         <listitem><para>Specifies a timeout in seconds, or a time span value after which
         <filename>systemd-logind</filename> checks the idle state of all sessions. Every session that is idle
-        for longer than the timeout will be stopped. Note that this option doesn't apply to
+        for longer than the timeout will be stopped. Note that this option does not apply to
         <literal>greeter</literal> or <literal>lock-screen</literal> sessions. Defaults to
         <literal>infinity</literal> (<filename>systemd-logind</filename> is not checking the idle state
         of sessions). For details about the syntax of time spans, see
@@ -390,6 +394,35 @@
         </para>
 
         <xi:include href="version-info.xml" xpointer="v252"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>DesignatedMaintenanceTime=</varname></term>
+
+        <listitem>
+          <para>
+            Specifies a default calendar event for scheduled shutdowns. So when using e.g. the command
+            <command>shutdown -r</command> to reboot the system without specifying a timeout, logind would
+            use the configured calendar event instead. For details about the syntax of calendar events, see
+            <citerefentry><refentrytitle>systemd.time</refentrytitle><manvolnum>7</manvolnum></citerefentry>.
+          </para>
+
+        <xi:include href="version-info.xml" xpointer="v257"/></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><varname>EnableWallMessages=</varname></term>
+
+        <listitem>
+          <para>
+            Controls whether
+            <citerefentry><refentrytitle>wall</refentrytitle><manvolnum>1</manvolnum></citerefentry>
+            messages should be sent to the terminals of all currently logged in users upon shutdown or
+            reboot. Defaults to <literal>yes</literal>, and can be changed at runtime via the DBus
+            <literal>EnableWallMessages</literal> and <literal>WallMessagePrefix</literal> properties.
+          </para>
+
+        <xi:include href="version-info.xml" xpointer="v258"/></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

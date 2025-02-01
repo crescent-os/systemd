@@ -29,8 +29,8 @@ struct RemoteServer {
         RemoteSource **sources;
         size_t active;
 
-        sd_event *events;
-        sd_event_source *sigterm_event, *sigint_event, *listen_event;
+        sd_event *event;
+        sd_event_source *listen_event;
 
         Hashmap *writers;
         Writer *_single_writer;
@@ -59,7 +59,7 @@ int journal_remote_server_init(
 
 int journal_remote_get_writer(RemoteServer *s, const char *host, Writer **writer);
 
-int journal_remote_add_source(RemoteServer *s, int fd, char* name, bool own_name);
+int journal_remote_add_source(RemoteServer *s, int fd, char *name, bool own_name);
 int journal_remote_add_raw_socket(RemoteServer *s, int fd);
 int journal_remote_handle_raw_source(
                 sd_event_source *event,
